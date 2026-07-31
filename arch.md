@@ -173,3 +173,4 @@ AI 回复中途用户发新消息（且命中触发）时：
 - `2026-07-31` 调整：上下文缓存友好化——`build_messages` 把图片/记忆/压缩历史等动态内容从「system 之后、recent 之前」移到消息列表末尾，保证 `system + recent 逐字对话` 作为稳定前缀，窗口未滑动时共享前缀近乎 100% 命中（详见 4.2）。
 - `2026-07-31` 调整：模型访问改走 AstrBot 提供商体系——移除插件自带 aiohttp `ChatClient` 与 base_url/api_key/model 配置；chat/vision/implicit 改用 `_special: "select_provider"` 面板选择、embedding 手填 provider_id，运行期 `provider_manager.get_provider_by_id()` 解析（llm.py 重写为 `LLMProvider` / `EmbeddingAdapter`，见 4.5）。
 - `2026-07-31` 约定：`_conf_schema.json` 中 `description` 为配置项标题、`hint` 为说明文字，说明性内容一律进 `hint`。
+- `2026-07-31` 补充：推理内容过滤——流式/非流式输出统一剥离 `<think>...</think>` 推理块（`llm.py.ThinkStripper`，跨 chunk 边界与未闭合标签均可处理），防止思考内容泄漏给用户。

@@ -15,6 +15,94 @@ from astrbot.core.provider.provider import EmbeddingProvider
 
 _VISION_PROMPT = "请用一两句话简洁描述这张图片的内容。"
 
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+
+
+class ThinkStripper:
+    """Removes ``<think>...</think>`` reasoning blocks from a text stream.
+
+    Tags may be split across arbitrary chunk boundaries, so the stripper holds
+    back characters that could be a tag prefix and only emits text that is
+    outside a think block.
+
+    Args:
+        open_tag: The opening tag.
+        close_tag: The closing tag.
+    """
+
+    def __init__(
+        self,
+        open_tag: str = _THINK_OPEN,
+        close_tag: str = _THINK_CLOSE,
+    ) -> None:
+        self.open_tag = open_tag
+        self.close_tag = close_tag
+        self._buf: list[str] = []
+        self._in_think = False
+
+    def feed(self, text: str) -> list[str]:
+        """Feed a text chunk.
+
+        Args:
+            text: The chunk of text.
+
+        Returns:
+            Emitted non-think text fragments.
+        """
+        out: list[str] = []
+        for ch in text:
+            if self._in_think:
+                if self._buf or ch == self.close_tag[0]:
+                    self._buf.append(ch)
+                    candidate = "".join(self._buf)
+                    if candidate == self.close_tag:
+                        self._in_think = False
+                        self._buf = []
+                    elif not self.close_tag.startswith(candidate):
+                        self._buf = []
+                continue
+            if ch == self.open_tag[0]:
+                self._buf.append(ch)
+            elif self._buf:
+                self._buf.append(ch)
+                candidate = "".join(self._buf)
+                if candidate == self.open_tag:
+                    self._in_think = True
+                    self._buf = []
+                elif not self.open_tag.startswith(candidate):
+                    out.append(candidate)
+                    self._buf = []
+            else:
+                out.append(ch)
+        return out
+
+    def flush(self) -> str:
+        """Release any remaining held-back text.
+
+        Returns:
+            Buffered non-think text (empty inside an open think block).
+        """
+        if self._in_think:
+            self._buf = []
+            return ""
+        text = "".join(self._buf)
+        self._buf = []
+        return text
+
+
+def strip_think(text: str) -> str:
+    """Strip ``<think>...</think>`` blocks from a complete text.
+
+    Args:
+        text: The complete text.
+
+    Returns:
+        The text without think blocks.
+    """
+    stripper = ThinkStripper()
+    return "".join(stripper.feed(text)) + stripper.flush()
+
 
 class LLMProvider:
     """Resolves an AstrBot chat provider by id and wraps chat/stream calls.
@@ -87,7 +175,7 @@ class LLMProvider:
             image_urls=images or None,
             temperature=temperature,
         )
-        return self._to_text(resp)
+        return strip_think(self._to_text(resp))
 
     async def chat_stream(
         self,
@@ -108,6 +196,7 @@ class LLMProvider:
             is skipped so deltas are not accumulated twice.
         """
         provider = await self._get()
+        stripper = ThinkStripper()
         async for resp in provider.text_chat_stream(
             contexts=messages,
             image_urls=images or None,
@@ -116,8 +205,11 @@ class LLMProvider:
             if not resp.is_chunk:
                 continue
             text = self._to_text(resp)
-            if text:
-                yield text
+            if not text:
+                continue
+            for delta in stripper.feed(text):
+                if delta:
+                    yield delta
 
     async def describe_image(self, image_url: str) -> str:
         """Describe a single image with the vision provider.
