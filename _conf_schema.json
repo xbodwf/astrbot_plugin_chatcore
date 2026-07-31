@@ -9,66 +9,76 @@
         "default": true
       },
       "stream": {
-        "description": "流式输出（开启后 AI 自己分段、逐段发送）",
-        "type": "bool",
-        "default": true
-      },
-      "takeover": {
-        "description": "接管模式：接管 AstrBot 原生 LLM 链路（建议开启）",
+        "description": "流式输出",
         "type": "bool",
         "default": true,
-        "hint": "开启后 ChatCore 处理的消息将阻止 AstrBot 原生继续处理"
+        "hint": "开启后 AI 自己分段、逐段发送"
+      },
+      "takeover": {
+        "description": "接管模式",
+        "type": "bool",
+        "default": true,
+        "hint": "接管 AstrBot 原生 LLM 链路（建议开启）。开启后 ChatCore 处理的消息将阻止 AstrBot 原生继续处理"
       },
       "private_force_reply": {
-        "description": "私聊必回（不参与概率）",
+        "description": "私聊必回",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "私聊消息必定回复，不参与概率"
       },
       "group_enabled": {
-        "description": "群聊启用（关闭后群消息只记录不回复）",
+        "description": "群聊启用",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "关闭后群消息只记录不回复"
       },
       "markers_enabled": {
-        "description": "主动动作：允许 AI 用 [[at:昵称]] / [[reply:昵称]] 主动 @ 或回复群成员",
+        "description": "主动动作",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "允许 AI 用 [[at:昵称]] / [[reply:昵称]] 主动 @ 或回复群成员"
       }
     }
   },
   "attention": {
-    "description": "注意力机制（群聊概率回复）",
+    "description": "注意力机制",
     "type": "object",
     "items": {
       "bubble_base_prob": {
-        "description": "冒泡基线概率：群聊无人搭理时 AI 自发插话的概率（建议 0.01~0.03）",
+        "description": "冒泡基线概率",
         "type": "float",
-        "default": 0.02
+        "default": 0.02,
+        "hint": "群聊无人搭理时 AI 自发插话的概率（建议 0.01~0.03）"
       },
       "active_max_prob": {
-        "description": "活跃态封顶概率：有人与 AI 对话时概率上限",
+        "description": "活跃态封顶概率",
         "type": "float",
-        "default": 0.3
+        "default": 0.3,
+        "hint": "有人与 AI 对话时概率上限"
       },
       "decay_minutes": {
-        "description": "衰减时间(分钟)：超过该时长无人维持，概率指数降回基线",
+        "description": "衰减时间(分钟)",
         "type": "float",
-        "default": 10.0
+        "default": 10.0,
+        "hint": "超过该时长无人维持，概率指数降回基线"
       },
       "hard_trigger_force": {
-        "description": "硬触发必回：被 @/reply/唤醒前缀 时是否必定回复",
+        "description": "硬触发必回",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "被 @/reply/唤醒前缀 时是否必定回复"
       },
       "hard_trigger_boost": {
-        "description": "硬触发活跃度加成：每次被 @/reply 额外提升的概率",
+        "description": "硬触发活跃度加成",
         "type": "float",
-        "default": 0.1
+        "default": 0.1,
+        "hint": "每次被 @/reply 额外提升的概率"
       },
       "wake_prefix": {
-        "description": "唤醒前缀列表（不带 @ 直接喊也能触发）",
+        "description": "唤醒前缀列表",
         "type": "list",
-        "default": ["bot", "ai", "机器人"]
+        "default": ["bot", "ai", "机器人"],
+        "hint": "不带 @ 直接喊也能触发"
       }
     }
   },
@@ -77,25 +87,28 @@
     "type": "object",
     "items": {
       "delimiter": {
-        "description": "AI 自我分段符（AI 输出该分隔符即切段）",
+        "description": "AI 自我分段符",
         "type": "text",
         "default": "\\n---\\n",
-        "hint": "转义写法：\\n 代表换行，实际写入配置时请填写 JSON 转义后的字符串"
+        "hint": "AI 输出该分隔符即切段。转义写法：\\n 代表换行，实际写入配置时请填写 JSON 转义后的字符串"
       },
       "escape_char": {
-        "description": "转义符：AI 想输出分段符本身时在其前加该字符",
+        "description": "转义符",
         "type": "string",
-        "default": "\\"
+        "default": "\\",
+        "hint": "AI 想输出分段符本身时在其前加该字符"
       },
       "interval": {
-        "description": "分段发送间隔(秒)：每段之间等待的时长",
+        "description": "分段发送间隔(秒)",
         "type": "float",
-        "default": 1.0
+        "default": 1.0,
+        "hint": "每段之间等待的时长"
       },
       "max_segment_chars": {
-        "description": "单段最大字符数（AI 忘了分段时的兜底保护，0 为不限制）",
+        "description": "单段最大字符数",
         "type": "int",
-        "default": 600
+        "default": 600,
+        "hint": "AI 忘了分段时的兜底保护，0 为不限制"
       }
     }
   },
@@ -104,14 +117,16 @@
     "type": "object",
     "items": {
       "recent_count": {
-        "description": "近 N 条完整原文（直接喂给 AI）",
+        "description": "近 N 条完整原文",
         "type": "int",
-        "default": 10
+        "default": 10,
+        "hint": "直接喂给 AI 的完整原文条数"
       },
       "history_count": {
-        "description": "历史压缩条数：recent 之外的更早消息保留条数",
+        "description": "历史压缩条数",
         "type": "int",
-        "default": 30
+        "default": 30,
+        "hint": "recent 之外的更早消息保留条数"
       },
       "old_msg_chars": {
         "description": "每条历史消息压缩后的最大字符数",
@@ -121,74 +136,50 @@
     }
   },
   "providers": {
-    "description": "独立模型提供商（OpenAI 兼容接口）",
+    "description": "模型提供商",
     "type": "object",
     "items": {
       "chat": {
         "description": "聊天主模型",
         "type": "object",
         "items": {
-          "base_url": {
-            "description": "接口地址，如 https://api.openai.com/v1",
+          "provider_id": {
+            "description": "聊天模型提供商",
             "type": "string",
-            "default": ""
-          },
-          "api_key": {
-            "description": "API Key",
-            "type": "string",
-            "default": ""
-          },
-          "model": {
-            "description": "模型名",
-            "type": "string",
-            "default": "gpt-4o-mini"
+            "default": "",
+            "_special": "select_provider",
+            "hint": "在 AstrBot「模型提供商」页面配置后选择"
           },
           "multimodal": {
-            "description": "聊天模型是否原生支持识图（多模态）。开启后图片直接传给聊天模型，无需单独配置识图模型",
+            "description": "多模态识图",
             "type": "bool",
-            "default": false
+            "default": false,
+            "hint": "聊天模型是否原生支持识图。开启后图片直接传给聊天模型，无需单独配置识图模型"
           }
         }
       },
       "vision": {
-        "description": "识图模型（消息含图片时转文字描述，可留空复用 chat 模型）",
+        "description": "识图模型",
         "type": "object",
         "items": {
-          "base_url": {
-            "description": "接口地址",
+          "provider_id": {
+            "description": "识图模型提供商",
             "type": "string",
-            "default": ""
-          },
-          "api_key": {
-            "description": "API Key",
-            "type": "string",
-            "default": ""
-          },
-          "model": {
-            "description": "模型名",
-            "type": "string",
-            "default": ""
+            "default": "",
+            "_special": "select_provider",
+            "hint": "需支持视觉输入。消息含图片时转文字描述；留空时复用聊天模型"
           }
         }
       },
       "embedding": {
-        "description": "嵌入模型（全局记忆向量检索）",
+        "description": "嵌入模型",
         "type": "object",
         "items": {
-          "base_url": {
-            "description": "接口地址",
+          "provider_id": {
+            "description": "Embedding 提供商 ID",
             "type": "string",
-            "default": ""
-          },
-          "api_key": {
-            "description": "API Key",
-            "type": "string",
-            "default": ""
-          },
-          "model": {
-            "description": "模型名",
-            "type": "string",
-            "default": "text-embedding-3-small"
+            "default": "",
+            "hint": "用于全局记忆向量检索。在 AstrBot「模型提供商」页面配置 Embedding 提供商后，将其 ID 填入此处"
           }
         }
       }
@@ -204,9 +195,10 @@
         "default": true
       },
       "shared_across_groups": {
-        "description": "跨群数据互通：各群聊的数据/记忆互相共享",
+        "description": "跨群数据互通",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "各群聊的数据/记忆互相共享"
       },
       "max_recall": {
         "description": "每次请求最多召回的记忆片段数",
@@ -216,7 +208,7 @@
     }
   },
   "implicit": {
-    "description": "隐性意图分析（AI 判断群内话题是否相关）",
+    "description": "隐性意图分析",
     "type": "object",
     "items": {
       "enabled": {
@@ -225,52 +217,41 @@
         "default": true
       },
       "interval_minutes": {
-        "description": "分析最小间隔(分钟)，避免频繁调用",
+        "description": "分析最小间隔(分钟)",
         "type": "int",
-        "default": 30
+        "default": 30,
+        "hint": "避免频繁调用"
       },
       "prob_boost": {
         "description": "命中隐性相关话题后的概率提升",
         "type": "float",
         "default": 0.05
       },
-      "model": {
-        "description": "分析模型（与聊天模型相互独立）",
-        "type": "object",
-        "items": {
-          "base_url": {
-            "description": "接口地址",
-            "type": "string",
-            "default": ""
-          },
-          "api_key": {
-            "description": "API Key",
-            "type": "string",
-            "default": ""
-          },
-          "model": {
-            "description": "模型名",
-            "type": "string",
-            "default": "gpt-4o-mini"
-          }
-        }
+      "provider_id": {
+        "description": "隐性分析模型提供商",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "与聊天模型相互独立；留空则关闭隐性分析"
       },
       "prompt": {
-        "description": "分析提示词（留空使用默认提示词）",
+        "description": "分析提示词",
         "type": "text",
         "default": "你是聊天活跃度分析器。判断群聊最近记录中是否有人隐性提及机器人、在邀请机器人参与话题、或有机器人值得参与的话题。只回答“是”或“否”。",
-        "editor_mode": true
+        "editor_mode": true,
+        "hint": "留空使用默认提示词"
       }
     }
   },
   "recall_cancel": {
-    "description": "撤回取消（用户撤回触发消息后，停止 AI 回复）",
+    "description": "撤回取消",
     "type": "object",
     "items": {
       "enabled": {
         "description": "撤回取消开关",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "用户撤回触发消息后，停止 AI 回复"
       }
     }
   }

@@ -1,171 +1,126 @@
-"""Independent model provider clients (OpenAI-compatible APIs).
+"""Model access through AstrBot's provider system.
 
-ChatCore keeps its own model configuration, independent from AstrBot's
-provider system, so it always talks to the exact model the user configured.
-All HTTP is done through aiohttp.
+ChatCore no longer manages its own model endpoints. The user picks the chat,
+vision and implicit-analysis providers inside AstrBot (``_special``
+``select_provider`` fields in the plugin config), and ChatCore resolves them by
+provider id through the provider manager at call time.
 """
 
-import json
 from collections.abc import AsyncGenerator
 
-import aiohttp
+from astrbot.api.provider import Provider
+from astrbot.api.star import Context
+from astrbot.core.provider.entities import LLMResponse
+from astrbot.core.provider.provider import EmbeddingProvider
+
+_VISION_PROMPT = "请用一两句话简洁描述这张图片的内容。"
 
 
-class ChatClient:
-    """OpenAI-compatible chat / streaming / vision / embedding client.
+class LLMProvider:
+    """Resolves an AstrBot chat provider by id and wraps chat/stream calls.
 
     Args:
-        base_url: OpenAI-compatible API base URL, e.g. ``https://api.openai.com/v1``.
-        api_key: API key.
-        model: Default chat model name.
+        context: AstrBot plugin context (holds the provider manager).
+        provider_id: Provider id selected in the plugin config.
     """
 
-    def __init__(self, base_url: str, api_key: str, model: str) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
-        self.model = model
-        self._timeout = aiohttp.ClientTimeout(total=120)
+    def __init__(self, context: Context, provider_id: str) -> None:
+        self.context = context
+        self.provider_id = provider_id
 
-    def _headers(self) -> dict[str, str]:
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        return headers
-
-    async def _post_json(self, path: str, payload: dict) -> dict:
-        async with aiohttp.ClientSession(
-            timeout=self._timeout,
-            headers=self._headers(),
-        ) as session:
-            async with session.post(
-                f"{self.base_url}/{path}",
-                json=payload,
-            ) as resp:
-                resp.raise_for_status()
-                return await resp.json()
-
-    @staticmethod
-    def _attach_images(
-        messages: list[dict],
-        images: list[str],
-    ) -> list[dict]:
-        """Merge image URLs into the last message as multimodal content.
-
-        Args:
-            messages: OpenAI-style message list.
-            images: Image URLs to attach to the final user message.
+    async def _get(self) -> Provider:
+        """Resolve the provider instance by id.
 
         Returns:
-            A new message list with the images attached.
-        """
-        if not messages or not images:
-            return messages
-        last = messages[-1]
-        content: list[dict] = [{"type": "text", "text": last.get("content", "")}]
-        content.extend(
-            {"type": "image_url", "image_url": {"url": url}} for url in images
-        )
-        return [*messages[:-1], {**last, "content": content}]
+            The AstrBot chat provider.
 
-    async def chat_stream(
-        self,
-        messages: list[dict],
-        *,
-        model: str | None = None,
-        temperature: float = 0.8,
-        images: list[str] | None = None,
-        extra_body: dict | None = None,
-    ) -> AsyncGenerator[str, None]:
-        """Stream a chat completion, yielding text deltas.
+        Raises:
+            ValueError: When the provider is unconfigured or missing.
+        """
+        if not self.provider_id:
+            raise ValueError("未配置模型提供商（provider_id 为空）")
+        provider = await self.context.provider_manager.get_provider_by_id(
+            self.provider_id
+        )
+        if not provider:
+            raise ValueError(
+                f"提供商 {self.provider_id} 不存在，请在 AstrBot 提供商页面检查配置"
+            )
+        return provider
+
+    @staticmethod
+    def _to_text(resp: LLMResponse) -> str:
+        """Extract plain text from an LLMResponse.
 
         Args:
-            messages: OpenAI-style message list.
-            model: Override model name; defaults to the client default.
-            temperature: Sampling temperature.
-            images: Image URLs to attach to the final user message.
-            extra_body: Extra payload fields to merge in.
+            resp: The provider response.
 
-        Yields:
-            Text deltas as they arrive.
+        Returns:
+            The plain text, possibly empty for tool-call-only chunks.
         """
-        if images:
-            messages = self._attach_images(messages, images)
-        payload: dict = {
-            "model": model or self.model,
-            "messages": messages,
-            "stream": True,
-            "temperature": temperature,
-        }
-        if extra_body:
-            payload.update(extra_body)
-
-        async with aiohttp.ClientSession(
-            timeout=self._timeout,
-            headers=self._headers(),
-        ) as session:
-            async with session.post(
-                f"{self.base_url}/chat/completions",
-                json=payload,
-            ) as resp:
-                resp.raise_for_status()
-                async for line in resp.content:
-                    line = line.strip()
-                    if not line or not line.startswith(b"data:"):
-                        continue
-                    data = line[len(b"data:") :].strip()
-                    if not data or data == b"[DONE]":
-                        continue
-                    try:
-                        chunk = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-                    choices = chunk.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta") or {}
-                    content = delta.get("content")
-                    if content:
-                        yield content
+        if resp.result_chain is not None:
+            text = resp.result_chain.get_plain_text()
+            if text:
+                return text
+        return (resp.completion_text or "").strip()
 
     async def chat(
         self,
         messages: list[dict],
         *,
-        model: str | None = None,
         temperature: float = 0.8,
         images: list[str] | None = None,
-        extra_body: dict | None = None,
     ) -> str:
         """Get a full (non-streaming) chat completion text.
 
         Args:
             messages: OpenAI-style message list.
-            model: Override model name; defaults to the client default.
             temperature: Sampling temperature.
-            images: Image URLs to attach to the final user message.
-            extra_body: Extra payload fields to merge in.
+            images: Image URLs to attach to the request.
 
         Returns:
             The assistant's reply text.
         """
-        if images:
-            messages = self._attach_images(messages, images)
-        payload: dict = {
-            "model": model or self.model,
-            "messages": messages,
-            "stream": False,
-            "temperature": temperature,
-        }
-        if extra_body:
-            payload.update(extra_body)
-        data = await self._post_json("chat/completions", payload)
-        choices = data.get("choices") or []
-        if not choices:
-            return ""
-        return (choices[0].get("message") or {}).get("content") or ""
+        provider = await self._get()
+        resp = await provider.text_chat(
+            contexts=messages,
+            image_urls=images or None,
+            temperature=temperature,
+        )
+        return self._to_text(resp)
+
+    async def chat_stream(
+        self,
+        messages: list[dict],
+        *,
+        temperature: float = 0.8,
+        images: list[str] | None = None,
+    ) -> AsyncGenerator[str, None]:
+        """Stream a chat completion, yielding text deltas.
+
+        Args:
+            messages: OpenAI-style message list.
+            temperature: Sampling temperature.
+            images: Image URLs to attach to the request.
+
+        Yields:
+            Text deltas as they arrive. The trailing full-completion response
+            is skipped so deltas are not accumulated twice.
+        """
+        provider = await self._get()
+        async for resp in provider.text_chat_stream(
+            contexts=messages,
+            image_urls=images or None,
+            temperature=temperature,
+        ):
+            if not resp.is_chunk:
+                continue
+            text = self._to_text(resp)
+            if text:
+                yield text
 
     async def describe_image(self, image_url: str) -> str:
-        """Describe an image using a vision-capable model.
+        """Describe a single image with the vision provider.
 
         Args:
             image_url: URL or base64 data URI of the image.
@@ -173,22 +128,21 @@ class ChatClient:
         Returns:
             A short text description of the image.
         """
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": image_url},
-                    },
-                    {
-                        "type": "text",
-                        "text": "请用一两句话简洁描述这张图片的内容。",
-                    },
-                ],
-            }
-        ]
-        return await self.chat(messages)
+        messages = [{"role": "user", "content": _VISION_PROMPT}]
+        return await self.chat(messages, temperature=0.0, images=[image_url])
+
+
+class EmbeddingAdapter:
+    """Resolves an AstrBot embedding provider by id.
+
+    Args:
+        context: AstrBot plugin context.
+        provider_id: Provider id of an embedding provider.
+    """
+
+    def __init__(self, context: Context, provider_id: str) -> None:
+        self.context = context
+        self.provider_id = provider_id
 
     async def embed(self, text: str) -> list[float]:
         """Embed a single text into a vector.
@@ -200,28 +154,15 @@ class ChatClient:
             The embedding vector.
 
         Raises:
-            RuntimeError: If the embedding request failed.
+            ValueError: When the provider is missing or not an embedding provider.
         """
-        payload = {"model": self.model, "input": text}
-        data = await self._post_json("embeddings", payload)
-        embeds = data.get("data") or []
-        if not embeds:
-            raise RuntimeError("Embedding response contains no data.")
-        return embeds[0].get("embedding", [])
-
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        """Embed multiple texts into vectors.
-
-        Args:
-            texts: The texts to embed.
-
-        Returns:
-            A list of embedding vectors, one per input text.
-        """
-        payload = {"model": self.model, "input": texts}
-        data = await self._post_json("embeddings", payload)
-        by_index = {
-            item.get("index"): item.get("embedding", [])
-            for item in data.get("data") or []
-        }
-        return [by_index.get(i, []) for i in range(len(texts))]
+        if not self.provider_id:
+            raise ValueError("未配置 Embedding 提供商（provider_id 为空）")
+        provider = await self.context.provider_manager.get_provider_by_id(
+            self.provider_id
+        )
+        if not provider or not isinstance(provider, EmbeddingProvider):
+            raise ValueError(
+                f"提供商 {self.provider_id} 不是有效的 Embedding 提供商"
+            )
+        return await provider.get_embedding(text)

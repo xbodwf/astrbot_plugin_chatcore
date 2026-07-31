@@ -25,7 +25,7 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 from .actions import parse_actions
 from .attention import AttentionManager
 from .context import ContextManager
-from .llm import ChatClient
+from .llm import EmbeddingAdapter, LLMProvider
 from .memory import MemoryStore
 from .segmentation import stream_respond
 
@@ -117,22 +117,16 @@ class Main(Star):
         """
         providers = config.get("providers", {})
         chat_cfg = providers.get("chat", {})
-        self.chat_client = ChatClient(
-            chat_cfg.get("base_url", ""),
-            chat_cfg.get("api_key", ""),
-            chat_cfg.get("model", ""),
-        )
+        self.chat_provider_id = chat_cfg.get("provider_id", "")
+        self.chat_client = LLMProvider(self.context, self.chat_provider_id)
         self.chat_multimodal = chat_cfg.get("multimodal", False)
-        self.markers_enabled = chat_cfg.get("markers_enabled", True)
+        self.markers_enabled = config.get("chat", {}).get("markers_enabled", True)
 
         vision_cfg = providers.get("vision", {})
-        self.vision_client = None
-        if vision_cfg.get("base_url") or vision_cfg.get("model") or vision_cfg.get("api_key"):
-            self.vision_client = ChatClient(
-                vision_cfg.get("base_url") or chat_cfg.get("base_url", ""),
-                vision_cfg.get("api_key") or chat_cfg.get("api_key", ""),
-                vision_cfg.get("model") or chat_cfg.get("model", ""),
-            )
+        self.vision_client = LLMProvider(
+            self.context,
+            vision_cfg.get("provider_id", "") or self.chat_provider_id,
+        )
 
         attn = config.get("attention", {})
         self.attention = AttentionManager(
@@ -162,22 +156,14 @@ class Main(Star):
         self.memory_top_k = memory_cfg.get("max_recall", 5)
         self.memory = None
         emb_cfg = providers.get("embedding", {})
-        if memory_cfg.get("enabled", True) and (
-            emb_cfg.get("base_url")
-            or emb_cfg.get("api_key")
-            or chat_cfg.get("base_url")
-        ):
-            embed_client = ChatClient(
-                emb_cfg.get("base_url") or chat_cfg.get("base_url", ""),
-                emb_cfg.get("api_key") or chat_cfg.get("api_key", ""),
-                emb_cfg.get("model", "text-embedding-3-small"),
-            )
+        if memory_cfg.get("enabled", True) and emb_cfg.get("provider_id"):
+            embed_adapter = EmbeddingAdapter(self.context, emb_cfg["provider_id"])
             path = (
                 Path(get_astrbot_plugin_data_path())
                 / "astrbot_plugin_chatcore"
                 / "memory.json"
             )
-            self.memory = MemoryStore(embed_client.embed, path)
+            self.memory = MemoryStore(embed_adapter.embed, path)
 
         implicit_cfg = config.get("implicit", {})
         self.implicit_enabled = implicit_cfg.get("enabled", True)
@@ -189,13 +175,11 @@ class Main(Star):
         self.implicit_prompt = (
             str(implicit_cfg.get("prompt", "")).strip() or DEFAULT_IMPLICIT_PROMPT
         )
-        analysis_model = implicit_cfg.get("model", {})
         self.analysis_client = None
-        if analysis_model.get("base_url") or analysis_model.get("api_key"):
-            self.analysis_client = ChatClient(
-                analysis_model.get("base_url", ""),
-                analysis_model.get("api_key", ""),
-                analysis_model.get("model", "gpt-4o-mini"),
+        if implicit_cfg.get("provider_id"):
+            self.analysis_client = LLMProvider(
+                self.context,
+                implicit_cfg["provider_id"],
             )
 
         self.recall_cancel_enabled = config.get("recall_cancel", {}).get(
@@ -215,7 +199,7 @@ class Main(Star):
         chat_cfg = self._config.get("chat", {})
         if not chat_cfg.get("enabled", True):
             return
-        if not self.chat_client.base_url:
+        if not self.chat_provider_id:
             return
 
         text = event.get_message_str().strip()
@@ -687,17 +671,17 @@ class Main(Star):
         """
         lines = [
             "ChatCore 运行状态：",
-            f"- 聊天模型: {self.chat_client.model or '(未配置)'}",
+            f"- 聊天模型: {self.chat_provider_id or '(未配置)'}",
             f"- 多模态: {'原生识图' if self.chat_multimodal else '走识图模型'}"
             + (
-                f" ({self.vision_client.model})"
-                if self.vision_client and not self.chat_multimodal
+                f" ({self.vision_client.provider_id})"
+                if not self.chat_multimodal
                 else ""
             ),
             f"- 全局记忆: {'启用' if self.memory else '未启用'}",
             f"- 隐性分析: "
             + (
-                f"启用 ({self.analysis_client.model})"
+                f"启用 ({self.analysis_client.provider_id})"
                 if self.implicit_enabled and self.analysis_client
                 else "关闭（未配置分析模型）"
             ),

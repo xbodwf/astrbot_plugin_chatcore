@@ -39,7 +39,8 @@ attention.py            context.py
    │                        │
    ▼                        ▼
 ┌─────────────────────────────────────────────┐
-│ llm.py 独立模型提供商(aiohttp)               │
+│ llm.py AstrBot 提供商访问层                  │
+│  - 按 provider_id 解析提供商                │
 │  - chat / chat_stream                       │
 │  - vision 识图                             │
 │  - embedding 嵌入                          │
@@ -53,7 +54,7 @@ segmentation.py
 - 防抖中断点
 ```
 
-**核心原则**：独立于 AstrBot 的模型提供商体系，插件自带模型配置；所有异步任务（流式、隐性分析、记忆）基于 aiohttp + asyncio。
+**核心原则**：插件不管理任何模型接口，完全复用 AstrBot 自身提供商体系。用户在 AstrBot「模型提供商」页面配置后，插件用 `_special: "select_provider"` 面板选择，运行期经 `provider_manager.get_provider_by_id()` 解析调用；所有异步任务（流式、隐性分析、记忆）基于 asyncio。
 
 ## 4. 模块设计
 
@@ -110,16 +111,17 @@ AI 回复中途用户发新消息（且命中触发）时：
 
 实现：每会话一个 `GenerationTask`，持有流式任务 + 新消息队列 + 中断标记；分段循环在段边界检查中断。
 
-### 4.5 独立模型提供商（llm.py）
+### 4.5 AstrBot 提供商访问层（llm.py）
 
-独立于 AstrBot 提供商体系，插件配置内自配：
+插件不管理任何模型接口，复用 AstrBot 提供商体系：
 
-- **chat LLM**：聊天主模型（OpenAI 兼容接口，`base_url` + `api_key` + `model`）。
+- **配置**：`providers.chat.provider_id`、`providers.vision.provider_id`、`implicit.provider_id` 使用 `_special: "select_provider"`，在插件配置面板直接下拉选择 AstrBot 已配置的提供商；`providers.embedding.provider_id` 为手填 ID（AstrBot 无 embedding 专用选择器）。
+- **解析**：运行期 `context.provider_manager.get_provider_by_id(id)` 取实例（查不到或为空抛中文 `ValueError`）；`LLMProvider` 包 `Provider.text_chat` / `text_chat_stream`，流式时跳过非 chunk 的尾部汇总响应，文本优先取 `result_chain.get_plain_text()` 再回落 `completion_text`。
 - **多模态**：若聊天模型原生支持识图（`providers.chat.multimodal=true`），图片直接以 `image_url` 内容块传给聊天模型；否则走独立 vision 模型转文字描述。
-- **vision 识图模型**：消息带图时转描述（OpenAI 兼容 `chat/completions` 的 image_url 能力）。
-- **embedding 模型**：用于全局记忆向量召回。
+- **vision 识图模型**：消息带图时转描述（`describe_image`）。
+- **embedding 模型**：`EmbeddingAdapter` 校验实例为 `EmbeddingProvider` 后调用 `get_embedding`，用于全局记忆向量召回。
 
-全部基于 aiohttp，支持流式 SSE 解析。
+无 aiohttp、无独立 SSE 解析，全部交给 AstrBot 提供商实现。
 
 ### 4.6 记忆与自我学习（memory）
 
@@ -134,7 +136,7 @@ AI 回复中途用户发新消息（且命中触发）时：
 - 单独的 AI 异步任务，**不定时、不频繁**地分析群上下文，判断有无隐性提及/相关话题。
 - 命中则提升该群活跃度（走 4.1 同一概率模型）。
 - 也服务于"冒泡"质量：冒泡命中时先判断话题接得上再开口。
-- aiohttp + asyncio 承载，任务多，单任务失败不拖垮主流程。
+- asyncio 承载，任务多，单任务失败不拖垮主流程。
 
 ### 4.8 主动动作
 
@@ -151,9 +153,9 @@ AI 回复中途用户发新消息（且命中触发）时：
 | attention | 冒泡基线 1~3%、活跃封顶 30%、衰减分钟数、@/reply 加成、唤醒前缀 |
 | segment | 分段符、转义符、分段发送间隔(秒)、单段最大字符数 |
 | context | 近 N 条完整数、历史压缩条数、每条压缩字符数 |
-| providers | chat / vision / embedding 各自 base_url、api_key、model |
+| providers | chat / vision / implicit 用 `select_provider` 下拉选 AstrBot 提供商；embedding 手填 provider_id；chat 多模态开关 |
 | memory | 记忆开关、跨群共享开关、召回条数 |
-| implicit | 隐性分析开关、分析最小间隔(分钟)、概率提升、独立分析模型（base_url/api_key/model）、分析提示词（留空用默认） |
+| implicit | 隐性分析开关、分析最小间隔(分钟)、概率提升、独立分析模型（`select_provider` 选提供商）、分析提示词（留空用默认） |
 | recall_cancel | 撤回取消开关 |
 
 ## 6. 变更记录
@@ -169,3 +171,5 @@ AI 回复中途用户发新消息（且命中触发）时：
 - `2026-07-31` 补充：手动补装饰阶段——接管 vanilla 流式会跳过 `on_decorating_result` 装饰钩子，现于 `_decorate_segment` 重放 `OnDecoratingResultEvent` 钩子（每段构造 `MessageEventResult` 后逐个调用注册的钩子，装饰结果即为最终发送内容）。
 - `2026-07-31` 补充：撤回取消——用户撤回触发 LLM 的消息后，等当前段输出完立即停止 LLM 回复；该撤回回复发送但不计入上下文，并从历史中移除该消息（留下「已撤回」占位）。实现：独立 `on_recall_notice` handler（aiocqhttp、priority=100，从 `raw_message` 读 `notice_type`/`message_id` 匹配当前任务的触发消息 id）；`GenerationTask` 增 cancel 信号，`stream_respond` 在段边界重查中断信号（`segment_token`），取消时丢弃后续缓冲。
 - `2026-07-31` 调整：上下文缓存友好化——`build_messages` 把图片/记忆/压缩历史等动态内容从「system 之后、recent 之前」移到消息列表末尾，保证 `system + recent 逐字对话` 作为稳定前缀，窗口未滑动时共享前缀近乎 100% 命中（详见 4.2）。
+- `2026-07-31` 调整：模型访问改走 AstrBot 提供商体系——移除插件自带 aiohttp `ChatClient` 与 base_url/api_key/model 配置；chat/vision/implicit 改用 `_special: "select_provider"` 面板选择、embedding 手填 provider_id，运行期 `provider_manager.get_provider_by_id()` 解析（llm.py 重写为 `LLMProvider` / `EmbeddingAdapter`，见 4.5）。
+- `2026-07-31` 约定：`_conf_schema.json` 中 `description` 为配置项标题、`hint` 为说明文字，说明性内容一律进 `hint`。
