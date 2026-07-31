@@ -6,6 +6,7 @@ user sends a new message mid-reply.
 """
 
 import asyncio
+import logging
 import random
 from pathlib import Path
 from typing import Any
@@ -104,6 +105,9 @@ class Main(Star):
 
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
+        if not hasattr(self, "logger"):
+            # Older AstrBot builds do not inject a plugin logger.
+            self.logger = logging.getLogger("astrbot")
         self._config = config
         self._init_from_config(config)
         self.active_tasks: dict[str, GenerationTask] = {}
