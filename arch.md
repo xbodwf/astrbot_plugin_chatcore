@@ -174,3 +174,5 @@ AI 回复中途用户发新消息（且命中触发）时：
 - `2026-07-31` 调整：模型访问改走 AstrBot 提供商体系——移除插件自带 aiohttp `ChatClient` 与 base_url/api_key/model 配置；chat/vision/implicit 改用 `_special: "select_provider"` 面板选择、embedding 手填 provider_id，运行期 `provider_manager.get_provider_by_id()` 解析（llm.py 重写为 `LLMProvider` / `EmbeddingAdapter`，见 4.5）。
 - `2026-07-31` 约定：`_conf_schema.json` 中 `description` 为配置项标题、`hint` 为说明文字，说明性内容一律进 `hint`。
 - `2026-07-31` 补充：推理内容过滤——流式/非流式输出统一剥离 `<think>...</think>` 推理块（`llm.py.ThinkStripper`，跨 chunk 边界与未闭合标签均可处理），防止思考内容泄漏给用户。
+- `2026-08-01` 调整：上下文防幻觉——系统提示明确「历史消息里的 [图片] 表示看不到内容、严禁编造图片内容」（当前消息附带图片可直接查看）；记忆召回背景块改为「过往对话片段（可能来自其他对话或其他人，不代表你本人执行过任何操作）」。
+- `2026-08-01` 调整：触发防抢话——群消息若 @ 的是别的用户（非 bot、非 @all），不参与软触发（`_addresses_other_user`）。

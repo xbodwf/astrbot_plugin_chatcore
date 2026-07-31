@@ -214,7 +214,10 @@ class ContextManager:
             background.append("当前消息中的图片内容:")
             background.extend(f"- {desc}" for desc in image_descriptions)
         if memory_texts:
-            background.append("你记得的相关信息:")
+            background.append(
+                "以下是你回忆起的过往对话片段（可能来自其他对话或其他人，"
+                "不代表你本人执行过任何操作，不要当成你做过的事）:"
+            )
             background.extend(f"- {text}" for text in memory_texts)
         if older:
             background.append("更早的对话（已压缩）:")

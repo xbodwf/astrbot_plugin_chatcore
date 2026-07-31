@@ -243,6 +243,9 @@ class Main(Star):
             if hard:
                 self.attention.record_hard_trigger(conv_id)
                 should_reply = self.hard_trigger_force or self.attention.should_respond(conv_id)
+            elif self._addresses_other_user(event):
+                # Directed at someone else; don't chime in on a soft trigger.
+                should_reply = False
             else:
                 should_reply = self.attention.should_respond(conv_id)
                 if should_reply:
@@ -364,6 +367,25 @@ class Main(Star):
                     return True
         lowered = text.lower()
         return any(w and lowered.startswith(w) for w in self.wake_prefix)
+
+    def _addresses_other_user(self, event: AstrMessageEvent) -> bool:
+        """Whether the message @-mentions a specific user other than the bot.
+
+        Such messages are directed at someone else, so the AI should not chime
+        in via soft-trigger. @all (``AtAll``) and @-ing the bot itself do not
+        count.
+
+        Args:
+            event: Current platform message event.
+
+        Returns:
+            True if the message @'s a non-bot, non-"all" user.
+        """
+        self_id = str(event.get_self_id())
+        for comp in event.get_messages():
+            if isinstance(comp, At) and str(comp.qq) not in ("all", self_id):
+                return True
+        return False
 
     async def _run_conversation(
         self,
@@ -496,6 +518,10 @@ class Main(Star):
                 "\n如需 @ 某人，在回复中写 `[[at:昵称]]`；如需回复某人的消息，"
                 "写 `[[reply:昵称]]`（昵称用最近对话里对方的名字）。"
             )
+        rules += (
+            "\n当前消息附带的图片可以直接查看；历史消息里的“[图片]”表示你"
+            "看不到该图片的实际内容，严禁编造或猜测图片内容。"
+        )
         return persona + rules
 
     async def _resolve_persona_prompt(self, conv_id: str) -> str:
