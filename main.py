@@ -216,6 +216,11 @@ class Main(Star):
         conv_id = event.unified_msg_origin
         msg_id = str(getattr(event.message_obj, "message_id", "") or "")
 
+        self.logger.info(
+            f"ChatCore recv | {'私聊' if is_private else '群聊'} | {conv_id}"
+            f" | {event.get_sender_name()}: {text or '[图片]'}"
+        )
+
         self.context_mgr.record(
             conv_id,
             "user",
@@ -406,6 +411,9 @@ class Main(Star):
                         return
                     if not task.suppress_record:
                         self.context_mgr.record(conv_id, "assistant", "bot", segment)
+                    self.logger.info(
+                        f"ChatCore send | {conv_id} | bot: {segment}"
+                    )
                     await self.context.send_message(
                         conv_id,
                         MessageChain(chain=chain),
@@ -432,6 +440,9 @@ class Main(Star):
                             self.context_mgr.record(
                                 conv_id, "assistant", "bot", trailing
                             )
+                        self.logger.info(
+                            f"ChatCore send | {conv_id} | bot: {trailing}"
+                        )
                         await self.context.send_message(
                             conv_id,
                             MessageChain(chain=chain),
