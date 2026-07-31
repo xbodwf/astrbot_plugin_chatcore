@@ -1,0 +1,9 @@
+name: astrbot_plugin_chatcore
+desc: A better chat core plugin for AstrBot, improving the weak native chat experience.
+short_desc: Better chat experience for AstrBot.
+author: xbodwf
+version: 0.1.0
+repo: https://github.com/xbodwf/astrbot_plugin_chatcore
+astrbot_version: ">=4.26"
+support_platforms:
+  - aiocqhttp
