@@ -8,12 +8,6 @@
         "type": "bool",
         "default": true
       },
-      "stream": {
-        "description": "流式输出",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后 AI 自己分段、逐段发送"
-      },
       "takeover": {
         "description": "接管模式",
         "type": "bool",

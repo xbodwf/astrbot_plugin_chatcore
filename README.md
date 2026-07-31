@@ -38,7 +38,6 @@
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `enabled` | `true` | 插件总开关 |
-| `stream` | `true` | 流式输出，开启后 AI 自己分段、逐段发送 |
 | `takeover` | `true` | 接管 AstrBot 原生 LLM 链路，避免重复回复 |
 | `private_force_reply` | `true` | 私聊必回，不参与概率 |
 | `group_enabled` | `true` | 群聊启用，关闭后群消息只记录不回复 |

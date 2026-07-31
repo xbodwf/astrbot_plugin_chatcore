@@ -212,7 +212,7 @@ class Main(Star):
         if not text and not images:
             return
 
-        is_private = event.get_message_type() == MessageType.PRIVATE_MESSAGE
+        is_private = event.get_message_type() == MessageType.FRIEND_MESSAGE
         conv_id = event.unified_msg_origin
         msg_id = str(getattr(event.message_obj, "message_id", "") or "")
 
