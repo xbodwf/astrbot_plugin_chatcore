@@ -310,8 +310,12 @@ class Main(Star):
             return
 
         text = event.get_message_str().strip()
-        if text.startswith("/"):
-            # Leave plugin commands untouched.
+        # AstrBot strips the configurable wake prefix (e.g. "/", "^", "&") from
+        # the message before handlers run, so sniffing for a literal "/" cannot
+        # tell commands apart. Instead trust AstrBot's own command matching:
+        # `handlers_parsed_params` is populated when a command handler matched
+        # this event, so leave those messages to the command pipeline.
+        if event.get_extra("handlers_parsed_params", {}):
             return
 
         components = event.get_messages()
