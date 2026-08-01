@@ -11,7 +11,7 @@
 
 import * as MUI from "./vendor/mui.full.js";
 
-const { React, ReactDOM } = MUI;
+const { React, ReactDOMClient } = MUI;
 const {
   Alert,
   Box,
@@ -761,7 +761,7 @@ async function boot() {
   } catch (err) {
     console.warn("ChatCore page bridge not ready:", err);
   }
-  ReactDOM.createRoot(document.getElementById("root")).render(
+  ReactDOMClient.createRoot(document.getElementById("root")).render(
     h(CssVarsProvider, { theme }, h(App)),
   );
 }
