@@ -64,6 +64,9 @@ HISTORY_SUMMARY_PROMPT = (
     "事件和结论，丢弃寒暄和无关细节。只输出摘要本身，不要任何前缀。\n\n"
 )
 
+# 模型声明"需要工具"的标记行（AI 在回复开头独占一行输出）。
+_TOOLS_REQUEST_MARK = "[[tools]]"
+
 
 class GenerationTask:
     """Tracks an in-flight streaming conversation and debounced messages.
@@ -567,6 +570,8 @@ class Main(Star):
             tool_set = self._build_tool_set()
             tool_round = False
             tool_rounds = 0
+            tools_armed = False
+            tools_requested = False
             while True:
                 if not tool_round:
                     task.suppress_record = False
@@ -632,7 +637,7 @@ class Main(Star):
                     async for resp in self.chat_client.chat_stream_raw(
                         messages,
                         images=image_urls,
-                        func_tool=tool_set,
+                        func_tool=(tool_set if (tool_round or tools_armed) else None),
                     ):
                         if resp.is_chunk:
                             text = self.chat_client._to_text(resp)
@@ -650,6 +655,11 @@ class Main(Star):
                 image_urls = []
 
                 async def send_fn(segment: str) -> None:
+                    nonlocal tools_requested
+                    # 无工具轮中模型声明需要工具: 丢弃该段，下一轮带工具重试。
+                    if not tools_armed and _TOOLS_REQUEST_MARK in segment:
+                        tools_requested = True
+                        return
                     chain = await self._decorate_segment(event, segment)
                     if not chain:
                         return
@@ -673,6 +683,17 @@ class Main(Star):
                 )
                 tool_round = False
                 if pending is None:
+                    # 无工具轮中模型声明需要工具: 升级为带工具的请求重试一轮。
+                    if (
+                        tools_requested
+                        and tool_set
+                        and not tools_armed
+                        and not tool_calls
+                        and tool_rounds == 0
+                    ):
+                        tools_armed = True
+                        tool_rounds += 1
+                        continue
                     # Stream finished naturally. If the model requested tool
                     # calls, execute them, feed the results back and loop
                     # again without rebuilding the messages (the tool results
@@ -680,6 +701,29 @@ class Main(Star):
                     if tool_calls and tool_set and tool_rounds < self.max_tool_rounds:
                         tool_rounds += 1
                         names, args_list, ids = tool_calls
+                        # OpenAI 协议: tool 结果必须跟在声明了这些 tool_calls
+                        # 的 assistant 消息之后，否则 provider 会当作孤儿消息
+                        # 丢弃，AI 永远看不到工具结果（表现为反复调用同一工具）。
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": tid,
+                                        "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": json.dumps(
+                                                args or {},
+                                                ensure_ascii=False,
+                                            ),
+                                        },
+                                    }
+                                    for name, args, tid in zip(names, args_list, ids)
+                                ],
+                            }
+                        )
                         for name, args, tid in zip(names, args_list, ids):
                             result = await self._execute_tool(
                                 event, tool_set, name, args or {}
@@ -797,6 +841,14 @@ class Main(Star):
                 "（而不是真的 @ / 回复）时，在它前面加 `"
                 + self.segment_escape
                 + "` 转义。"
+            )
+        if self.tools_enabled:
+            rules += (
+                "\n你可以使用工具完成查资料、获取信息、定时提醒等操作。"
+                "当且仅当完成用户请求必须使用工具时，在回复最开头单独写一行 `"
+                + _TOOLS_REQUEST_MARK
+                + "`（独占一行，前面不要有任何文字），插件会用带工具的请求"
+                "重试；不需要工具时直接正常回复，绝不要输出这个标记。"
             )
         if self.emoji_store:
             rules += (

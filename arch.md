@@ -243,13 +243,27 @@ AstrBot 4.23.4+ 插件页机制（`pages/<页面>/index.html` 由 dashboard ifra
 - **后端 API**：`register_web_api` 注册 `/chatcore/{profiles|memories|emoji|stats}` 等 REST 路由，页内 `apiGet/apiPost` 调用。
 - **资源合规**：`vendor/` 内每个第三方资源在 `pages/LICENSE` 注明协议（如 MIT/Apache-2.0）+ 作者 + 来源 URL；`.gitattributes` 标记 vendored 以免污染语言统计。
 
+### 4.17 工具调用（按需下发）（main.py / llm.py）
+
+让 AI 具备 function calling（查资料、定时提醒等），但**普通闲聊零工具开销**：
+
+- **按需下发（模型自主声明）**：常规轮次**不携带工具 schema**（回复快、token 省）。system prompt 告知模型：完成请求必须使用工具时，在回复最开头独占一行输出 `[[tools]]`。插件在分段发送时拦截该标记（该段不发送），下一轮以**带工具**的请求重试。是否需要工具由模型自己判断，无硬编码关键词。
+- **工具集**：`_build_tool_set()` 懒构建缓存——AstrBot 全局注册表 `llm_tools.func_list`（其他插件注册的工具）+ 内置 `FutureTaskTool`（复用 AstrBot 定时任务）+ 自研 `schedule_task`（`create/list/delete` 一次性提醒）。`chat.tools_enabled` 总开关，`chat.max_tool_rounds` 上限。
+- **执行**：`_execute_tool` 复用 AstrBot `FunctionToolExecutor`（构造最小 `AstrAgentContext` wrapper），内置/插件工具行为与 vanilla 一致；结果以 `role:"tool"` 回传。
+- **回传协议**：OpenAI 要求 tool 结果跟在带 `tool_calls` 声明的 assistant 消息之后，否则 AstrBot 的 `_sanitize_assistant_messages` 当作孤儿消息丢弃（表现为模型反复调用同一工具）。工具轮先 append assistant 声明（`tool_calls` 含 id/name/arguments JSON），再 append 各 tool 结果。
+- **定时任务调度**：`_scheduler_loop`（20s 轮询，JSON 持久化 `scheduled_jobs.json`）触发到期任务，构造 `CronMessageEvent` 走 `_run_conversation` 完整链路（人格/情绪/记忆/分段/表情）投递到目标会话。AstrBot 原生 cron 触发固定走 vanilla agent，无法注入，故调度器自研。
+
+### 4.18 回复中断续聊
+
+生成被中断（异常/取消/插件重载）时标记该会话（`_interrupted`，1 小时内有效）；下次该会话互动时在背景块注入「你上一条回复因故中断了，如果合适请接着把没说完的话补完」，让 AI 自然续上（详见 4.2 背景块注入路径）。
+
 ## 5. 配置项（_conf_schema.json）
 
 所有参数用户可调，分组：
 
 | 分组 | 关键项 |
 |---|---|
-| chat | 总开关、群/私聊开关、接管模式、多模态开关、主动动作标记开关（人格提示词取自 AstrBot，不在此配置；流式+智能分段为固定设计） |
+| chat | 总开关、群/私聊开关、接管模式、多模态开关、主动动作标记开关、工具调用开关、单次回复最大工具轮数（人格提示词取自 AstrBot，不在此配置；流式+智能分段为固定设计） |
 | attention | 冒泡基线 1~3%、活跃封顶 30%、衰减分钟数、@/reply 加成、唤醒前缀 |
 | segment | 分段符、转义符、分段发送间隔(秒)、单段最大字符数 |
 | context | 近 N 条完整数、历史压缩条数、每条压缩字符数 |
@@ -291,4 +305,6 @@ AstrBot 4.23.4+ 插件页机制（`pages/<页面>/index.html` 由 dashboard ifra
 - `2026-08-01` 设计：追赶 MaiBot 聊天能力（写入本文档，逐步开工）——人物画像+记忆写回（4.11）、表达风格学习（4.12）、带溯源的表情包系统（4.13）、情绪/状态系统（4.14）、退避策略读空气（4.15）、PluginPage WebUI（4.16，MUI MD3 + vendor 资源 + `.gitattributes`/LICENSE 合规）。
 - `2026-08-01` 实现：PluginPage WebUI 前端落地——MUI v9（MD3）经 esbuild 预构建为自包含 ESM `pages/dashboard/vendor/mui.full.js`（内联 React 19/ReactDOM/Emotion，离线可跑、页面无构建步骤）；`app.js` 用 `React.createElement` 免 JSX/Babel；双 Tab：监控（数据统计 + 注意力/上下文/情绪实况）+ 管理（画像/记忆/表情包/表达风格 CRUD）；`styles.css` 提供页面骨架样式；主题经 MutationObserver 监听宿主 `data-theme` 驱动 `useColorScheme().setMode` 深浅色自适应（见 4.16）。
 - `2026-08-01` 补充：表情包 WebUI 内联预览——iframe sandbox 无 `allow-same-origin`，不可直读二进制，新增 `GET .../emojis/<emoji_id>/image/data` 返回 base64 data URI JSON；父桥 `apiGet` 会解包 `response.data?.data`，故该路由返回 `{"data": "data:image/<mime>;base64,..."}` 后前端直接拿到 URI 字符串（`EmojiThumb` 处理）。
+- `2026-08-02` 补充：工具调用——按需下发（模型自主声明 `[[tools]]`，常规轮不携带工具 schema）、`_build_tool_set`（插件工具 + `FutureTaskTool` + `schedule_task`）、`FunctionToolExecutor` 复用、tool 结果回传协议（assistant tool_calls 声明先行，防孤儿丢弃）、自研定时任务调度器（`_scheduler_loop` + `CronMessageEvent` 复用完整回复链路）、回复中断续聊标记（见 4.17/4.18）。
+- `2026-08-02` 调整：工具请求标记 `[[tools]]` 在无工具轮被分段层拦截丢弃，模型声明后插件升级为带工具请求重试（仅允许一次升级，防循环）。
 
