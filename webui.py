@@ -230,7 +230,7 @@ class ChatCoreWebUI:
         return json_response({"data": data_uri})
 
     async def list_memories(self) -> dict:
-        """List all memory entries.
+        """List memory entries, optionally filtered by session tag.
 
         Returns:
             A memories payload.
@@ -238,7 +238,13 @@ class ChatCoreWebUI:
         memory = self.plugin.memory
         if not memory:
             return json_response({"memories": []})
-        return json_response({"memories": memory.list_entries()})
+        entries = memory.list_entries()
+        group_id = str(request.query.get("group_id", "") or "").strip()
+        if group_id:
+            entries = [
+                e for e in entries if group_id in [str(t) for t in e.get("tags", [])]
+            ]
+        return json_response({"memories": entries})
 
     async def delete_memory(self) -> dict:
         """Delete a memory entry by list index.

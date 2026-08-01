@@ -6,9 +6,12 @@ user sends a new message mid-reply.
 """
 
 import asyncio
+import json
 import logging
+import os
 import random
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +20,10 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import At, Image, Plain, Reply
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
+from astrbot.core.agent.run_context import ContextWrapper
+from astrbot.core.agent.tool import ToolSet
+from astrbot.core.astr_agent_context import AstrAgentContext
+from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
 from astrbot.core.message.message_event_result import (
     MessageEventResult,
     ResultContentType,
@@ -37,7 +44,7 @@ from .history import (
     build_friend_umo,
     clean_placeholder_text,
 )
-from .llm import EmbeddingAdapter, LLMProvider
+from .llm import EmbeddingAdapter, LLMProvider, ThinkStripper
 from .memory import MemoryStore
 from .profile import ProfileStore
 from .segmentation import stream_respond
@@ -131,9 +138,15 @@ class Main(Star):
         self._config = config
         self._init_from_config(config)
         self.active_tasks: dict[str, GenerationTask] = {}
+        self._interrupted: dict[str, float] = {}
         self._analysis_task: asyncio.Task | None = None
         self._expression_task: asyncio.Task | None = None
+        self._scheduled_jobs: dict[str, dict] = {}
+        self._scheduler_task: asyncio.Task | None = None
+        self._load_scheduled_jobs()
         ChatCoreWebUI(self).register_routes()
+        if self.tools_enabled:
+            self._scheduler_task = asyncio.create_task(self._scheduler_loop())
 
     def _init_from_config(self, config: AstrBotConfig) -> None:
         """Build all runtime components from the plugin config.
@@ -149,6 +162,9 @@ class Main(Star):
         chat_main_cfg = config.get("chat", {})
         self.markers_enabled = chat_main_cfg.get("markers_enabled", True)
         self.reminder = str(chat_main_cfg.get("reminder", "")).strip()
+        self.tools_enabled = chat_main_cfg.get("tools_enabled", True)
+        self.max_tool_rounds = max(1, int(chat_main_cfg.get("max_tool_rounds", 3)))
+        self._tool_set: ToolSet | None = None
 
         vision_cfg = providers.get("vision", {})
         self.vision_client = LLMProvider(
@@ -548,19 +564,28 @@ class Main(Star):
                 )
 
             current_text = first_text
+            tool_set = self._build_tool_set()
+            tool_round = False
+            tool_rounds = 0
             while True:
-                task.suppress_record = False
-                history_blocks = await self._inject_history_blocks(event, conv_id)
-                system_prompt = await self._build_system_prompt(conv_id)
-                if self.reminder:
-                    system_prompt = f"{system_prompt}\n\n{self.reminder}"
-                messages = self.context_mgr.build_messages(
-                    conv_id,
-                    system_prompt=system_prompt,
-                    memory_texts=await self._recall(conv_id, current_text),
-                    history_texts=history_blocks,
-                    profile_texts=await self._inject_profile(event),
-                )
+                if not tool_round:
+                    task.suppress_record = False
+                    history_blocks = await self._inject_history_blocks(event, conv_id)
+                    interrupted = self._interrupted.pop(conv_id, None)
+                    if interrupted is not None and time.time() - interrupted < 3600:
+                        history_blocks = list(history_blocks) + [
+                            "【提示】你上一条回复因故中断了，如果合适，请自然地接着把没说完的话补完。"
+                        ]
+                    system_prompt = await self._build_system_prompt(conv_id)
+                    if self.reminder:
+                        system_prompt = f"{system_prompt}\n\n{self.reminder}"
+                    messages = self.context_mgr.build_messages(
+                        conv_id,
+                        system_prompt=system_prompt,
+                        memory_texts=await self._recall(conv_id, current_text),
+                        history_texts=history_blocks,
+                        profile_texts=await self._inject_profile(event),
+                    )
 
                 # Replay OnLLMRequestEvent hooks (e.g. LLMPerception) so
                 # vanilla-ecosystem reminders still reach the model, then
@@ -599,10 +624,29 @@ class Main(Star):
                 )
                 image_urls = req.image_urls
 
-                stream_gen = self.chat_client.chat_stream(
-                    messages,
-                    images=image_urls,
-                )
+                tool_calls: tuple | None = None
+                stripper = ThinkStripper()
+
+                async def stream_gen():
+                    nonlocal tool_calls
+                    async for resp in self.chat_client.chat_stream_raw(
+                        messages,
+                        images=image_urls,
+                        func_tool=tool_set,
+                    ):
+                        if resp.is_chunk:
+                            text = self.chat_client._to_text(resp)
+                            if text:
+                                for delta in stripper.feed(text):
+                                    if delta:
+                                        yield delta
+                        elif resp.tools_call_name:
+                            tool_calls = (
+                                resp.tools_call_name,
+                                resp.tools_call_args,
+                                resp.tools_call_ids,
+                            )
+
                 image_urls = []
 
                 async def send_fn(segment: str) -> None:
@@ -619,7 +663,7 @@ class Main(Star):
                     )
 
                 pending = await stream_respond(
-                    stream_gen,
+                    stream_gen(),
                     send_fn,
                     delimiter=self.segment_delimiter,
                     escape_char=self.segment_escape,
@@ -627,7 +671,31 @@ class Main(Star):
                     max_segment_chars=self.max_segment_chars,
                     interrupt_check=task.signal,
                 )
+                tool_round = False
                 if pending is None:
+                    # Stream finished naturally. If the model requested tool
+                    # calls, execute them, feed the results back and loop
+                    # again without rebuilding the messages (the tool results
+                    # live in `messages`).
+                    if tool_calls and tool_set and tool_rounds < self.max_tool_rounds:
+                        tool_rounds += 1
+                        names, args_list, ids = tool_calls
+                        for name, args, tid in zip(names, args_list, ids):
+                            result = await self._execute_tool(
+                                event, tool_set, name, args or {}
+                            )
+                            messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tid,
+                                    "content": result,
+                                }
+                            )
+                            self.logger.info(
+                                f"ChatCore tool | {conv_id} | {name}: {result[:200]}"
+                            )
+                        tool_round = True
+                        continue
                     break
                 trailing, (next_text, cancelled) = pending
                 if trailing:
@@ -652,6 +720,7 @@ class Main(Star):
                 current_text = next_text
             if first_text:
                 self._writeback_profile(
+                    conv_id,
                     event.get_sender_id(),
                     event.get_sender_name(),
                     first_text,
@@ -659,9 +728,13 @@ class Main(Star):
             if self.emotion_mgr and first_text:
                 self.emotion_mgr.update_after_reply(conv_id, first_text)
         except asyncio.CancelledError:
+            # The generation was interrupted mid-reply (plugin reload, cancel).
+            # Mark the conversation so the next turn can offer to continue.
+            self._interrupted[conv_id] = time.time()
             raise
         except Exception as e:
             self.logger.error(f"ChatCore conversation failed: {e}")
+            self._interrupted[conv_id] = time.time()
             try:
                 await self.context.send_message(
                     conv_id,
@@ -716,6 +789,10 @@ class Main(Star):
             rules += (
                 "\n如需 @ 某人，在回复中写 `[[at:昵称]]`；如需回复某人的消息，"
                 "写 `[[reply:昵称]]`（昵称用最近对话里对方的名字）。"
+                "当你的回复是针对某个人、或回应较早的某条消息（最近一条消息"
+                "不是你说的对象时），务必用 `[[at:昵称]]` 或 `[[reply:昵称]]`"
+                "标注回复对象，避免对方不知道你在跟谁说话；只有你回应的是"
+                "紧挨着你的最近一条消息时才可不标注。"
                 "你确实需要原样输出 `[[at:...]]` / `[[reply:...]]` 这类文字"
                 "（而不是真的 @ / 回复）时，在它前面加 `"
                 + self.segment_escape
@@ -808,6 +885,304 @@ class Main(Star):
                         return messages
             messages.append({"role": "user", "content": merged})
         return messages
+
+    def _build_tool_set(self) -> ToolSet | None:
+        """Build the ToolSet from AstrBot's registered tools, once.
+
+        Includes all plugin-registered tools (``llm_tools.func_list``) plus
+        AstrBot's built-in future-task tool. None when tools are disabled or
+        nothing is registered.
+
+        Returns:
+            The ToolSet, or None when there are no tools.
+        """
+        if not self.tools_enabled:
+            return None
+        if self._tool_set is not None:
+            return self._tool_set
+        try:
+            from astrbot.core.agent.tool import FunctionTool
+            from astrbot.core.provider.register import llm_tools
+            from astrbot.core.tools.cron_tools import FutureTaskTool
+
+            ts = ToolSet()
+            for tool in llm_tools.func_list:
+                ts.add_tool(tool)
+            ts.add_tool(
+                self.context.get_llm_tool_manager().get_builtin_tool(FutureTaskTool)
+            )
+            ts.add_tool(
+                FunctionTool(
+                    name="schedule_task",
+                    description=(
+                        "Create, list or delete a scheduled reminder. "
+                        "Use action='create' with an ISO run_at datetime and a note "
+                        "describing what to say to the user when it fires; "
+                        "action='list' lists tasks; action='delete' removes one by job_id."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["create", "list", "delete"],
+                                "description": "Action to perform.",
+                            },
+                            "name": {
+                                "type": "string",
+                                "description": "Optional task label.",
+                            },
+                            "note": {
+                                "type": "string",
+                                "description": "What to say when the task fires.",
+                            },
+                            "run_at": {
+                                "type": "string",
+                                "description": "ISO datetime for one-time execution, e.g. 2026-02-02T08:00:00+08:00.",
+                            },
+                            "job_id": {
+                                "type": "string",
+                                "description": "Task id, required for delete.",
+                            },
+                        },
+                        "required": ["action"],
+                    },
+                    handler=self._schedule_tool_handler,
+                )
+            )
+            self._tool_set = ts if not ts.empty() else None
+        except Exception as e:
+            self.logger.warning(f"ChatCore: tool set build failed: {e}")
+            self._tool_set = None
+        return self._tool_set
+
+    async def _execute_tool(
+        self,
+        event: AstrMessageEvent,
+        tool_set: ToolSet,
+        name: str,
+        args: dict,
+    ) -> str:
+        """Execute one function-call and render its result as text.
+
+        Reuses AstrBot's ``FunctionToolExecutor`` with a minimal
+        ``AstrAgentContext`` wrapper, so built-in and plugin tools behave
+        exactly as they do in the vanilla pipeline.
+
+        Args:
+            event: The message event driving this conversation.
+            tool_set: The active ToolSet.
+            name: The tool name the model called.
+            args: The arguments the model passed.
+
+        Returns:
+            The tool result text (or an error message).
+        """
+        tool = tool_set.get_tool(name)
+        if not tool:
+            return (
+                f"error: tool {name} not found. "
+                f"Available tools are: {', '.join(tool_set.names())}"
+            )
+        wrapper = ContextWrapper(
+            context=AstrAgentContext(context=self.context, event=event)
+        )
+        results: list[str] = []
+        try:
+            async for res in FunctionToolExecutor.execute(tool, wrapper, **args):
+                if res is None:
+                    continue
+                content = getattr(res, "content", None)
+                if content is None:
+                    results.append(str(res))
+                    continue
+                for item in content:
+                    text = getattr(item, "text", None)
+                    if text:
+                        results.append(str(text))
+        except Exception as e:
+            self.logger.warning(f"ChatCore: tool {name} failed: {e}")
+            return f"error: tool {name} failed: {e}"
+        return "\n".join(results) or "The tool returned no content."
+
+    def _jobs_path(self) -> Path:
+        """Path of the persisted scheduled-jobs file.
+
+        Returns:
+            The JSON file path under the plugin data directory.
+        """
+        return (
+            Path(get_astrbot_plugin_data_path())
+            / "astrbot_plugin_chatcore"
+            / "scheduled_jobs.json"
+        )
+
+    def _load_scheduled_jobs(self) -> None:
+        """Restore persisted scheduled jobs (after a restart)."""
+        try:
+            data = json.loads(self._jobs_path().read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                self._scheduled_jobs = {
+                    str(k): v
+                    for k, v in data.items()
+                    if isinstance(v, dict) and v.get("conv_id") and v.get("note")
+                }
+        except (OSError, json.JSONDecodeError):
+            self._scheduled_jobs = {}
+
+    def _save_scheduled_jobs(self) -> None:
+        """Persist the scheduled jobs."""
+        try:
+            path = self._jobs_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(self._scheduled_jobs, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            os.replace(tmp, path)
+        except OSError as e:
+            self.logger.warning(f"ChatCore: save scheduled jobs failed: {e}")
+
+    async def _schedule_tool_handler(
+        self,
+        event: AstrMessageEvent,
+        action: str = "",
+        name: str = "",
+        note: str = "",
+        run_at: str = "",
+        job_id: str = "",
+    ) -> str:
+        """AI-facing tool to create / list / delete scheduled tasks.
+
+        Args:
+            event: The message event.
+            action: ``create`` / ``list`` / ``delete``.
+            name: Optional task label.
+            note: What the AI should say when the task fires.
+            run_at: ISO datetime for one-time execution.
+            job_id: Task id for ``delete``.
+
+        Returns:
+            A human-readable result.
+        """
+        action = str(action or "").strip().lower()
+        conv_id = event.unified_msg_origin
+        if action == "create":
+            run_at = str(run_at or "").strip()
+            if not note or not run_at:
+                return "error: note and run_at (ISO datetime) are required when action=create."
+            try:
+                from datetime import datetime
+
+                run_at_dt = datetime.fromisoformat(run_at)
+            except ValueError:
+                return "error: run_at must be ISO datetime, e.g., 2026-02-02T08:00:00+08:00"
+            import time as _time
+
+            jid = f"{int(_time.time() * 1000)}-{len(self._scheduled_jobs) + 1}"
+            self._scheduled_jobs[jid] = {
+                "conv_id": conv_id,
+                "name": str(name or "").strip() or "scheduled_task",
+                "note": note,
+                "run_at": run_at_dt.isoformat(),
+            }
+            self._save_scheduled_jobs()
+            return f"created scheduled task {jid}, will run at {run_at_dt.isoformat()}."
+        if action == "list":
+            if not self._scheduled_jobs:
+                return "no scheduled tasks."
+            lines = [
+                f"- {jid} | {job.get('name')} | {job.get('run_at')} | {job.get('note')[:40]}"
+                for jid, job in self._scheduled_jobs.items()
+            ]
+            return "scheduled tasks:\n" + "\n".join(lines)
+        if action == "delete":
+            jid = str(job_id or "").strip()
+            if jid not in self._scheduled_jobs:
+                return f"error: task {jid} not found."
+            del self._scheduled_jobs[jid]
+            self._save_scheduled_jobs()
+            return f"deleted scheduled task {jid}."
+        return "error: action must be create / list / delete."
+
+    async def _scheduler_loop(self) -> None:
+        """Poll due scheduled tasks and fire them through ChatCore."""
+        from datetime import datetime
+
+        while True:
+            try:
+                await asyncio.sleep(20)
+                now = datetime.now().astimezone()
+                due = [
+                    (jid, job)
+                    for jid, job in self._scheduled_jobs.items()
+                    if self._job_due(job, now)
+                ]
+                for jid, job in due:
+                    self._scheduled_jobs.pop(jid, None)
+                    self._save_scheduled_jobs()
+                    asyncio.create_task(
+                        self._run_scheduled(job["conv_id"], job["note"])
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger.warning(f"ChatCore: scheduler loop error: {e}")
+
+    @staticmethod
+    def _job_due(job: dict, now) -> bool:
+        """Whether a job's run_at has passed.
+
+        Args:
+            job: The scheduled job dict.
+            now: Current aware datetime.
+
+        Returns:
+            True when the job is due.
+        """
+        try:
+            from datetime import datetime
+
+            run_at = datetime.fromisoformat(job["run_at"])
+            if run_at.tzinfo is None:
+                run_at = run_at.astimezone()
+            return now >= run_at
+        except (KeyError, ValueError):
+            return False
+
+    async def _run_scheduled(self, conv_id: str, note: str) -> None:
+        """Execute a scheduled task through the normal ChatCore pipeline.
+
+        Args:
+            conv_id: Conversation identifier to deliver to.
+            note: The scheduled reminder text.
+        """
+        try:
+            from astrbot.core.cron.events import CronMessageEvent
+            from astrbot.core.platform.message_session import MessageSession
+
+            session = MessageSession.from_str(conv_id)
+            cron_event = CronMessageEvent(
+                context=self.context,
+                session=session,
+                message=note,
+                message_type=session.message_type,
+            )
+            self.context_mgr.record(
+                conv_id, "user", "定时任务", f"（定时任务提醒）{note}"
+            )
+            task = GenerationTask(conv_id, "")
+            self.active_tasks[conv_id] = task
+            await self._run_conversation(
+                task,
+                cron_event,
+                conv_id,
+                f"（定时任务提醒）{note}",
+                [],
+            )
+        except Exception as e:
+            self.logger.warning(f"ChatCore: scheduled job delivery failed: {e}")
 
     async def _resolve_persona_prompt(self, conv_id: str) -> str:
         """Resolve the persona prompt AstrBot applies to this conversation.
@@ -1147,6 +1522,7 @@ class Main(Star):
 
     def _writeback_profile(
         self,
+        conv_id: str,
         sender_id: str,
         nickname: str,
         text: str,
@@ -1154,18 +1530,25 @@ class Main(Star):
         """Schedule an async person-fact extraction for a replied message.
 
         Fire-and-forget: the summary model extracts stable facts about the
-        sender and merges them into their profile. Failures are logged only.
+        sender and merges them into their profile. The sender's recent
+        messages in this conversation are bundled into the extraction input so
+        profiles grow richer than a single message. Failures are logged only.
 
         Args:
+            conv_id: Conversation identifier.
             sender_id: Stable platform id of the sender.
             nickname: Display name of the sender.
-            text: The replied message text.
+            text: The triggering message text.
         """
 
         async def _run() -> None:
             try:
+                recent = self.context_mgr.recent_user_texts(conv_id, sender_id, limit=5)
+                if text not in recent:
+                    recent.insert(0, text)
+                material = "\n".join(recent)
                 facts = await self.profile_store.extract_facts(
-                    self.summary_client, nickname, text
+                    self.summary_client, nickname, material
                 )
                 if facts:
                     self.profile_store.merge(sender_id, nickname, facts)
@@ -1480,4 +1863,7 @@ class Main(Star):
         if self._expression_task:
             self._expression_task.cancel()
             self._expression_task = None
+        if self._scheduler_task:
+            self._scheduler_task.cancel()
+            self._scheduler_task = None
         self.active_tasks.clear()

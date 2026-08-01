@@ -37,6 +37,18 @@
         "type": "text",
         "default": "",
         "hint": "每次调用模型前附加给模型的提醒/环境信息（追加到系统提示末尾），可留空。第三方 on_llm_request 插件（如 LLMPerception）注入的环境信息也会照常生效"
+      },
+      "tools_enabled": {
+        "description": "工具调用",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后把 AstrBot 注册的工具（含定时任务/主动消息等内置工具）下发给模型，AI 可以调用工具并主动发起定时提醒"
+      },
+      "max_tool_rounds": {
+        "description": "单次回复最大工具轮数",
+        "type": "int",
+        "default": 3,
+        "hint": "防止工具调用死循环，达到轮数后强制输出文本回复"
       }
     }
   },
@@ -290,8 +302,8 @@
       "shared_across_groups": {
         "description": "跨群数据互通",
         "type": "bool",
-        "default": true,
-        "hint": "各群聊的数据/记忆互相共享"
+        "default": false,
+        "hint": "开启后各群/私聊的记忆互相共享；关闭则记忆按会话隔离，某群/私聊的记忆不会泄漏给其他群/私聊"
       },
       "max_recall": {
         "description": "每次请求最多召回的记忆片段数",

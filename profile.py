@@ -7,6 +7,7 @@ the exchange and merges them back into the profile, so ChatCore gradually
 "gets to know" the people it talks to. Persisted as JSON.
 """
 
+import difflib
 import json
 import os
 import re
@@ -15,11 +16,12 @@ from pathlib import Path
 from typing import Any
 
 _EXTRACT_PROMPT = (
-    "以下是一条群聊/私聊发言。请从中提取关于说话人 {name} 的稳定、有价值的人物事实，"
-    "例如身份、职业、称呼偏好、喜好、习惯、性格特点、与其他人/群的关系等。"
-    "忽略一次性的话题内容（如某件事的讨论、临时求助）。没有有价值信息就输出空数组。\n"
+    "以下是关于说话人 {name} 的发言记录（可能包含多条）。请从中提取关于 {name} "
+    "的稳定、有价值的人物事实，例如身份、职业、称呼偏好、喜好、习惯、性格特点、"
+    "与其他人/群的关系等。忽略一次性的话题内容（如某件事的讨论、临时求助）。"
+    "没有有价值信息就输出空数组。\n"
     '只输出 JSON 字符串数组，例如 ["小明是大学生", "喜欢喝奶茶"].\n'
-    "发言: {text}"
+    "发言记录:\n{text}"
 )
 
 _MAX_FACTS = 30
@@ -149,10 +151,18 @@ class ProfileStore:
             }
             self._profiles[person_id] = profile
         profile["nickname"] = nickname or profile.get("nickname", "")
-        existing = set(profile.get("facts", []))
-        added = [fact for fact in facts if fact not in existing]
+        existing = profile.get("facts", []) or []
+        added = []
+        for fact in facts:
+            # 近似去重: LLM 措辞变体（"小明是大学生" vs "小明在读大学"）不重复累积
+            if any(
+                difflib.SequenceMatcher(None, fact, old).ratio() > 0.65
+                for old in existing + added
+            ):
+                continue
+            added.append(fact)
         if added:
-            profile["facts"] = (profile.get("facts", []) + added)[-_MAX_FACTS:]
+            profile["facts"] = (existing + added)[-_MAX_FACTS:]
             profile["updated_at"] = now
             self._save()
 
@@ -198,7 +208,7 @@ class ProfileStore:
         message = text.strip()
         if not message:
             return []
-        prompt = _EXTRACT_PROMPT.format(name=name, text=message[:500])
+        prompt = _EXTRACT_PROMPT.format(name=name, text=message[:1500])
         try:
             raw = await client.chat(
                 [

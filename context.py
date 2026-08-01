@@ -208,16 +208,48 @@ class ContextManager:
         for conv_id in self._histories:
             history = self._history(conv_id)
             summary = self._summaries.get(conv_id)
+            summary_text = summary.get("text") if summary else ""
+            summary_text = summary_text or ""
             rows.append(
                 {
                     "conv_id": conv_id,
                     "messages": len(history),
                     "older_count": self.older_count(conv_id),
-                    "has_summary": bool(summary and summary[0]),
-                    "summary_len": len(summary[0]) if summary and summary[0] else 0,
+                    "has_summary": bool(summary_text),
+                    "summary_len": len(summary_text),
                 }
             )
         return rows
+
+    def recent_user_texts(
+        self,
+        conv_id: str,
+        sender_id: str,
+        limit: int = 5,
+    ) -> list[str]:
+        """Recent plain texts of one sender, newest first.
+
+        Used as extraction material for profile writeback so the profile is
+        built from more than the single triggering message.
+
+        Args:
+            conv_id: Conversation identifier.
+            sender_id: The sender's platform id.
+            limit: How many recent messages to return.
+
+        Returns:
+            The recent texts, empty when the sender has none.
+        """
+        texts: list[str] = []
+        for record in reversed(self._history(conv_id)):
+            if record.role != "user" or record.sender_id != sender_id:
+                continue
+            text = (record.text or "").strip()
+            if text and text not in ("[图片]", "[媒体(下载失败)]", "[转发消息]"):
+                texts.append(text)
+            if len(texts) >= limit:
+                break
+        return texts
 
     def find_message(self, conv_id: str, message_id: str) -> MessageRecord | None:
         """Find the most recent user message with the given platform id.

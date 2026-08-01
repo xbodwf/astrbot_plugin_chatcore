@@ -356,6 +356,8 @@ function ProfilesPanel() {
 function MemoriesPanel() {
   const { data, error, loading, reload } = useLoad(() => bridge.apiGet("memories"));
   const [busy, setBusy] = React.useState(false);
+  const [groupFilter, setGroupFilter] = React.useState("");
+  const [visibleCount, setVisibleCount] = React.useState(20);
   const memories = data?.memories || [];
 
   const doDelete = async (index) => {
@@ -368,17 +370,42 @@ function MemoriesPanel() {
     }
   };
 
+  const kw = groupFilter.trim().toLowerCase();
+  const filtered = kw
+    ? memories.filter((entry) =>
+        (entry.tags || []).some((tag) => String(tag).toLowerCase().includes(kw)),
+      )
+    : memories;
+  const visible = filtered.slice(0, visibleCount);
+  const showMore = filtered.length > visible.length;
+
   if (loading) return h(LoadingBox);
   return h(
     Box,
     null,
     h(ErrorBanner, { error }),
-    memories.length === 0
+    h(
+      Stack,
+      { direction: "row", spacing: 1, alignItems: "center", mb: 1.5 },
+      h(TextField, {
+        size: "small",
+        variant: "outlined",
+        placeholder: "按群/会话过滤（如 GroupMessage:384128966）",
+        value: groupFilter,
+        onChange: (e) => {
+          setGroupFilter(e.target.value);
+          setVisibleCount(20);
+        },
+        sx: { flex: 1, maxWidth: 420 },
+      }),
+      h(Typography, { variant: "caption", color: "text.secondary" }, `共 ${filtered.length} 条`),
+    ),
+    filtered.length === 0
       ? h(Typography, { variant: "body2", color: "text.secondary" }, "暂无记忆片段")
       : h(
           Stack,
           { direction: "column", spacing: 1 },
-          memories.map((entry) =>
+          visible.map((entry) =>
             h(
               Paper,
               { key: entry.index, variant: "outlined", sx: { p: 1.5 } },
@@ -412,6 +439,12 @@ function MemoriesPanel() {
             ),
           ),
         ),
+    showMore &&
+      h(
+        Button,
+        { size: "small", variant: "text", onClick: () => setVisibleCount((n) => n + 20) },
+        "加载更多",
+      ),
   );
 }
 
@@ -646,7 +679,13 @@ function ExpressionsPanel() {
                   Stack,
                   { direction: "row", spacing: 0.5, mt: 0.75, flexWrap: "wrap" },
                   style.jargon.map((item) =>
-                    h(Chip, { key: item, label: item, size: "small", variant: "outlined" }),
+                    h(Chip, {
+                      key: item.term,
+                      label: item.term,
+                      size: "small",
+                      variant: "outlined",
+                      title: `${item.meaning || ""}${item.example ? `（例: ${item.example}）` : ""}`,
+                    }),
                   ),
                 ),
               (style.samples || []).slice(0, 3).map((sample, idx) =>

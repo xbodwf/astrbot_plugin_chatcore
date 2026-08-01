@@ -158,6 +158,7 @@ class LLMProvider:
         *,
         temperature: float = 0.8,
         images: list[str] | None = None,
+        func_tool=None,
     ) -> str:
         """Get a full (non-streaming) chat completion text.
 
@@ -165,6 +166,7 @@ class LLMProvider:
             messages: OpenAI-style message list.
             temperature: Sampling temperature.
             images: Image URLs to attach to the request.
+            func_tool: Optional ToolSet for function calling.
 
         Returns:
             The assistant's reply text.
@@ -174,6 +176,7 @@ class LLMProvider:
             contexts=messages,
             image_urls=images or None,
             temperature=temperature,
+            func_tool=func_tool,
         )
         return strip_think(self._to_text(resp))
 
@@ -183,6 +186,7 @@ class LLMProvider:
         *,
         temperature: float = 0.8,
         images: list[str] | None = None,
+        func_tool=None,
     ) -> AsyncGenerator[str, None]:
         """Stream a chat completion, yielding text deltas.
 
@@ -190,6 +194,7 @@ class LLMProvider:
             messages: OpenAI-style message list.
             temperature: Sampling temperature.
             images: Image URLs to attach to the request.
+            func_tool: Optional ToolSet for function calling.
 
         Yields:
             Text deltas as they arrive. The trailing full-completion response
@@ -201,6 +206,7 @@ class LLMProvider:
             contexts=messages,
             image_urls=images or None,
             temperature=temperature,
+            func_tool=func_tool,
         ):
             if not resp.is_chunk:
                 continue
@@ -210,6 +216,38 @@ class LLMProvider:
             for delta in stripper.feed(text):
                 if delta:
                     yield delta
+
+    async def chat_stream_raw(
+        self,
+        messages: list[dict],
+        *,
+        temperature: float = 0.8,
+        images: list[str] | None = None,
+        func_tool=None,
+    ) -> AsyncGenerator[LLMResponse, None]:
+        """Stream raw LLM responses (chunks and the final completion).
+
+        The trailing full completion carries the accumulated function-call
+        fields (``tools_call_name`` etc.), which the text-level
+        ``chat_stream`` drops. Used by the tool-call loop.
+
+        Args:
+            messages: OpenAI-style message list.
+            temperature: Sampling temperature.
+            images: Image URLs to attach to the request.
+            func_tool: Optional ToolSet for function calling.
+
+        Yields:
+            Every LLMResponse, chunks included.
+        """
+        provider = await self._get()
+        async for resp in provider.text_chat_stream(
+            contexts=messages,
+            image_urls=images or None,
+            temperature=temperature,
+            func_tool=func_tool,
+        ):
+            yield resp
 
     async def describe_image(self, image_url: str) -> str:
         """Describe a single image with the vision provider.
