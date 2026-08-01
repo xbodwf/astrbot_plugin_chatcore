@@ -23,7 +23,6 @@ from astrbot.core.message.message_event_result import (
 )
 from astrbot.core.pipeline.context_utils import call_event_hook
 from astrbot.core.platform.message_type import MessageType
-from astrbot.core.provider.entities import TextPart
 from astrbot.core.star.star_handler import EventType, star_handlers_registry
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
@@ -771,8 +770,13 @@ class Main(Star):
         if req.prompt != current_text or req.extra_user_content_parts:
             merged = (req.prompt or "").strip()
             for part in req.extra_user_content_parts:
-                if isinstance(part, TextPart) and part.text:
-                    merged = f"{merged}\n{part.text}" if merged else part.text
+                text = (
+                    part.get("text")
+                    if isinstance(part, dict)
+                    else getattr(part, "text", None)
+                )
+                if text:
+                    merged = f"{merged}\n{text}" if merged else text
             merged = merged.strip()
             if not merged:
                 return messages
