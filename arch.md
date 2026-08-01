@@ -170,6 +170,79 @@ AI 回复中途用户发新消息（且命中触发）时：
 - 内存历史兜底：`find_message(conv_id, message_id)` 查不到 adapter 解析结果时，从插件内存历史取原文。
 - 深度上限 `context.quote_max_depth`（默认 15），防止循环引用与超深链拖垮性能。
 
+### 4.11 人物画像 + 记忆写回（profile.py）
+
+为每个用户维护**结构化画像**（区别于 4.6 的文本片段向量记忆），让 AI "越来越懂这个人"：
+
+- **画像字段**：`person_id`（platform+user_id）、昵称、稳定事实（`facts`）、偏好（`preferences`）、互动特点（`interaction`）、最近活跃时间。
+- **写回**：每次回复后异步 `_extract_person_facts`——用摘要模型从本轮对话提取**稳定的人物事实**（不是流水账），去重合并进该用户画像。
+- **注入**：`build_messages` 时把当前发送者的画像压缩成背景块注入（与记忆召回同级），`_truncate` 限长。
+- **持久化**：JSON 文件（插件数据目录），重启不丢。
+
+与 4.6 全局记忆的分工：记忆 = 向量召回的"片段"，画像 = 结构化的"对人的理解"；两者互不重叠。
+
+### 4.12 表达风格学习（expression.py）
+
+解决"永远 AI 腔"的最大短板：**从群聊学习表达方式，模仿群友**。
+
+- **收集**：异步定时任务（复用隐性分析的调度节奏）从各群抽取最近消息样本。
+- **分析**：LLM 从样本中提炼三类产出并落 JSON：
+  - 常用句式/语气（如 `hhh`、`绷不住了`、短句流、方言词）；
+  - 黑话词条及 LLM 推断的含义（`?` 有歧义时保留来源例句）；
+  - 该群表达风格的一句话总结。
+- **注入**：对应群的 system prompt 追加「表达风格」块，包含句式偏好 + 黑话表（带例句）。
+- **共享组**：`expression.shared_groups` 允许跨群互通表达风格（可选，默认仅本群生效）。
+
+### 4.13 表情包系统（带溯源）（emoji.py）
+
+吸收 MaiBot 教训（偷包与使用脱节、AI 只看到分类好的库里有什么、无法溯源、无法结合原语境理解含义）。ChatCore 设计为**带溯源的表情包对象**：
+
+- **数据模型**：每条表情包携带完整来源——
+  `emoji_id`、本地 `file_path`、`source_group`、`source_sender`、`source_message_id`、`source_text`（偷包时该消息的文字）、`source_context`（原上下文窗口）、`collected_at`、`category`（VLM 分类：开心/嘲讽/敷衍…）、`tags`、`usage_count`。
+- **收集（偷包）**：群消息带图且开启收集时，落库图片**并记录来源语境**（发送者/群/原消息文字/上下文窗口）；异步用视觉模型打分类与标签。**不是无意识偷图，每张都带出处**。
+- **检索使用**：AI 通过工具 `search_emoji(意图)` 检索，返回的条目**附来源语境原文**（如 `[表情: 草.jpg] 来源语境: "笑死，你这头像跟哈批一样"）——AI 先读到"这张图当初是配什么话用的"，再决定用不用，语义精准。
+- **使用回写**：AI 选用后 `usage_count+1`；WebUI 可查看、分类、删除、编辑标签。
+
+### 4.14 情绪/状态系统（emotion.py）
+
+让人格随聊天氛围流动，避免一个调子说话到底：
+
+- 每会话维护 `EmotionState(mood, energy, state_key, updated_at)`。
+- **情绪特质**：`emotion.trait`（rational_calm / neutral / sentimental）决定基线。
+- **状态列表**：`emotion.states` 可配置一组状态（每项含描述 + 替换概率），聊天氛围变化时按概率切换；回复后由 LLM 或启发式更新状态。
+- **注入**：当前状态描述进 system prompt（`当前情绪: 慵懒`），影响措辞长度与语气。
+
+### 4.15 退避策略（读空气）（attention.py 扩展）
+
+在 4.1 概率模型上补"该闭嘴时闭嘴"：
+
+- **冷却**：bot 刚回复过 → `attention.cool_down_seconds` 内抑制软触发（硬触发仍必回）。
+- **退避**：连续 soft-trigger 落空（没轮到说话）→ 临时降低后续概率（no_action 退避）。
+- **动态发言频率**：`attention.time_rules` 按时间段配置发言概率调整（如凌晨低、晚间高）。
+- **读空气**：他人高密度对话（无 @bot）时进一步压低冒泡概率；话题在 bot 上次发言后仍在延续则抬高。
+
+### 4.16 WebUI（PluginPage）
+
+AstrBot 4.23.4+ 插件页机制（`pages/<页面>/index.html` 由 dashboard iframe 托管，自动注入 `AstrBotPluginPage` 桥：`ready/apiGet/apiPost/upload/subscribeSSE`，相对资源自动加鉴权 token 重写；后端用 `context.register_web_api(route, handler, methods, desc)` 注册，暴露于 `/api/plug/...`）。
+
+- **页面结构**：
+  ```
+  pages/
+    dashboard/                 # 管理面板
+      index.html
+      app.js / styles.css
+      vendor/                  # MUI MD3 等第三方前端资源，提前下载备好
+      assets/
+    LICENSE                    # vendor 资源版权/许可声明（协议名+作者+出处）
+  .gitattributes               # vendor/ 打 linguist-vendored，避免计入代码占用分析
+  ```
+- **前端技术**：无构建步骤的纯静态页 + MUI Material Design 3（JS/CSS 提前下载进 `vendor/`，离线可用）；主题走 `data-theme` 自适应深浅色。
+- **页面内容**（两者都要）：
+  1. **记忆/画像/表情包管理**：查看/编辑/删除人物画像、记忆片段、表情包库（含来源溯源）；
+  2. **运行状态监控**：注意力活跃度曲线、上下文窗口占用、分段统计、退避冷却、情绪状态。
+- **后端 API**：`register_web_api` 注册 `/chatcore/{profiles|memories|emoji|stats}` 等 REST 路由，页内 `apiGet/apiPost` 调用。
+- **资源合规**：`vendor/` 内每个第三方资源在 `pages/LICENSE` 注明协议（如 MIT/Apache-2.0）+ 作者 + 来源 URL；`.gitattributes` 标记 vendored 以免污染语言统计。
+
 ## 5. 配置项（_conf_schema.json）
 
 所有参数用户可调，分组：
@@ -184,6 +257,11 @@ AI 回复中途用户发新消息（且命中触发）时：
 | memory | 记忆开关、跨群共享开关、召回条数 |
 | implicit | 隐性分析开关、分析最小间隔(分钟)、概率提升、独立分析模型（`select_provider` 选提供商）、分析提示词（留空用默认） |
 | recall_cancel | 撤回取消开关 |
+| profile | 画像开关、每会话注入条数/字符上限 |
+| expression | 表达学习开关、采样间隔、注入字符上限、跨群共享组 |
+| emoji | 表情包收集开关、存储上限、分类模型（`select_provider`）、收集白/黑名单 |
+| emotion | 情绪系统开关、情绪特质、状态列表与替换概率 |
+| backoff | 冷却秒数、退避衰减、时间段发言频率规则 |
 
 ## 6. 变更记录
 
@@ -209,3 +287,8 @@ AI 回复中途用户发新消息（且命中触发）时：
 - `2026-08-01` 补充：引用回溯——用户引用消息时沿 `Reply.chain` 递归解析引用链（`_extract_quote_chain`/`_resolve_quote_node`），被引内容以 `[引用了消息: ...]` 前缀注入；`MessageRecord.quote` 字段持久化；`find_message` 查内存历史兜底；深度上限 `context.quote_max_depth`（默认 15）。
 - `2026-08-01` 调整：分段器重写——`StreamSegmenter` 改用独占行匹配（`_try_exact`/`_try_standalone_line`），容忍 `\n\n---\n\n` 与结尾无换行 `---`，转义行不被匹配，`flush()` 丢弃结尾独立分隔符行，杜绝分隔符泄漏（见 4.3）；系统提示措辞改为「单独写一行」。
 - `2026-08-01` 补充：持久化聊天记录注入——新增 `history.py`（`build_umo`/`build_friend_umo`/`extract_text_history`/`render_history_block`/`HistoryReader.read_session`）；`main.py._inject_history_blocks` 自动注入当前会话历史 + 群聊注入同发送者私聊历史（`【记忆参考】`），配置 `history.inject_enabled`/`max_messages`/`max_chars`（见 4.9）。
+- `2026-08-01` 调整：分段符改用真实换行——默认 `delimiter` 由字面 `\n---\n` 改为真实换行 `\n---\n`（JSON 里直接回车），`main.py` 加载时把存量的字面 `\n` 归一化为真实换行；提示词明示「换行是真实换行符、不含反斜杠、不要写 \n 字面量、分隔符行前后不留空格不加反引号」；`segmentation._delimiter_core` 对字面 `\n`/`\r` 与真实换行一并剥离，两种存量配置都能命中独占行（见 4.3）。
+- `2026-08-01` 设计：追赶 MaiBot 聊天能力（写入本文档，逐步开工）——人物画像+记忆写回（4.11）、表达风格学习（4.12）、带溯源的表情包系统（4.13）、情绪/状态系统（4.14）、退避策略读空气（4.15）、PluginPage WebUI（4.16，MUI MD3 + vendor 资源 + `.gitattributes`/LICENSE 合规）。
+- `2026-08-01` 实现：PluginPage WebUI 前端落地——MUI v9（MD3）经 esbuild 预构建为自包含 ESM `pages/dashboard/vendor/mui.full.js`（内联 React 19/ReactDOM/Emotion，离线可跑、页面无构建步骤）；`app.js` 用 `React.createElement` 免 JSX/Babel；双 Tab：监控（数据统计 + 注意力/上下文/情绪实况）+ 管理（画像/记忆/表情包/表达风格 CRUD）；`styles.css` 提供页面骨架样式；主题经 MutationObserver 监听宿主 `data-theme` 驱动 `useColorScheme().setMode` 深浅色自适应（见 4.16）。
+- `2026-08-01` 补充：表情包 WebUI 内联预览——iframe sandbox 无 `allow-same-origin`，不可直读二进制，新增 `GET .../emojis/<emoji_id>/image/data` 返回 base64 data URI JSON；父桥 `apiGet` 会解包 `response.data?.data`，故该路由返回 `{"data": "data:image/<mime>;base64,..."}` 后前端直接拿到 URI 字符串（`EmojiThumb` 处理）。
+

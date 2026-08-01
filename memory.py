@@ -55,9 +55,7 @@ class MemoryStore:
             return
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-            self._entries = [
-                e for e in data if isinstance(e, dict) and e.get("vec")
-            ]
+            self._entries = [e for e in data if isinstance(e, dict) and e.get("vec")]
         except (OSError, json.JSONDecodeError):
             self._entries = []
 
@@ -134,3 +132,34 @@ class MemoryStore:
             Entry count.
         """
         return len(self._entries)
+
+    def list_entries(self) -> list[dict]:
+        """List all stored memories for management (WebUI).
+
+        Returns:
+            A list of entry summaries (without embedding vectors).
+        """
+        return [
+            {
+                "index": i,
+                "text": e.get("text", ""),
+                "tags": e.get("tags", []),
+                "ts": e.get("ts", 0),
+            }
+            for i, e in enumerate(self._entries)
+        ]
+
+    def delete_entry(self, index: int) -> bool:
+        """Delete a memory entry by its list index.
+
+        Args:
+            index: Index returned by ``list_entries``.
+
+        Returns:
+            True if an entry was removed.
+        """
+        if not 0 <= index < len(self._entries):
+            return False
+        self._entries.pop(index)
+        self._save()
+        return True

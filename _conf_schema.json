@@ -73,6 +73,49 @@
         "type": "list",
         "default": ["bot", "ai", "机器人"],
         "hint": "不带 @ 直接喊也能触发"
+      },
+      "cool_down_seconds": {
+        "description": "回复冷却(秒)",
+        "type": "int",
+        "default": 120,
+        "hint": "AI 刚回复过，该时长内抑制软触发（被 @ 等硬触发仍必回）"
+      },
+      "no_action_backoff": {
+        "description": "落空退避系数",
+        "type": "float",
+        "default": 0.6,
+        "hint": "连续软触发落空（没轮到说话）时，每落空一次把概率乘以该系数"
+      },
+      "backoff_floor": {
+        "description": "退避下限",
+        "type": "float",
+        "default": 0.25,
+        "hint": "退避最多把概率压到多少倍（0~1），避免完全闭嘴"
+      },
+      "time_rules": {
+        "description": "时段发言频率规则",
+        "type": "list",
+        "item_type": "object",
+        "default": [],
+        "hint": "按时间段调整发言概率，如凌晨压低、晚间抬高。每项: {\"start\": \"00:00\", \"end\": \"06:00\", \"multiplier\": 0.2}；start>end 视为跨夜"
+      },
+      "read_air_factor": {
+        "description": "读空气压低系数",
+        "type": "float",
+        "default": 0.5,
+        "hint": "他人高密度对话（未 @bot）时，把冒泡概率乘以该系数"
+      },
+      "others_density_threshold": {
+        "description": "高密度对话判定条数",
+        "type": "int",
+        "default": 3,
+        "hint": "3 分钟内他人发言达到该条数即视为在激烈讨论"
+      },
+      "followup_boost": {
+        "description": "话题延续加成",
+        "type": "float",
+        "default": 0.05,
+        "hint": "bot 上次发言后话题仍在延续时，给概率的额外提升"
       }
     }
   },
@@ -296,6 +339,122 @@
         "type": "bool",
         "default": true,
         "hint": "用户撤回触发消息后，停止 AI 回复"
+      }
+    }
+  },
+  "profile": {
+    "description": "人物画像",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "人物画像开关",
+        "type": "bool",
+        "default": true,
+        "hint": "为每个用户维护结构化画像（稳定事实/偏好/互动特点），回复后自动提取写回，构建请求时注入"
+      },
+      "max_chars": {
+        "description": "单条画像注入上限(字符)",
+        "type": "int",
+        "default": 600,
+        "hint": "压缩后注入上下文的画像文本最大字符数"
+      }
+    }
+  },
+  "expression": {
+    "description": "表达风格学习",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "表达学习开关",
+        "type": "bool",
+        "default": true,
+        "hint": "定期从群聊学习句式/语气/黑话，注入系统提示让 AI 说话更像群友"
+      },
+      "interval_minutes": {
+        "description": "学习采样间隔(分钟)",
+        "type": "int",
+        "default": 60,
+        "hint": "多久采样一次群聊记录进行风格学习，最小 30 分钟"
+      },
+      "max_chars": {
+        "description": "风格注入上限(字符)",
+        "type": "int",
+        "default": 800,
+        "hint": "注入系统提示的表达风格文本最大字符数"
+      },
+      "shared_groups": {
+        "description": "表达互通群列表",
+        "type": "list",
+        "item_type": "text",
+        "default": [],
+        "hint": "这些群的表达风格会互相借鉴（只有风格受影响，记忆不受影响）。填 unified_msg_origin"
+      }
+    }
+  },
+  "emoji": {
+    "description": "表情包系统",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "表情包开关",
+        "type": "bool",
+        "default": true,
+        "hint": "收集群内图片建立带溯源的表情包库，AI 回复可用 [[emoji:意图或编号]] 发送"
+      },
+      "max_entries": {
+        "description": "表情包库存上限",
+        "type": "int",
+        "default": 500,
+        "hint": "超过上限后淘汰最久未使用的表情包"
+      },
+      "vision_provider_id": {
+        "description": "分类视觉模型",
+        "type": "text",
+        "default": "",
+        "hint": "用于描述并分类表情包的视觉模型 provider id；留空则复用对话模型"
+      }
+    }
+  },
+  "emotion": {
+    "description": "情绪/状态系统",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "情绪系统开关",
+        "type": "bool",
+        "default": true,
+        "hint": "每会话维护情绪状态，回复后按氛围概率切换，注入系统提示影响措辞语气"
+      },
+      "trait": {
+        "description": "情绪特质",
+        "type": "list",
+        "default": "neutral",
+        "hint": "决定情绪基线：rational_calm（理性克制）/ neutral（中性）/ sentimental（感性细腻）",
+        "choices": ["rational_calm", "neutral", "sentimental"]
+      },
+      "states": {
+        "description": "可切换状态列表",
+        "type": "list",
+        "item_type": "object",
+        "default": [
+          {"key": "兴奋", "description": "热情、话变多、可以多用感叹号", "switch_prob": 0.2},
+          {"key": "慵懒", "description": "话少、简短、慢悠悠", "switch_prob": 0.2},
+          {"key": "严肃", "description": "认真、正经、尽量客观严谨", "switch_prob": 0.15},
+          {"key": "调侃", "description": "带点玩笑、损友风格，但不过分", "switch_prob": 0.15}
+        ],
+        "hint": "每项含 key / description / switch_prob（被选中概率）"
+      },
+      "switch_probability": {
+        "description": "状态切换概率",
+        "type": "float",
+        "default": 0.5,
+        "hint": "氛围变化（回复后）时实际切换情绪的概率（0~1）"
+      },
+      "decay_seconds": {
+        "description": "情绪回落时间(秒)",
+        "type": "int",
+        "default": 1800,
+        "hint": "该时长无互动后情绪回到基线，避免一直停留在一个状态"
       }
     }
   }

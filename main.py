@@ -8,6 +8,7 @@ user sends a new message mid-reply.
 import asyncio
 import logging
 import random
+import re
 from pathlib import Path
 from typing import Any
 
@@ -26,17 +27,24 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 from .actions import parse_actions
 from .attention import AttentionManager
 from .context import ContextManager
+from .emoji import EmojiStore, classify_emoji
+from .emotion import EmotionManager
+from .expression import ExpressionStore
 from .history import HistoryReader, build_friend_umo
 from .llm import EmbeddingAdapter, LLMProvider
 from .memory import MemoryStore
+from .profile import ProfileStore
 from .segmentation import stream_respond
+from .webui import ChatCoreWebUI
 
 DEFAULT_IMPLICIT_PROMPT = (
     "你是聊天活跃度分析器。判断群聊最近记录中是否有人隐性提及机器人、"
     "在邀请机器人参与话题、或有机器人值得参与的话题。只回答“是”或“否”。"
 )
 
-FALLBACK_SYSTEM_PROMPT = "你是一个友善、自然的聊天机器人，请像真人一样聊天，回复不要机械化。"
+FALLBACK_SYSTEM_PROMPT = (
+    "你是一个友善、自然的聊天机器人，请像真人一样聊天，回复不要机械化。"
+)
 
 HISTORY_SUMMARY_PROMPT = (
     "请把下面的群聊/对话历史压缩成一段简洁的中文摘要，保留关键人物、"
@@ -118,6 +126,8 @@ class Main(Star):
         self._init_from_config(config)
         self.active_tasks: dict[str, GenerationTask] = {}
         self._analysis_task: asyncio.Task | None = None
+        self._expression_task: asyncio.Task | None = None
+        ChatCoreWebUI(self).register_routes()
 
     def _init_from_config(self, config: AstrBotConfig) -> None:
         """Build all runtime components from the plugin config.
@@ -150,6 +160,13 @@ class Main(Star):
             active_cap=attn.get("active_max_prob", 0.30),
             decay_minutes=attn.get("decay_minutes", 10.0),
             hard_trigger_boost=attn.get("hard_trigger_boost", 0.10),
+            cool_down_seconds=attn.get("cool_down_seconds", 120),
+            no_action_backoff=attn.get("no_action_backoff", 0.6),
+            backoff_floor=attn.get("backoff_floor", 0.25),
+            time_rules=attn.get("time_rules", []),
+            read_air_factor=attn.get("read_air_factor", 0.5),
+            others_density_threshold=attn.get("others_density_threshold", 3),
+            followup_boost=attn.get("followup_boost", 0.05),
         )
         self.hard_trigger_force = attn.get("hard_trigger_force", True)
         self.wake_prefix = [str(w).lower() for w in attn.get("wake_prefix", [])]
@@ -170,9 +187,7 @@ class Main(Star):
         self.history_max_chars = max(1, int(history_cfg.get("max_chars", 1200)))
 
         seg = config.get("segment", {})
-        self.segment_delimiter = seg.get("delimiter", "\n---\n").replace(
-            "\\n", "\n"
-        )
+        self.segment_delimiter = seg.get("delimiter", "\n---\n").replace("\\n", "\n")
         self.segment_escape = seg.get("escape_char", "\\")
         self.segment_interval = seg.get("interval", 1.0)
         self.max_segment_chars = seg.get("max_segment_chars", 600)
@@ -190,6 +205,72 @@ class Main(Star):
                 / "memory.json"
             )
             self.memory = MemoryStore(embed_adapter.embed, path)
+
+        profile_cfg = config.get("profile", {})
+        self.profile_store = None
+        if profile_cfg.get("enabled", True) and self.summary_client:
+            profile_path = (
+                Path(get_astrbot_plugin_data_path())
+                / "astrbot_plugin_chatcore"
+                / "profiles.json"
+            )
+            self.profile_store = ProfileStore(
+                profile_path,
+                max_chars=int(profile_cfg.get("max_chars", 600)),
+            )
+
+        expr_cfg = config.get("expression", {})
+        self.expression_store = None
+        self.expression_shared_groups: list[str] = []
+        if expr_cfg.get("enabled", True) and self.summary_client:
+            expr_path = (
+                Path(get_astrbot_plugin_data_path())
+                / "astrbot_plugin_chatcore"
+                / "expression.json"
+            )
+            self.expression_store = ExpressionStore(
+                expr_path,
+                max_chars=int(expr_cfg.get("max_chars", 800)),
+            )
+            self.expression_shared_groups = [
+                str(g).strip()
+                for g in expr_cfg.get("shared_groups", [])
+                if str(g).strip()
+            ]
+        self.expression_interval = max(
+            30,
+            int(expr_cfg.get("interval_minutes", 60)),
+        )
+
+        emoji_cfg = config.get("emoji", {})
+        self.emoji_store = None
+        self.emoji_vision_client = None
+        if emoji_cfg.get("enabled", True):
+            emoji_root = (
+                Path(get_astrbot_plugin_data_path())
+                / "astrbot_plugin_chatcore"
+                / "emoji"
+            )
+            self.emoji_store = EmojiStore(
+                emoji_root / "images",
+                emoji_root / "index.json",
+                max_entries=int(emoji_cfg.get("max_entries", 500)),
+            )
+            if emoji_cfg.get("vision_provider_id"):
+                self.emoji_vision_client = LLMProvider(
+                    self.context,
+                    emoji_cfg["vision_provider_id"],
+                )
+
+        emotion_cfg = config.get("emotion", {})
+        self.emotion_mgr = None
+        if emotion_cfg.get("enabled", True):
+            self.emotion_mgr = EmotionManager(
+                trait=str(emotion_cfg.get("trait", "neutral")),
+                states=emotion_cfg.get("states", None),
+                switch_probability=float(emotion_cfg.get("switch_probability", 0.5)),
+                decay_seconds=float(emotion_cfg.get("decay_seconds", 1800)),
+            )
 
         implicit_cfg = config.get("implicit", {})
         self.implicit_enabled = implicit_cfg.get("enabled", True)
@@ -265,9 +346,12 @@ class Main(Star):
         if is_private:
             should_reply = chat_cfg.get("private_force_reply", True)
         elif chat_cfg.get("group_enabled", True):
+            self.attention.record_others_message(conv_id)
             if hard:
                 self.attention.record_hard_trigger(conv_id)
-                should_reply = self.hard_trigger_force or self.attention.should_respond(conv_id)
+                should_reply = self.hard_trigger_force or self.attention.should_respond(
+                    conv_id
+                )
             elif self._addresses_other_user(event):
                 # Directed at someone else; don't chime in on a soft trigger.
                 should_reply = False
@@ -275,10 +359,18 @@ class Main(Star):
                 should_reply = self.attention.should_respond(conv_id)
                 if should_reply:
                     self.attention.record_interaction(conv_id)
+                    self.attention.record_soft_hit(conv_id)
+                else:
+                    self.attention.record_soft_miss(conv_id)
 
         if self.memory:
             asyncio.create_task(
                 self._remember(conv_id, event.get_sender_name(), text),
+            )
+
+        if self.emoji_store and images:
+            asyncio.create_task(
+                self._collect_emoji(conv_id, event, images, text),
             )
 
         takeover = chat_cfg.get("takeover", True)
@@ -430,6 +522,7 @@ class Main(Star):
             images: Images attached to the triggering message.
         """
         try:
+            self.attention.record_reply(conv_id)
             image_urls: list[str] = []
             if self.chat_multimodal:
                 image_urls = [
@@ -450,6 +543,7 @@ class Main(Star):
                     system_prompt=await self._build_system_prompt(conv_id),
                     memory_texts=await self._recall(conv_id, current_text),
                     history_texts=history_blocks,
+                    profile_texts=await self._inject_profile(event),
                 )
 
                 stream_gen = self.chat_client.chat_stream(
@@ -465,9 +559,7 @@ class Main(Star):
                     if not task.suppress_record:
                         self.context_mgr.record(conv_id, "assistant", "bot", segment)
                         self._schedule_summary(conv_id)
-                    self.logger.info(
-                        f"ChatCore send | {conv_id} | bot: {segment}"
-                    )
+                    self.logger.info(f"ChatCore send | {conv_id} | bot: {segment}")
                     await self.context.send_message(
                         conv_id,
                         MessageChain(chain=chain),
@@ -495,9 +587,7 @@ class Main(Star):
                                 conv_id, "assistant", "bot", trailing
                             )
                             self._schedule_summary(conv_id)
-                        self.logger.info(
-                            f"ChatCore send | {conv_id} | bot: {trailing}"
-                        )
+                        self.logger.info(f"ChatCore send | {conv_id} | bot: {trailing}")
                         await self.context.send_message(
                             conv_id,
                             MessageChain(chain=chain),
@@ -507,6 +597,14 @@ class Main(Star):
                     # current segment instead of restarting.
                     break
                 current_text = next_text
+            if first_text:
+                self._writeback_profile(
+                    event.get_sender_id(),
+                    event.get_sender_name(),
+                    first_text,
+                )
+            if self.emotion_mgr and first_text:
+                self.emotion_mgr.update_after_reply(conv_id, first_text)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -534,7 +632,9 @@ class Main(Star):
         Returns:
             The full system prompt.
         """
-        persona = (await self._resolve_persona_prompt(conv_id)) or FALLBACK_SYSTEM_PROMPT
+        persona = (
+            await self._resolve_persona_prompt(conv_id)
+        ) or FALLBACK_SYSTEM_PROMPT
         delim = self.segment_delimiter.strip() or self.segment_delimiter
         rules = (
             "\n\n回复规则：你可以自行分段，把回复拆成多条消息依次发送。"
@@ -552,6 +652,12 @@ class Main(Star):
                 "\n如需 @ 某人，在回复中写 `[[at:昵称]]`；如需回复某人的消息，"
                 "写 `[[reply:昵称]]`（昵称用最近对话里对方的名字）。"
             )
+        if self.emoji_store:
+            rules += (
+                "\n如需发表情包，在回复中写 `[[emoji:意图或编号]]`，"
+                "例如 `[[emoji:嘲讽]]`。插件会结合表情包来源语境选择最合适的一张"
+                "作为图片发送。"
+            )
         rules += (
             "\n当前消息附带的图片可以直接查看；历史消息里的“[图片]”表示你"
             "看不到该图片的实际内容，严禁编造或猜测图片内容；带"
@@ -559,6 +665,22 @@ class Main(Star):
             "用户带“[引用了消息: ...]”前缀时，括号内就是被引用的原消息内容，"
             "可据此回看对方引用的内容。"
         )
+        style = (
+            self.expression_store.render(
+                conv_id,
+                self.expression_shared_groups,
+            )
+            if self.expression_store
+            else None
+        )
+        if style:
+            rules += (
+                "\n\n【表达风格参考】以下是从本群聊天中学到的表达风格与黑话，"
+                "请自然地融入你的回复（不要生硬套用，不要引用本段原文）:"
+                f"\n{style}"
+            )
+        if self.emotion_mgr:
+            rules += self.emotion_mgr.inject_text(conv_id)
         return persona + rules
 
     async def _resolve_persona_prompt(self, conv_id: str) -> str:
@@ -592,13 +714,16 @@ class Main(Star):
         except Exception:
             pass
         try:
-            _, persona, _, _ = (
-                await self.context.persona_manager.resolve_selected_persona(
-                    umo=conv_id,
-                    conversation_persona_id=conversation_persona_id,
-                    platform_name="aiocqhttp",
-                    provider_settings=provider_settings,
-                )
+            (
+                _,
+                persona,
+                _,
+                _,
+            ) = await self.context.persona_manager.resolve_selected_persona(
+                umo=conv_id,
+                conversation_persona_id=conversation_persona_id,
+                platform_name="aiocqhttp",
+                provider_settings=provider_settings,
             )
         except Exception as e:
             self.logger.warning(f"Persona resolution failed: {e}")
@@ -639,6 +764,45 @@ class Main(Star):
                 break
         return chain
 
+    async def _segment_with_emoji(self, event: AstrMessageEvent, segment: str) -> list:
+        """Build a segment's message chain, resolving emoji markers.
+
+        ``[[emoji:意图或编号]]`` markers are removed from the text; each is
+        resolved (search + context-aware pick) and appended as an image
+        component. When the segment contains no text the chain is just the
+        images.
+
+        Args:
+            event: The message event that triggered this conversation.
+            segment: The generated segment text.
+
+        Returns:
+            The message chain with emoji images appended.
+        """
+        emoji_queries: list[str] = []
+
+        def _extract(match: re.Match) -> str:
+            emoji_queries.append(match.group(1))
+            return ""
+
+        clean = re.sub(r"\[\[emoji:([^\]]+)\]\]", _extract, segment)
+        chain = self._segment_to_chain(event.unified_msg_origin, clean)
+        if emoji_queries and self.emoji_store:
+            for query in emoji_queries:
+                emoji_id = await self._resolve_emoji_query(
+                    event.unified_msg_origin,
+                    query,
+                )
+                if not emoji_id:
+                    continue
+                path = self.emoji_store.file_path(emoji_id)
+                if not path or not Path(path).is_file():
+                    continue
+                self.emoji_store.mark_used(emoji_id)
+                chain.append(Image.fromFileSystem(path))
+                self.logger.info(f"ChatCore send emoji | {emoji_id} | query={query}")
+        return chain
+
     async def _decorate_segment(self, event: AstrMessageEvent, segment: str) -> list:
         """Replay AstrBot's pre-send decoration hooks on one streamed segment.
 
@@ -648,6 +812,10 @@ class Main(Star):
         ``ResultDecorateStage``. Re-run them so plugins can still modify each
         reply before it is sent.
 
+        Emoji markers (``[[emoji:意图或编号]]``) are resolved first: the
+        cleaned text becomes the message chain and each chosen emoji is sent as
+        an image component.
+
         Args:
             event: The message event that triggered this conversation.
             segment: The generated segment text.
@@ -655,9 +823,8 @@ class Main(Star):
         Returns:
             The final message chain to send, or an empty list when suppressed.
         """
-        result = MessageEventResult(
-            chain=self._segment_to_chain(event.unified_msg_origin, segment)
-        )
+        chain = await self._segment_with_emoji(event, segment)
+        result = MessageEventResult(chain=chain)
         result.set_result_content_type(ResultContentType.STREAMING_FINISH)
         event.set_result(result)
         try:
@@ -835,6 +1002,162 @@ class Main(Star):
             self.logger.warning(f"Memory recall failed: {e}")
         return None
 
+    async def _inject_profile(self, event: AstrMessageEvent) -> list[str]:
+        """Build the current sender's profile block for context injection.
+
+        Args:
+            event: Current platform message event.
+
+        Returns:
+            A single profile block, or an empty list when absent/disabled.
+        """
+        if not self.profile_store:
+            return []
+        sender_id = event.get_sender_id()
+        if not sender_id:
+            return []
+        text = self.profile_store.render(sender_id)
+        return [text] if text else []
+
+    def _writeback_profile(
+        self,
+        sender_id: str,
+        nickname: str,
+        text: str,
+    ) -> None:
+        """Schedule an async person-fact extraction for a replied message.
+
+        Fire-and-forget: the summary model extracts stable facts about the
+        sender and merges them into their profile. Failures are logged only.
+
+        Args:
+            sender_id: Stable platform id of the sender.
+            nickname: Display name of the sender.
+            text: The replied message text.
+        """
+
+        async def _run() -> None:
+            try:
+                facts = await self.profile_store.extract_facts(
+                    self.summary_client, nickname, text
+                )
+                if facts:
+                    self.profile_store.merge(sender_id, nickname, facts)
+                    self.logger.info(
+                        f"ChatCore profile | {sender_id} +{len(facts)} facts"
+                    )
+            except Exception as e:
+                self.logger.warning(f"Profile writeback failed: {e}")
+
+        if self.profile_store and text:
+            asyncio.create_task(_run())
+
+    async def _collect_emoji(
+        self,
+        conv_id: str,
+        event: AstrMessageEvent,
+        images: list[Image],
+        text: str,
+    ) -> None:
+        """Collect an emoji image into the library with full provenance.
+
+        Copies the first image of a message into the emoji store, records the
+        source (group, sender, original text and a context window), then
+        classifies it asynchronously from the image description plus that
+        context. Failures are logged only.
+
+        Args:
+            conv_id: Conversation identifier.
+            event: The message event.
+            images: Image components of the message.
+            text: The message's text.
+        """
+        if not self.emoji_store:
+            return
+        image = images[0]
+        source_file = image.file or image.path
+        if not source_file or not Path(source_file).is_file():
+            return
+        context_window = self.context_mgr.summary_text(conv_id, max_chars=300)
+        emoji_id = self.emoji_store.collect(
+            source_file,
+            source_group=conv_id,
+            source_sender=event.get_sender_name() or "",
+            source_message_id=str(getattr(event.message_obj, "message_id", "") or ""),
+            source_text=text,
+            source_context=context_window,
+        )
+        if not emoji_id:
+            return
+        self.logger.info(f"ChatCore emoji | collected {emoji_id} from {conv_id}")
+        stored_path = self.emoji_store.file_path(emoji_id)
+        if not stored_path:
+            return
+        vision_client = self.emoji_vision_client or self.vision_client
+        category, tags = await classify_emoji(
+            vision_client,
+            self.summary_client,
+            stored_path,
+            context_window,
+        )
+        if category or tags:
+            self.emoji_store.set_meta(emoji_id, category, tags)
+
+    async def _resolve_emoji_query(self, conv_id: str, query: str) -> str | None:
+        """Resolve an emoji intent or id to a concrete emoji id.
+
+        When the query is an existing id it is returned directly. Otherwise the
+        store is searched and the top candidates (each carrying its source
+        context) are shown to the model, which reads their original contexts
+        and picks the most fitting one.
+
+        Args:
+            conv_id: Conversation identifier.
+            query: The emoji intent text or emoji id.
+
+        Returns:
+            A concrete emoji id, or None when nothing matches.
+        """
+        if not self.emoji_store:
+            return None
+        query = query.strip()
+        if self.emoji_store.get(query):
+            return query
+        records = self.emoji_store.search(query, top_k=3)
+        if not records:
+            return None
+        if len(records) == 1:
+            return records[0]["emoji_id"]
+        candidates = self.emoji_store.render_candidates(records)
+        recent = self.context_mgr.summary_text(conv_id, max_chars=300)
+        try:
+            raw = await self.summary_client.chat(
+                [
+                    {
+                        "role": "system",
+                        "content": "你是表情包选择助手。结合候选表情包的来源语境与当前对话意图，"
+                        "选择最合适的一个。只回复 [[emoji:编号]]；都不合适就回复「不用」。",
+                    },
+                    {
+                        "role": "user",
+                        "content": f"候选:\n{candidates}\n\n"
+                        f"当前对话意图: {query}\n最近对话: {recent}",
+                    },
+                ],
+                temperature=0.0,
+            )
+        except Exception as e:
+            self.logger.warning(f"Emoji pick failed: {e}")
+            return records[0]["emoji_id"]
+        match = re.search(r"\[\[emoji:([^\]]+)\]\]", raw)
+        if match:
+            pick = match.group(1).strip()
+            if any(pick == r["emoji_id"] for r in records):
+                return pick
+            if pick.startswith("emoji_") and self.emoji_store.get(pick):
+                return pick
+        return records[0]["emoji_id"]
+
     def _schedule_summary(self, conv_id: str) -> None:
         """Kick off an LLM summary of a conversation's older history.
 
@@ -911,7 +1234,7 @@ class Main(Star):
                 else ""
             ),
             f"- 全局记忆: {'启用' if self.memory else '未启用'}",
-            f"- 隐性分析: "
+            "- 隐性分析: "
             + (
                 f"启用 ({self.analysis_client.provider_id})"
                 if self.implicit_enabled and self.analysis_client
@@ -930,6 +1253,50 @@ class Main(Star):
         """Start background tasks when the plugin is activated."""
         if self.implicit_enabled and self.analysis_client:
             self._analysis_task = asyncio.create_task(self._implicit_analysis_loop())
+        if self.expression_store:
+            self._expression_task = asyncio.create_task(self._expression_learn_loop())
+
+    async def _expression_learn_loop(self) -> None:
+        """Periodically sample active groups and learn their expression style.
+
+        Runs infrequently (interval + random jitter); a single failed analysis
+        must not stop the loop.
+        """
+        while True:
+            await asyncio.sleep(
+                self.expression_interval * 60 + random.uniform(0, 600),
+            )
+            try:
+                await self._run_expression_learn_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger.warning(f"Expression learning failed: {e}")
+
+    async def _run_expression_learn_once(self) -> None:
+        """Sample each active group and update its learned expression style.
+
+        Uses the same summary source as implicit analysis; groups with an
+        in-flight generation are skipped.
+        """
+        if not self.expression_store:
+            return
+        for conv_id in self.context_mgr.active_conversations():
+            if conv_id in self.active_tasks:
+                continue
+            context_text = self.context_mgr.summary_text(conv_id, max_chars=2500)
+            if not context_text:
+                continue
+            try:
+                learned = await self.expression_store.learn(
+                    self.summary_client,
+                    conv_id,
+                    context_text,
+                )
+                if learned:
+                    self.logger.info(f"ChatCore expression | {conv_id} style updated")
+            except Exception as e:
+                self.logger.warning(f"Expression learning call failed: {e}")
 
     async def _implicit_analysis_loop(self) -> None:
         """Periodically analyze group topics for implicit AI relevance.
@@ -984,4 +1351,7 @@ class Main(Star):
         if self._analysis_task:
             self._analysis_task.cancel()
             self._analysis_task = None
+        if self._expression_task:
+            self._expression_task.cancel()
+            self._expression_task = None
         self.active_tasks.clear()

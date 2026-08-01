@@ -121,9 +121,7 @@ class ContextManager:
                 record.description = description
                 return
 
-    def set_summary(
-        self, conv_id: str, text: str, covered_count: int
-    ) -> None:
+    def set_summary(self, conv_id: str, text: str, covered_count: int) -> None:
         """Store an LLM-generated summary of the older history.
 
         ``covered_count`` is the number of older records the summary already
@@ -197,6 +195,27 @@ class ContextManager:
             Conversation id list.
         """
         return list(self._histories.keys())
+
+    def conversation_stats(self) -> list[dict]:
+        """Summarize per-conversation state for monitoring (WebUI).
+
+        Returns:
+            One summary dict per active conversation.
+        """
+        rows = []
+        for conv_id in self._histories:
+            history = self._history(conv_id)
+            summary = self._summaries.get(conv_id)
+            rows.append(
+                {
+                    "conv_id": conv_id,
+                    "messages": len(history),
+                    "older_count": self.older_count(conv_id),
+                    "has_summary": bool(summary and summary[0]),
+                    "summary_len": len(summary[0]) if summary and summary[0] else 0,
+                }
+            )
+        return rows
 
     def find_message(self, conv_id: str, message_id: str) -> MessageRecord | None:
         """Find the most recent user message with the given platform id.
@@ -356,6 +375,7 @@ class ContextManager:
         system_prompt: str,
         memory_texts: list[str] | None = None,
         history_texts: list[str] | None = None,
+        profile_texts: list[str] | None = None,
     ) -> list[dict]:
         """Build the OpenAI-style message list from a conversation's history.
 
@@ -373,6 +393,7 @@ class ContextManager:
             system_prompt: The AI persona / system prompt.
             memory_texts: Recalled global memories to inject.
             history_texts: Persisted chat-history blocks to inject.
+            profile_texts: Structured person-profile blocks to inject.
 
         Returns:
             OpenAI-style message dict list.
@@ -400,6 +421,9 @@ class ContextManager:
                 "不代表你本人执行过任何操作，不要当成你做过的事）:"
             )
             background.extend(f"- {text}" for text in memory_texts)
+        if profile_texts:
+            background.append("以下是你对该用户的了解（人物画像，可能随时间更新）:")
+            background.extend(profile_texts)
         if older:
             summary = self.get_summary(conv_id)
             if summary:

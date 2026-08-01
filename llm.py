@@ -254,7 +254,5 @@ class EmbeddingAdapter:
             self.provider_id
         )
         if not provider or not isinstance(provider, EmbeddingProvider):
-            raise ValueError(
-                f"提供商 {self.provider_id} 不是有效的 Embedding 提供商"
-            )
+            raise ValueError(f"提供商 {self.provider_id} 不是有效的 Embedding 提供商")
         return await provider.get_embedding(text)

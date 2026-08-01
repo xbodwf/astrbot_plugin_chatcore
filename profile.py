@@ -1,0 +1,220 @@
+"""Structured person profiles with LLM memory writeback.
+
+Unlike the vector-text memories in ``memory.py``, a profile is a compact,
+structured understanding of a single person (stable facts, preferences and
+interaction traits). After each reply, an LLM extracts new stable facts from
+the exchange and merges them back into the profile, so ChatCore gradually
+"gets to know" the people it talks to. Persisted as JSON.
+"""
+
+import json
+import os
+import re
+import time
+from pathlib import Path
+from typing import Any
+
+_EXTRACT_PROMPT = (
+    "以下是一条群聊/私聊发言。请从中提取关于说话人 {name} 的稳定、有价值的人物事实，"
+    "例如身份、职业、称呼偏好、喜好、习惯、性格特点、与其他人/群的关系等。"
+    "忽略一次性的话题内容（如某件事的讨论、临时求助）。没有有价值信息就输出空数组。\n"
+    '只输出 JSON 字符串数组，例如 ["小明是大学生", "喜欢喝奶茶"].\n'
+    "发言: {text}"
+)
+
+_MAX_FACTS = 30
+
+
+def _parse_fact_list(raw: str) -> list[str]:
+    """Parse a JSON string array out of a model reply.
+
+    Args:
+        raw: Raw model output, possibly wrapped in markdown fences.
+
+    Returns:
+        The parsed fact strings.
+    """
+    text = raw.strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
+    match = re.search(r"\[.*\]", text, flags=re.DOTALL)
+    if match:
+        text = match.group(0)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = []
+    if not isinstance(parsed, list):
+        return []
+    return [
+        str(item).strip()
+        for item in parsed
+        if isinstance(item, str) and str(item).strip()
+    ]
+
+
+class ProfileStore:
+    """Persistent per-person structured profiles.
+
+    Args:
+        path: Path of the JSON persistence file.
+        max_chars: Max characters of a rendered profile block.
+    """
+
+    def __init__(self, path: str | Path, max_chars: int = 600) -> None:
+        self.path = Path(path)
+        self.max_chars = max_chars
+        self._profiles: dict[str, dict] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            self._profiles = {
+                key: value for key, value in data.items() if isinstance(value, dict)
+            }
+        except (OSError, json.JSONDecodeError):
+            self._profiles = {}
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(self._profiles, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.replace(tmp, self.path)
+
+    def get(self, person_id: str) -> dict | None:
+        """Get a person's profile dict, or None.
+
+        Args:
+            person_id: Stable platform id of the person.
+
+        Returns:
+            The profile dict or None.
+        """
+        return self._profiles.get(person_id)
+
+    def all(self) -> list[dict]:
+        """All profiles.
+
+        Returns:
+            List of profile dicts (with their id attached).
+        """
+        return [
+            {"person_id": pid, **profile} for pid, profile in self._profiles.items()
+        ]
+
+    def delete(self, person_id: str) -> bool:
+        """Delete a person's profile.
+
+        Args:
+            person_id: Stable platform id of the person.
+
+        Returns:
+            True if a profile was removed.
+        """
+        if person_id in self._profiles:
+            del self._profiles[person_id]
+            self._save()
+            return True
+        return False
+
+    def merge(
+        self,
+        person_id: str,
+        nickname: str,
+        facts: list[str],
+    ) -> None:
+        """Merge new facts into a person's profile.
+
+        Args:
+            person_id: Stable platform id of the person.
+            nickname: Latest observed nickname.
+            facts: Newly extracted stable facts.
+        """
+        now = time.time()
+        profile = self._profiles.get(person_id)
+        if profile is None:
+            profile = {
+                "person_id": person_id,
+                "nickname": nickname or "",
+                "facts": [],
+                "preferences": [],
+                "interaction": [],
+                "first_seen": now,
+                "updated_at": now,
+            }
+            self._profiles[person_id] = profile
+        profile["nickname"] = nickname or profile.get("nickname", "")
+        existing = set(profile.get("facts", []))
+        added = [fact for fact in facts if fact not in existing]
+        if added:
+            profile["facts"] = (profile.get("facts", []) + added)[-_MAX_FACTS:]
+            profile["updated_at"] = now
+            self._save()
+
+    def render(self, person_id: str) -> str | None:
+        """Render a person's profile as an injection block.
+
+        Args:
+            person_id: Stable platform id of the person.
+
+        Returns:
+            A compact profile text, or None when absent.
+        """
+        profile = self._profiles.get(person_id)
+        if not profile:
+            return None
+        facts = profile.get("facts", []) or []
+        if not facts:
+            return None
+        nickname = profile.get("nickname", "") or person_id
+        parts = [f"该用户昵称: {nickname}"]
+        parts.extend(f"- {fact}" for fact in facts)
+        text = "\n".join(parts)
+        if len(text) > self.max_chars:
+            text = text[: self.max_chars] + "..."
+        return text
+
+    async def extract_facts(
+        self,
+        client: Any,
+        name: str,
+        text: str,
+    ) -> list[str]:
+        """Extract stable facts about a speaker from one message.
+
+        Args:
+            client: An LLM wrapper exposing ``async chat(messages)``.
+            name: The speaker's display name.
+            text: The speaker's message text.
+
+        Returns:
+            The extracted facts, or an empty list on any failure.
+        """
+        message = text.strip()
+        if not message:
+            return []
+        prompt = _EXTRACT_PROMPT.format(name=name, text=message[:500])
+        try:
+            raw = await client.chat(
+                [
+                    {"role": "system", "content": "你是信息提取助手，只输出 JSON。"},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+            )
+        except Exception:
+            return []
+        return _parse_fact_list(raw)
+
+    def count(self) -> int:
+        """Number of profiles.
+
+        Returns:
+            Profile count.
+        """
+        return len(self._profiles)
