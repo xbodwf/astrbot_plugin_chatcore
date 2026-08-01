@@ -6,10 +6,28 @@ escaped so the AI can output it literally when needed.
 """
 
 import asyncio
+import re
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import Any
 
 _SENTENCE_BOUNDARIES = {".", "!", "?", "。", "！", "？", "\n", "…"}
+_LINE_BREAK_RE = re.compile(r"\\n|\\r|\s")
+
+
+def _delimiter_core(delimiter: str) -> str:
+    """Extract the meaningful token from a delimiter string.
+
+    Removes real whitespace/newlines as well as literal ``\\n``/``\\r``
+    sequences, so a standalone ``---`` line is matched regardless of how the
+    configured delimiter stores its line separators.
+
+    Args:
+        delimiter: The configured delimiter.
+
+    Returns:
+        The delimiter token with surrounding line separators stripped.
+    """
+    return _LINE_BREAK_RE.sub("", delimiter)
 
 
 class StreamSegmenter:
@@ -31,7 +49,7 @@ class StreamSegmenter:
         max_segment_chars: int = 0,
     ) -> None:
         self.delimiter = delimiter
-        self.delimiter_core = delimiter.strip()
+        self.delimiter_core = _delimiter_core(delimiter)
         self.escape_char = escape_char
         self.max_segment_chars = max(0, max_segment_chars)
         self._chars: list[str] = []

@@ -105,7 +105,7 @@ prob = clamp(bubble_base + active_contribution + boost_remaining, 0, active_cap)
 
 接管 vanilla LLM，使用流式输出，**AI 自己分段**：
 
-- Prompt 约定分段符（默认 `\n---\n`，可配置），并声明**转义规则**：AI 真想输出该符号时用转义符（默认 `\`）前缀。
+- Prompt 约定分段符（默认 `---` 独占一行，可配置），并声明**转义规则**：AI 真想输出该符号时用转义符（默认 `\`）前缀。
 - **行级识别**：`StreamSegmenter` 用 `_try_exact`（内联子串匹配，如 `。`）与 `_try_standalone_line`（独占一行匹配，容忍 `\n\n---\n\n` 与结尾无换行的 `---`）两种模式切分；转义行（`\---`）按字面处理不触发切分，`a---b` 行内不会误伤，`flush()` 丢弃结尾独立的未闭合分隔符行，彻底杜绝分隔符泄漏到输出。
 - 每段独立发送 → 每段是一条消息，**发送等待与流式生成并行**（解决"很久不回+断断续续"）。
 - **手动补装饰阶段**：绕过 vanilla 流式后，原 `on_decorating_result` 等插件链失效。ChatCore 在 `main.py._decorate_segment` 里**重放装饰钩子**：把每段构造成 `MessageEventResult`（`result_content_type=STREAMING_FINISH`，与 vanilla 流式语义一致），按 `EventType.OnDecoratingResultEvent` 从 `star_handlers_registry` 取钩子逐个调用，装饰后再发送。

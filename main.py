@@ -170,7 +170,9 @@ class Main(Star):
         self.history_max_chars = max(1, int(history_cfg.get("max_chars", 1200)))
 
         seg = config.get("segment", {})
-        self.segment_delimiter = seg.get("delimiter", "\n---\n")
+        self.segment_delimiter = seg.get("delimiter", "\n---\n").replace(
+            "\\n", "\n"
+        )
         self.segment_escape = seg.get("escape_char", "\\")
         self.segment_interval = seg.get("interval", 1.0)
         self.max_segment_chars = seg.get("max_segment_chars", 600)
@@ -533,12 +535,14 @@ class Main(Star):
             The full system prompt.
         """
         persona = (await self._resolve_persona_prompt(conv_id)) or FALLBACK_SYSTEM_PROMPT
-        delim = self.segment_delimiter.replace("\n", "\\n")
+        delim = self.segment_delimiter.strip() or self.segment_delimiter
         rules = (
             "\n\n回复规则：你可以自行分段，把回复拆成多条消息依次发送。"
-            "需要分段时，在段与段之间单独写一行 `"
+            "需要分段时，在两段之间先换行，然后单独写一行 `"
             + delim
-            + "`（即独占一行的分隔符）。"
+            + "`（该行只含这个分隔符，前后不留空格、不加反引号或反斜杠）。"
+            "注意：这里的换行是真实换行符（直接另起一行），"
+            "不要写成 `\\n` 这样的字面量。"
             "如果你确实需要输出这串分隔符本身而不是用来分段，请在其前加 `"
             + self.segment_escape
             + "` 转义。"
