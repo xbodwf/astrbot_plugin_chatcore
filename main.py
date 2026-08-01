@@ -565,6 +565,14 @@ class Main(Star):
                 # Replay OnLLMRequestEvent hooks (e.g. LLMPerception) so
                 # vanilla-ecosystem reminders still reach the model, then
                 # merge whatever they mutated back into the request.
+                #
+                # ChatCore's event is already stopped (on_message calls
+                # stop_event() before starting the async reply), so
+                # call_event_hook's return value is meaningless here and the
+                # hooks may set a result / stop the event as if they were in
+                # the vanilla request flow. Save and restore the event state
+                # so third-party hooks cannot hijack the reply; only the
+                # ProviderRequest mutations are kept.
                 req = ProviderRequest(
                     prompt=current_text,
                     session_id=conv_id,
@@ -573,8 +581,16 @@ class Main(Star):
                     system_prompt=system_prompt,
                     extra_user_content_parts=[],
                 )
-                if await call_event_hook(event, EventType.OnLLMRequestEvent, req):
-                    break
+                prev_result = event.get_result()
+                was_stopped = event.is_stopped()
+                try:
+                    await call_event_hook(event, EventType.OnLLMRequestEvent, req)
+                finally:
+                    event.set_result(prev_result)
+                    if was_stopped:
+                        event.stop_event()
+                    else:
+                        event.continue_event()
                 messages = self._merge_llm_request(
                     req,
                     messages,

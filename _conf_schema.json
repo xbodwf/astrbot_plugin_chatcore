@@ -433,7 +433,7 @@
       },
       "trait": {
         "description": "情绪特质",
-        "type": "list",
+        "type": "string",
         "default": "neutral",
         "hint": "决定情绪基线：rational_calm（理性克制）/ neutral（中性）/ sentimental（感性细腻）",
         "choices": ["rational_calm", "neutral", "sentimental"]
