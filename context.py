@@ -8,6 +8,8 @@ message, plus recalled global memories and image descriptions.
 import time
 from dataclasses import dataclass, field
 
+from .history import escape_user_markers
+
 
 @dataclass
 class MessageRecord:
@@ -301,18 +303,38 @@ class ContextManager:
             if not (record.role == "user" and record.message_id == message_id)
         ]
 
+    @staticmethod
+    def _sender_label(record: MessageRecord) -> str:
+        """Render a user record's sender as ``昵称`` or ``昵称(QQ号)``.
+
+        The platform id is appended so the AI can tell same-nickname people
+        apart and address them precisely.
+
+        Args:
+            record: The message record.
+
+        Returns:
+            The display label of the sender.
+        """
+        name = record.sender_name or "未知用户"
+        if record.sender_id:
+            return f"{name}({record.sender_id})"
+        return name
+
     def _format_record(self, record: MessageRecord) -> str:
         if record.role == "assistant":
             return record.text
-        prefix = f"{record.sender_name}: "
+        prefix = f"{self._sender_label(record)}: "
         body = ""
         if record.quote:
-            body += f"[引用了消息: {record.quote}] "
+            body += f"[引用了消息: {escape_user_markers(record.quote)}] "
         if record.description:
             desc = f"[图片描述: {record.description}]"
-            body += f"{record.text} {desc}" if record.text else desc
+            body += (
+                f"{escape_user_markers(record.text)} {desc}" if record.text else desc
+            )
         elif record.text:
-            body += record.text
+            body += escape_user_markers(record.text)
         if body:
             return prefix + body
         return f"{prefix}[图片]"
@@ -336,15 +358,17 @@ class ContextManager:
             return f"bot: {text}" if text else None
         body = ""
         if record.quote:
-            body += f"[引用了消息: {record.quote}] "
+            body += f"[引用了消息: {escape_user_markers(record.quote)}] "
         if record.description:
             desc = f"[图片描述: {record.description}]"
-            body += f"{record.text} {desc}" if record.text else desc
+            body += (
+                f"{escape_user_markers(record.text)} {desc}" if record.text else desc
+            )
         elif record.text:
-            body += record.text
+            body += escape_user_markers(record.text)
         if record.images and not body:
             return None
-        return f"{record.sender_name}: {body}" if body else None
+        return f"{self._sender_label(record)}: {body}" if body else None
 
     def _truncate(self, text: str, limit: int) -> str:
         """Truncate text at a boundary, appending an ellipsis.
@@ -420,15 +444,15 @@ class ContextManager:
                 "以下是你回忆起的过往对话片段（可能来自其他对话或其他人，"
                 "不代表你本人执行过任何操作，不要当成你做过的事）:"
             )
-            background.extend(f"- {text}" for text in memory_texts)
+            background.extend(f"- {escape_user_markers(text)}" for text in memory_texts)
         if profile_texts:
             background.append("以下是你对该用户的了解（人物画像，可能随时间更新）:")
-            background.extend(profile_texts)
+            background.extend(escape_user_markers(text) for text in profile_texts)
         if older:
             summary = self.get_summary(conv_id)
             if summary:
                 background.append("更早的对话（已压缩摘要）:")
-                background.append(summary)
+                background.append(escape_user_markers(summary))
             else:
                 compressed = [
                     self._truncate(line, self.old_msg_chars)
