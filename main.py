@@ -26,6 +26,7 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 from .actions import parse_actions
 from .attention import AttentionManager
 from .context import ContextManager
+from .history import HistoryReader, build_friend_umo
 from .llm import EmbeddingAdapter, LLMProvider
 from .memory import MemoryStore
 from .segmentation import stream_respond
@@ -36,6 +37,11 @@ DEFAULT_IMPLICIT_PROMPT = (
 )
 
 FALLBACK_SYSTEM_PROMPT = "你是一个友善、自然的聊天机器人，请像真人一样聊天，回复不要机械化。"
+
+HISTORY_SUMMARY_PROMPT = (
+    "请把下面的群聊/对话历史压缩成一段简洁的中文摘要，保留关键人物、"
+    "事件和结论，丢弃寒暄和无关细节。只输出摘要本身，不要任何前缀。\n\n"
+)
 
 
 class GenerationTask:
@@ -132,6 +138,12 @@ class Main(Star):
             vision_cfg.get("provider_id", "") or self.chat_provider_id,
         )
 
+        summary_cfg = providers.get("summary", {})
+        self.summary_client = LLMProvider(
+            self.context,
+            summary_cfg.get("provider_id", "") or self.chat_provider_id,
+        )
+
         attn = config.get("attention", {})
         self.attention = AttentionManager(
             bubble_base=attn.get("bubble_base_prob", 0.02),
@@ -148,6 +160,14 @@ class Main(Star):
             history_count=ctx.get("history_count", 30),
             old_msg_chars=ctx.get("old_msg_chars", 40),
         )
+        self.llm_summarize = ctx.get("llm_summarize", True)
+        self.quote_max_depth = max(1, int(ctx.get("quote_max_depth", 15)))
+        self._summary_tasks: set[str] = set()
+        history_cfg = config.get("history", {})
+        self.history_reader = HistoryReader(self.context.conversation_manager)
+        self.history_inject_enabled = history_cfg.get("inject_enabled", True)
+        self.history_max_messages = max(1, int(history_cfg.get("max_messages", 10)))
+        self.history_max_chars = max(1, int(history_cfg.get("max_chars", 1200)))
 
         seg = config.get("segment", {})
         self.segment_delimiter = seg.get("delimiter", "\n---\n")
@@ -232,7 +252,10 @@ class Main(Star):
             text or "[图片]",
             sender_id=event.get_sender_id(),
             message_id=msg_id,
+            images=[img.url or img.file for img in images if img.url or img.file],
+            quote=self._extract_quote_chain(conv_id, components, self.quote_max_depth),
         )
+        self._schedule_summary(conv_id)
 
         hard = self._is_hard_trigger(event, text)
 
@@ -406,24 +429,26 @@ class Main(Star):
         """
         try:
             image_urls: list[str] = []
-            image_descs: list[str] = []
             if self.chat_multimodal:
                 image_urls = [
                     img.url or img.file for img in images if img.url or img.file
                 ]
-            else:
-                image_descs = await self._describe_images(images)
+            image_descs = await self._describe_images(images)
+            if image_descs and task.trigger_message_id:
+                self.context_mgr.set_image_description(
+                    conv_id, task.trigger_message_id, "；".join(image_descs)
+                )
 
             current_text = first_text
             while True:
                 task.suppress_record = False
+                history_blocks = await self._inject_history_blocks(event, conv_id)
                 messages = self.context_mgr.build_messages(
                     conv_id,
                     system_prompt=await self._build_system_prompt(conv_id),
                     memory_texts=await self._recall(conv_id, current_text),
-                    image_descriptions=image_descs,
+                    history_texts=history_blocks,
                 )
-                image_descs = []
 
                 stream_gen = self.chat_client.chat_stream(
                     messages,
@@ -437,6 +462,7 @@ class Main(Star):
                         return
                     if not task.suppress_record:
                         self.context_mgr.record(conv_id, "assistant", "bot", segment)
+                        self._schedule_summary(conv_id)
                     self.logger.info(
                         f"ChatCore send | {conv_id} | bot: {segment}"
                     )
@@ -466,6 +492,7 @@ class Main(Star):
                             self.context_mgr.record(
                                 conv_id, "assistant", "bot", trailing
                             )
+                            self._schedule_summary(conv_id)
                         self.logger.info(
                             f"ChatCore send | {conv_id} | bot: {trailing}"
                         )
@@ -508,10 +535,13 @@ class Main(Star):
         persona = (await self._resolve_persona_prompt(conv_id)) or FALLBACK_SYSTEM_PROMPT
         delim = self.segment_delimiter.replace("\n", "\\n")
         rules = (
-            "\n\n回复规则：你可以自行分段，段与段之间用分段符 `"
+            "\n\n回复规则：你可以自行分段，把回复拆成多条消息依次发送。"
+            "需要分段时，在段与段之间单独写一行 `"
             + delim
-            + "` 分隔，每一段会作为一条独立消息发送。"
-            f"如果你确实需要输出分段符本身，请在其前加 `{self.segment_escape}` 转义。"
+            + "`（即独占一行的分隔符）。"
+            "如果你确实需要输出这串分隔符本身而不是用来分段，请在其前加 `"
+            + self.segment_escape
+            + "` 转义。"
         )
         if self.markers_enabled:
             rules += (
@@ -520,7 +550,10 @@ class Main(Star):
             )
         rules += (
             "\n当前消息附带的图片可以直接查看；历史消息里的“[图片]”表示你"
-            "看不到该图片的实际内容，严禁编造或猜测图片内容。"
+            "看不到该图片的实际内容，严禁编造或猜测图片内容；带"
+            "“[图片描述: ...]”的消息以描述文字为准。"
+            "用户带“[引用了消息: ...]”前缀时，括号内就是被引用的原消息内容，"
+            "可据此回看对方引用的内容。"
         )
         return persona + rules
 
@@ -645,7 +678,11 @@ class Main(Star):
             event.clear_result()
 
     async def _describe_images(self, images: list[Image]) -> list[str]:
-        """Describe attached images with the vision model.
+        """Describe attached images.
+
+        Uses the multimodal chat model itself when available (it reads the
+        image and returns a description marker), otherwise falls back to the
+        dedicated vision model.
 
         Args:
             images: Image components of the triggering message.
@@ -653,7 +690,10 @@ class Main(Star):
         Returns:
             Descriptions, one per readable image.
         """
-        if not self.vision_client or not images:
+        if not images:
+            return []
+        model = self.chat_client if self.chat_multimodal else self.vision_client
+        if not model:
             return []
         descriptions: list[str] = []
         for img in images:
@@ -661,10 +701,116 @@ class Main(Star):
             if not url:
                 continue
             try:
-                descriptions.append(await self.vision_client.describe_image(url))
+                descriptions.append(await model.describe_image(url))
             except Exception as e:
                 self.logger.warning(f"Image description failed: {e}")
         return descriptions
+
+    def _extract_quote_chain(
+        self, conv_id: str, components: list, max_depth: int = 15
+    ) -> str:
+        """Extract quoted-message content so the AI can read what was referenced.
+
+        The adapter already resolves the directly quoted message into the
+        ``Reply`` component (``message_str`` / ``chain``). Chained quotes (a
+        quote of a quote) are resolved recursively: nested ``Reply`` components
+        carry only an id, which is looked up in this conversation's in-memory
+        history. The chain is capped at ``max_depth`` (15 by default) to avoid
+        runaway recursion on adversarial/cyclic references.
+
+        Args:
+            conv_id: Conversation identifier.
+            components: The incoming message components.
+            max_depth: Maximum chained-quote depth to follow.
+
+        Returns:
+            A compact textual rendering of the quote chain, or an empty string.
+        """
+        parts: list[str] = []
+        for comp in components:
+            if not isinstance(comp, Reply):
+                continue
+            text = self._resolve_quote_node(conv_id, comp, 0, max_depth)
+            if text:
+                parts.append(text)
+        return "；".join(parts)
+
+    def _resolve_quote_node(
+        self, conv_id: str, reply: Reply, depth: int, max_depth: int
+    ) -> str:
+        """Resolve one quoted message (and its own nested quote) to text.
+
+        Args:
+            conv_id: Conversation identifier.
+            reply: The Reply component to resolve.
+            depth: Current recursion depth.
+            max_depth: Maximum recursion depth.
+
+        Returns:
+            Rendered quoted content, or an empty string when unresolvable.
+        """
+        if depth >= max_depth:
+            return ""
+        sender = reply.sender_nickname or reply.sender_id or "未知用户"
+        direct = (reply.message_str or "").strip()
+        if not direct:
+            record = self.context_mgr.find_message(conv_id, str(reply.id))
+            if record:
+                direct = record.text.strip()
+        nested = ""
+        for inner in reply.chain or []:
+            if isinstance(inner, Reply):
+                nested = self._resolve_quote_node(conv_id, inner, depth + 1, max_depth)
+                break
+        if not direct and not nested:
+            return ""
+        text = direct or "(无文字内容)"
+        return f"{sender}: {text}" + (f"（该消息又引用了：{nested}）" if nested else "")
+
+    async def _inject_history_blocks(
+        self,
+        event: AstrMessageEvent,
+        conv_id: str,
+    ) -> list[str]:
+        """Build background blocks from AstrBot's persisted chat history.
+
+        Injects the current session's recent records plus, for group chats, the
+        same sender's private-chat records (mirroring the reference plugin's
+        automatic private-context injection). No-ops when disabled.
+
+        Args:
+            event: Current platform message event.
+            conv_id: Conversation identifier.
+
+        Returns:
+            A list of history blocks to append to the background.
+        """
+        if not self.history_inject_enabled:
+            return []
+        blocks: list[str] = []
+        try:
+            blocks.append(
+                await self.history_reader.read_session(
+                    conv_id,
+                    max_messages=self.history_max_messages,
+                    max_chars=self.history_max_chars,
+                )
+            )
+            if not event.is_private_chat():
+                sender_id = event.get_sender_id()
+                if sender_id:
+                    friend_umo = build_friend_umo(conv_id, sender_id)
+                    blocks.append(
+                        await self.history_reader.read_session(
+                            friend_umo,
+                            max_messages=self.history_max_messages,
+                            max_chars=self.history_max_chars,
+                            header="【记忆参考】以下是你与该用户在其他私聊中的最近对话记录，仅作背景参考，与当前群聊无关:",
+                        )
+                    )
+        except Exception as e:
+            self.logger.warning(f"History injection failed: {e}")
+        return [b for b in blocks if b]
 
     async def _recall(self, conv_id: str, text: str) -> list[str] | None:
         """Recall relevant global memories for a message.
@@ -683,7 +829,48 @@ class Main(Star):
             return await self.memory.recall(text, top_k=self.memory_top_k, tags=tags)
         except Exception as e:
             self.logger.warning(f"Memory recall failed: {e}")
-            return None
+        return None
+
+    def _schedule_summary(self, conv_id: str) -> None:
+        """Kick off an LLM summary of a conversation's older history.
+
+        Only one task runs per conversation at a time; the task is skipped if
+        the summary is already up to date.
+
+        Args:
+            conv_id: Conversation identifier.
+        """
+        if not self.llm_summarize or conv_id in self._summary_tasks:
+            return
+        if not self.context_mgr.summary_stale(conv_id):
+            return
+        self._summary_tasks.add(conv_id)
+        asyncio.create_task(self._summarize_history(conv_id))
+
+    async def _summarize_history(self, conv_id: str) -> None:
+        """Compress older history with the chat model, caching the summary.
+
+        Args:
+            conv_id: Conversation identifier.
+        """
+        try:
+            older_count = self.context_mgr.older_count(conv_id)
+            if older_count <= 0:
+                return
+            payload = self.context_mgr.summary_payload(conv_id)
+            if not payload.strip():
+                return
+            summary = await self.summary_client.chat(
+                [{"role": "user", "content": HISTORY_SUMMARY_PROMPT + payload}],
+                temperature=0.3,
+            )
+            summary = summary.strip()
+            if summary:
+                self.context_mgr.set_summary(conv_id, summary, older_count)
+        except Exception as e:
+            self.logger.warning(f"History summarization failed: {e}")
+        finally:
+            self._summary_tasks.discard(conv_id)
 
     async def _remember(self, conv_id: str, sender_name: str, text: str) -> None:
         """Store a message into global memory (fire and forget).

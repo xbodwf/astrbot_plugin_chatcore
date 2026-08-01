@@ -89,15 +89,24 @@ prob = clamp(bubble_base + active_contribution + boost_remaining, 0, active_cap)
 2. **更早历史压缩**（`history_count` 内，超出 recent 的部分逐条截断到 `old_msg_chars`）：保留关键信息、去掉噪声，适配稀疏注意力。
 3. **全局记忆召回**：用 embedding 检索跨群共享记忆，注入相关片段（见 4.6）。
 4. **图片转描述**：消息含图片 → 交给视觉模型描述 → 以文本形式进上下文。
+5. **AstrBot 持久化聊天记录注入**（`history.*`，见 4.9）。
 
-注入路径：不用 `system_prompt +=`（会打爆缓存）。消息布局采用**缓存友好前缀**：`system`（人格，首位且字节稳定）→ `recent` 近 N 条逐字对话（只增不改，作为稳定前缀）→ 末尾单个 `user` 背景块（图片描述 / 记忆召回 / 压缩的更早历史，全部是短命内容）。这样动态内容永远不挤占共享前缀，窗口未滑动时命中率近乎满；窗口滑动瞬间（有界窗口的固有代价）整条已累积前缀作废，只能靠加大 `recent_count` 减少滑动频率。
+注入路径：不用 `system_prompt +=`（会打爆缓存）。消息布局采用**缓存友好前缀**：`system`（人格，首位且字节稳定）→ `recent` 近 N 条逐字对话（只增不改，作为稳定前缀）→ 末尾单个 `user` 背景块（图片描述 / 记忆召回 / 压缩的更早历史 / 持久化历史，全部是短命内容）。这样动态内容永远不挤占共享前缀，窗口未滑动时命中率近乎满；窗口滑动瞬间（有界窗口的固有代价）整条已累积前缀作废，只能靠加大 `recent_count` 减少滑动频率。
+
+**压缩与滚动摘要**：
+
+- **逐条截断**：超出 `recent_count` 的旧消息逐条截断到 `old_msg_chars` 字符。图片占位符 `[图片]` 不参与压缩（描述参与），assistant 消息带 `bot:` 前缀区分说话人，`_truncate` 优先在标点/空格断句，避免裁出半句话。
+- **LLM 滚动摘要**：启用 `context.llm_summarize`（默认 true）时，历史超过阈值触发 `_schedule_summary` → `_summarize_history` 异步调用摘要模型，把更早对话提炼为摘要缓存（`_summaries`，按 conv_id 存 `(摘要, 断点, 模型, 版本)`）。`build_messages` 有摘要就用摘要代替该段原文（减少 token），无摘要则回落逐条截断。
+- **摘要独立模型**：`providers.summary.provider_id` 可单独指定摘要用的提供商（留空复用聊天模型）。`_init_from_config` 构造独立 `summary_client`（`LLMProvider`），压缩任务不占用聊天模型配额。
+
+**引用回溯（quote）**：用户引用消息时（如 QQ 回复某条消息），`on_message` 用 `_extract_quote_chain` 沿 `Reply.chain` 递归解析引用链，把被引内容（含逐级回溯的原始消息）以 `[引用了消息: ...]` 前缀注入当前用户消息（`MessageRecord.quote`），最大嵌套深度 `context.quote_max_depth`（默认 15）。解析不到则用 `find_message` 查内存历史兜底；系统提示告知 AI 可据此回看对方引用的内容。
 
 ### 4.3 智能分段（segmentation.py）
 
 接管 vanilla LLM，使用流式输出，**AI 自己分段**：
 
 - Prompt 约定分段符（默认 `\n---\n`，可配置），并声明**转义规则**：AI 真想输出该符号时用转义符（默认 `\`）前缀。
-- 流式消费 token，按分段符切成段；**转义感知**：`\` 后一个字符按字面处理，不触发切分。
+- **行级识别**：`StreamSegmenter` 用 `_try_exact`（内联子串匹配，如 `。`）与 `_try_standalone_line`（独占一行匹配，容忍 `\n\n---\n\n` 与结尾无换行的 `---`）两种模式切分；转义行（`\---`）按字面处理不触发切分，`a---b` 行内不会误伤，`flush()` 丢弃结尾独立的未闭合分隔符行，彻底杜绝分隔符泄漏到输出。
 - 每段独立发送 → 每段是一条消息，**发送等待与流式生成并行**（解决"很久不回+断断续续"）。
 - **手动补装饰阶段**：绕过 vanilla 流式后，原 `on_decorating_result` 等插件链失效。ChatCore 在 `main.py._decorate_segment` 里**重放装饰钩子**：把每段构造成 `MessageEventResult`（`result_content_type=STREAMING_FINISH`，与 vanilla 流式语义一致），按 `EventType.OnDecoratingResultEvent` 从 `star_handlers_registry` 取钩子逐个调用，装饰后再发送。
 
@@ -143,6 +152,24 @@ AI 回复中途用户发新消息（且命中触发）时：
 - 构建回复消息链时支持 `Comp.At`（指向目标用户）与 `Comp.Reply`（基于原始消息 ID），修掉"@ 错消息"。
 - AI 需要时可在回复中用 `[[at:昵称]]` / `[[reply:昵称]]` 主动 @ / 回复（由 `actions.py` 解析并降级处理）。
 
+### 4.9 持久化聊天记录注入（history.py）
+
+复用 AstrBot 的 `conversation_manager` 与 `platform_message_history_mgr` 读取已持久化的聊天记录，补足插件内存上下文的空窗：
+
+- **当前会话历史**：`HistoryReader.read_session(umo, max_messages, max_chars)` 读当前会话（`build_umo`）最近消息，`_inject_history_blocks` 在构建请求时以 `【历史参考】...` 头部注入。
+- **群聊 + 私聊交叉**：群聊中用户发言时，`build_friend_umo(conv_id, sender_id)` 定位该发送者对应的私聊会话，自动注入其最近私聊历史（`【记忆参考】...`），让 AI 记得与该用户的私聊语境。
+- 文本化：`extract_text_history` / `render_history_block` 把 `MessageChain` 序列化为纯文本（图片→`[图片]`），丢弃非文本组件。
+- **配置**：`history.inject_enabled`（默认 true）、`history.max_messages`（默认 10）、`history.max_chars`（默认 1200）。
+
+### 4.10 引用回溯（quote）
+
+用户引用某条消息（如 QQ 回复）时，AI 需要读到被引用的内容：
+
+- `on_message` 解析事件组件中的 `Reply`，沿 `Reply.chain` 递归回溯整条引用链（`_extract_quote_chain` / `_resolve_quote_node`）。
+- 被引内容（逐级含"又引用了"前缀）以 `MessageRecord.quote` 字段随消息存入，渲染为 `[引用了消息: ...]` 前缀进入上下文。
+- 内存历史兜底：`find_message(conv_id, message_id)` 查不到 adapter 解析结果时，从插件内存历史取原文。
+- 深度上限 `context.quote_max_depth`（默认 15），防止循环引用与超深链拖垮性能。
+
 ## 5. 配置项（_conf_schema.json）
 
 所有参数用户可调，分组：
@@ -176,3 +203,9 @@ AI 回复中途用户发新消息（且命中触发）时：
 - `2026-07-31` 补充：推理内容过滤——流式/非流式输出统一剥离 `<think>...</think>` 推理块（`llm.py.ThinkStripper`，跨 chunk 边界与未闭合标签均可处理），防止思考内容泄漏给用户。
 - `2026-08-01` 调整：上下文防幻觉——系统提示明确「历史消息里的 [图片] 表示看不到内容、严禁编造图片内容」（当前消息附带图片可直接查看）；记忆召回背景块改为「过往对话片段（可能来自其他对话或其他人，不代表你本人执行过任何操作）」。
 - `2026-08-01` 调整：触发防抢话——群消息若 @ 的是别的用户（非 bot、非 @all），不参与软触发（`_addresses_other_user`）。
+- `2026-08-01` 补充：图片重构——多模态模型直接读图输出 `[图片描述: ...]` 标记存入历史；`MessageRecord` 增 `images`/`description` 字段，`set_image_description` 按消息 id 回填描述；压缩时裸 `[图片]` 占位不参与压缩、描述参与；assistant 压缩行加 `bot:` 前缀；`_truncate` 优先断句（详见 4.2）。
+- `2026-08-01` 补充：上下文压缩 LLM 摘要化——`ContextManager._summaries` 缓存摘要（set_summary/get_summary/summary_stale/older_count/summary_payload）；`build_messages` 有摘要用摘要、无则逐条截断兜底；`main.py` 异步 `_schedule_summary`→`_summarize_history`；配置 `context.llm_summarize`（默认 true）。
+- `2026-08-01` 补充：压缩独立模型——`providers.summary.provider_id` 单独指定摘要提供商（留空复用聊天模型），`_init_from_config` 构造独立 `summary_client`，压缩任务不占聊天配额。
+- `2026-08-01` 补充：引用回溯——用户引用消息时沿 `Reply.chain` 递归解析引用链（`_extract_quote_chain`/`_resolve_quote_node`），被引内容以 `[引用了消息: ...]` 前缀注入；`MessageRecord.quote` 字段持久化；`find_message` 查内存历史兜底；深度上限 `context.quote_max_depth`（默认 15）。
+- `2026-08-01` 调整：分段器重写——`StreamSegmenter` 改用独占行匹配（`_try_exact`/`_try_standalone_line`），容忍 `\n\n---\n\n` 与结尾无换行 `---`，转义行不被匹配，`flush()` 丢弃结尾独立分隔符行，杜绝分隔符泄漏（见 4.3）；系统提示措辞改为「单独写一行」。
+- `2026-08-01` 补充：持久化聊天记录注入——新增 `history.py`（`build_umo`/`build_friend_umo`/`extract_text_history`/`render_history_block`/`HistoryReader.read_session`）；`main.py._inject_history_blocks` 自动注入当前会话历史 + 群聊注入同发送者私聊历史（`【记忆参考】`），配置 `history.inject_enabled`/`max_messages`/`max_chars`（见 4.9）。

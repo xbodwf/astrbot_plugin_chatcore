@@ -31,17 +31,67 @@ class StreamSegmenter:
         max_segment_chars: int = 0,
     ) -> None:
         self.delimiter = delimiter
+        self.delimiter_core = delimiter.strip()
         self.escape_char = escape_char
         self.max_segment_chars = max(0, max_segment_chars)
         self._chars: list[str] = []
         self._escaped = False
         self._delim_pos = 0
+        self._line_start = 0
+        self._line_has_escape = False
 
     def _emit(self) -> str | None:
         text = "".join(self._chars).strip()
         self._chars = []
         self._delim_pos = 0
+        self._line_start = 0
+        self._line_has_escape = False
         return text or None
+
+    def _try_exact(self, ch: str) -> str | None:
+        """Match an inline delimiter substring ending at ``ch``.
+
+        Handles single-char delimiters such as ``。`` that appear mid-line.
+
+        Args:
+            ch: The just-appended character.
+
+        Returns:
+            The emitted segment, or None when no boundary matched.
+        """
+        if not self.delimiter or self._line_has_escape:
+            return None
+        if ch == self.delimiter[self._delim_pos]:
+            self._delim_pos += 1
+            if self._delim_pos == len(self.delimiter):
+                del self._chars[-len(self.delimiter) :]
+                return self._emit()
+        else:
+            self._delim_pos = 1 if ch == self.delimiter[0] else 0
+        return None
+
+    def _try_standalone_line(self, ch: str) -> str | None:
+        """Match a delimiter line on its own (``---`` with any blank lines).
+
+        The delimiter is treated as a markdown-style horizontal rule: a line
+        that, after stripping whitespace, equals the delimiter token splits the
+        stream. This handles ``\\n---\\n``, ``\\n\\n---\\n\\n`` and ``---``
+        without exact surrounding-newline requirements, so ``---`` no longer
+        leaks into the delivered message.
+
+        Args:
+            ch: The just-appended character (must be ``\\n`` to end a line).
+
+        Returns:
+            The emitted segment, or None when the line is not a delimiter.
+        """
+        if ch != "\n" or not self.delimiter_core or self._line_has_escape:
+            return None
+        line = "".join(self._chars[self._line_start :])
+        if line.strip() != self.delimiter_core:
+            return None
+        del self._chars[self._line_start :]
+        return self._emit()
 
     def feed(self, text: str) -> list[str]:
         """Feed a chunk of streamed text.
@@ -56,6 +106,7 @@ class StreamSegmenter:
         for ch in text:
             if self._escaped:
                 self._chars.append(ch)
+                self._line_has_escape = True
                 self._escaped = False
                 self._delim_pos = 0
                 continue
@@ -63,16 +114,13 @@ class StreamSegmenter:
                 self._escaped = True
                 continue
             self._chars.append(ch)
-            if self.delimiter:
-                if ch == self.delimiter[self._delim_pos]:
-                    self._delim_pos += 1
-                    if self._delim_pos == len(self.delimiter):
-                        del self._chars[-len(self.delimiter) :]
-                        seg = self._emit()
-                        if seg:
-                            segments.append(seg)
-                else:
-                    self._delim_pos = 0
+            seg = self._try_exact(ch) or self._try_standalone_line(ch)
+            if seg:
+                segments.append(seg)
+                continue
+            if ch == "\n":
+                self._line_start = len(self._chars)
+                self._line_has_escape = False
             if self.max_segment_chars and len(self._chars) >= self.max_segment_chars:
                 seg = self._emit()
                 if seg:
@@ -90,12 +138,19 @@ class StreamSegmenter:
     def flush(self) -> str | None:
         """Flush the remaining buffer as the final segment.
 
+        A trailing delimiter line (``---`` without a closing newline) is
+        dropped rather than leaked into the delivered text.
+
         Returns:
             The trailing text, or None if empty.
         """
         if self._escaped:
             self._chars.append(self.escape_char)
             self._escaped = False
+        if not self._line_has_escape and self.delimiter_core:
+            line = "".join(self._chars[self._line_start :])
+            if line.strip() == self.delimiter_core:
+                del self._chars[self._line_start :]
         return self._emit()
 
 

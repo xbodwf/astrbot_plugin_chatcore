@@ -122,10 +122,47 @@
         "default": 30,
         "hint": "recent 之外的更早消息保留条数"
       },
+      "llm_summarize": {
+        "description": "LLM 压缩历史",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后更早历史由聊天模型异步生成摘要；关闭则逐条截断"
+      },
+      "quote_max_depth": {
+        "description": "引用消息回溯深度",
+        "type": "int",
+        "default": 15,
+        "hint": "用户引用消息时，向 AI 提供被引用内容，支持连锁引用；此值为最大回溯层数"
+      },
       "old_msg_chars": {
         "description": "每条历史消息压缩后的最大字符数",
         "type": "int",
-        "default": 40
+        "default": 40,
+        "hint": "仅未开启 LLM 压缩时的兜底逐条截断长度"
+      }
+    }
+  },
+  "history": {
+    "description": "持久化聊天记录",
+    "type": "object",
+    "items": {
+      "inject_enabled": {
+        "description": "自动注入历史记录",
+        "type": "bool",
+        "default": true,
+        "hint": "构建上下文时注入 AstrBot 持久化的当前会话历史；群聊额外注入同发送者私聊"
+      },
+      "max_messages": {
+        "description": "注入的最大消息条数",
+        "type": "int",
+        "default": 10,
+        "hint": "取最近 N 条历史记录"
+      },
+      "max_chars": {
+        "description": "注入的总字符上限",
+        "type": "int",
+        "default": 1200,
+        "hint": "超出后仅保留尾部"
       }
     }
   },
@@ -162,6 +199,19 @@
             "default": "",
             "_special": "select_provider",
             "hint": "需支持视觉输入。消息含图片时转文字描述；留空时复用聊天模型"
+          }
+        }
+      },
+      "summary": {
+        "description": "上下文压缩模型",
+        "type": "object",
+        "items": {
+          "provider_id": {
+            "description": "压缩/摘要模型提供商",
+            "type": "string",
+            "default": "",
+            "_special": "select_provider",
+            "hint": "用于把更早历史压缩成摘要；留空时复用聊天模型"
           }
         }
       },

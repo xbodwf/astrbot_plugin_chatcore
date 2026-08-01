@@ -17,6 +17,8 @@ class MessageRecord:
         role: ``user`` for humans, ``assistant`` for the bot itself.
         sender_name: Display name of the sender.
         text: The plain text content.
+        images: Image URLs attached to the message (empty when none).
+        description: Generated image description, ``[图片描述: ...]`` marker.
         sender_id: Platform id of the sender (for proactive @).
         message_id: Platform message id (for proactive reply).
         ts: Unix timestamp.
@@ -25,8 +27,11 @@ class MessageRecord:
     role: str
     sender_name: str
     text: str
+    images: list[str] = field(default_factory=list)
+    description: str = ""
     sender_id: str = ""
     message_id: str = ""
+    quote: str = ""
     ts: float = field(default_factory=time.time)
 
 
@@ -49,6 +54,7 @@ class ContextManager:
         self.history_count = max(0, history_count)
         self.old_msg_chars = max(1, old_msg_chars)
         self._histories: dict[str, list[MessageRecord]] = {}
+        self._summaries: dict[str, dict] = {}
 
     def _history(self, conv_id: str) -> list[MessageRecord]:
         history = self._histories.get(conv_id)
@@ -65,6 +71,8 @@ class ContextManager:
         text: str,
         sender_id: str = "",
         message_id: str = "",
+        images: list[str] | None = None,
+        quote: str = "",
     ) -> None:
         """Append a message to a conversation, trimming the oldest.
 
@@ -75,6 +83,8 @@ class ContextManager:
             text: Message text.
             sender_id: Sender platform id.
             message_id: Platform message id.
+            images: Image URLs attached to the message.
+            quote: Quoted-message content this message replies to.
         """
         history = self._history(conv_id)
         history.append(
@@ -82,12 +92,103 @@ class ContextManager:
                 role=role,
                 sender_name=sender_name,
                 text=text,
+                images=list(images or []),
                 sender_id=sender_id,
                 message_id=message_id,
+                quote=quote,
             )
         )
         cap = self.recent_count + self.history_count
         del history[: max(0, len(history) - cap)]
+
+    def set_image_description(
+        self, conv_id: str, message_id: str, description: str
+    ) -> None:
+        """Attach a generated image description to a user message.
+
+        The description is rendered as a ``[图片描述: ...]`` marker so the
+        model references real content instead of a bare ``[图片]`` placeholder.
+
+        Args:
+            conv_id: Conversation identifier.
+            message_id: Platform id of the message to update.
+            description: Generated image description text.
+        """
+        if not message_id or not description:
+            return
+        for record in reversed(self._history(conv_id)):
+            if record.role == "user" and record.message_id == message_id:
+                record.description = description
+                return
+
+    def set_summary(
+        self, conv_id: str, text: str, covered_count: int
+    ) -> None:
+        """Store an LLM-generated summary of the older history.
+
+        ``covered_count`` is the number of older records the summary already
+        folded in, so stale summaries can be refreshed only when new messages
+        have slid out of the recent window.
+
+        Args:
+            conv_id: Conversation identifier.
+            text: The summarized text.
+            covered_count: How many older records the summary covers.
+        """
+        self._summaries[conv_id] = {"text": text, "count": covered_count}
+
+    def get_summary(self, conv_id: str) -> str:
+        """Return the cached LLM summary of a conversation, if any.
+
+        Args:
+            conv_id: Conversation identifier.
+
+        Returns:
+            The summary text, or an empty string.
+        """
+        entry = self._summaries.get(conv_id)
+        return entry["text"] if entry else ""
+
+    def summary_stale(self, conv_id: str, threshold: int = 1) -> bool:
+        """Whether older history needs a fresh LLM summary.
+
+        Args:
+            conv_id: Conversation identifier.
+            threshold: How many unsized older records trigger a refresh.
+
+        Returns:
+            True when messages have slid out that aren't covered yet.
+        """
+        older_count = self.older_count(conv_id)
+        if older_count <= 0:
+            return False
+        entry = self._summaries.get(conv_id)
+        covered = entry["count"] if entry else 0
+        return (older_count - covered) >= threshold
+
+    def older_count(self, conv_id: str) -> int:
+        """Number of records that have slid out of the recent window.
+
+        Args:
+            conv_id: Conversation identifier.
+
+        Returns:
+            The count of older (compressible) records.
+        """
+        return len(self._history(conv_id)) - self.recent_count
+
+    def summary_payload(self, conv_id: str, max_records: int = 50) -> str:
+        """Format older records as the input for an LLM summarizer.
+
+        Args:
+            conv_id: Conversation identifier.
+            max_records: How many older records to include.
+
+        Returns:
+            Formatted older-history text.
+        """
+        older = self._history(conv_id)[: -self.recent_count][-max_records:]
+        return "\n".join(self._format_record(r) for r in older)
 
     def active_conversations(self) -> list[str]:
         """List conversation ids that have recorded history.
@@ -96,6 +197,23 @@ class ContextManager:
             Conversation id list.
         """
         return list(self._histories.keys())
+
+    def find_message(self, conv_id: str, message_id: str) -> MessageRecord | None:
+        """Find the most recent user message with the given platform id.
+
+        Args:
+            conv_id: Conversation identifier.
+            message_id: Platform message id to look up.
+
+        Returns:
+            The matching record, or None.
+        """
+        if not message_id:
+            return None
+        for record in reversed(self._history(conv_id)):
+            if record.role == "user" and record.message_id == message_id:
+                return record
+        return None
 
     def resolve_target(self, conv_id: str, name: str) -> dict | None:
         """Resolve a display name to the most recent matching user message.
@@ -167,7 +285,69 @@ class ContextManager:
     def _format_record(self, record: MessageRecord) -> str:
         if record.role == "assistant":
             return record.text
-        return f"{record.sender_name}: {record.text}"
+        prefix = f"{record.sender_name}: "
+        body = ""
+        if record.quote:
+            body += f"[引用了消息: {record.quote}] "
+        if record.description:
+            desc = f"[图片描述: {record.description}]"
+            body += f"{record.text} {desc}" if record.text else desc
+        elif record.text:
+            body += record.text
+        if body:
+            return prefix + body
+        return f"{prefix}[图片]"
+
+    def _compress_record(self, record: MessageRecord) -> str | None:
+        """Format a record for the compressed older-history block.
+
+        Image placeholders (``[图片]`` with no description) carry no real
+        content and are dropped entirely so they don't pollute the summary;
+        a stored description participates as real text. Assistant lines get a
+        ``bot:`` prefix so the speaker is unambiguous.
+
+        Args:
+            record: The record to compress.
+
+        Returns:
+            The compressed line, or None to skip this record.
+        """
+        if record.role == "assistant":
+            text = record.text or ""
+            return f"bot: {text}" if text else None
+        body = ""
+        if record.quote:
+            body += f"[引用了消息: {record.quote}] "
+        if record.description:
+            desc = f"[图片描述: {record.description}]"
+            body += f"{record.text} {desc}" if record.text else desc
+        elif record.text:
+            body += record.text
+        if record.images and not body:
+            return None
+        return f"{record.sender_name}: {body}" if body else None
+
+    def _truncate(self, text: str, limit: int) -> str:
+        """Truncate text at a boundary, appending an ellipsis.
+
+        Prefers to cut after sentence punctuation (。！？，,. ) so Chinese
+        text isn't split mid-sentence; falls back to a hard cut.
+
+        Args:
+            text: Text to truncate.
+            limit: Maximum characters.
+
+        Returns:
+            The truncated text.
+        """
+        if len(text) <= limit:
+            return text
+        head = text[:limit]
+        for sep in ("。", "！", "？", "，", ".", "！", ",", " "):
+            idx = head.rfind(sep)
+            if idx >= 0:
+                return head[: idx + 1] + "…"
+        return head + "…"
 
     def build_messages(
         self,
@@ -175,22 +355,24 @@ class ContextManager:
         *,
         system_prompt: str,
         memory_texts: list[str] | None = None,
-        image_descriptions: list[str] | None = None,
+        history_texts: list[str] | None = None,
     ) -> list[dict]:
         """Build the OpenAI-style message list from a conversation's history.
 
         Cache-stable layout: ``system`` first, then the verbatim recent
-        messages as a stable, growing prefix. Everything short-lived (image
-        descriptions, recalled memories, compressed older history) goes into a
+        messages as a stable, growing prefix. Everything short-lived (recalled
+        memories, injected chat history, compressed older history) goes into a
         single trailing ``user`` block at the end, so it never shifts the
         shared prefix and provider-side prompt caching stays effective between
-        window slides.
+        window slides. Image descriptions are stored on the message records
+        themselves and rendered inline (``[图片描述: ...]``) rather than as a
+        separate block.
 
         Args:
             conv_id: Conversation identifier.
             system_prompt: The AI persona / system prompt.
             memory_texts: Recalled global memories to inject.
-            image_descriptions: Descriptions of images in the current message.
+            history_texts: Persisted chat-history blocks to inject.
 
         Returns:
             OpenAI-style message dict list.
@@ -210,9 +392,8 @@ class ContextManager:
         )
 
         background: list[str] = []
-        if image_descriptions:
-            background.append("当前消息中的图片内容:")
-            background.extend(f"- {desc}" for desc in image_descriptions)
+        for block in history_texts or []:
+            background.append(block)
         if memory_texts:
             background.append(
                 "以下是你回忆起的过往对话片段（可能来自其他对话或其他人，"
@@ -220,11 +401,19 @@ class ContextManager:
             )
             background.extend(f"- {text}" for text in memory_texts)
         if older:
-            background.append("更早的对话（已压缩）:")
-            background.extend(
-                f"- {self._format_record(r)[: self.old_msg_chars]}"
-                for r in older[-self.history_count :]
-            )
+            summary = self.get_summary(conv_id)
+            if summary:
+                background.append("更早的对话（已压缩摘要）:")
+                background.append(summary)
+            else:
+                compressed = [
+                    self._truncate(line, self.old_msg_chars)
+                    for record in older[-self.history_count :]
+                    if (line := self._compress_record(record))
+                ]
+                if compressed:
+                    background.append("更早的对话（已压缩）:")
+                    background.extend(f"- {line}" for line in compressed)
 
         if background:
             messages.append({"role": "user", "content": "\n".join(background)})
