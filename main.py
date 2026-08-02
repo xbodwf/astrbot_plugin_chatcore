@@ -48,7 +48,7 @@ from .history import (
 from .llm import EmbeddingAdapter, LLMProvider, ThinkStripper
 from .memory import MemoryStore
 from .profile import ProfileStore
-from .segmentation import stream_respond
+from .segmentation import build_interval_calc, stream_respond
 from .webui import ChatCoreWebUI
 
 DEFAULT_IMPLICIT_PROMPT = (
@@ -228,7 +228,8 @@ class Main(Star):
         seg = config.get("segment", {})
         self.segment_delimiter = seg.get("delimiter", "\n---\n").replace("\\n", "\n")
         self.segment_escape = seg.get("escape_char", "\\")
-        self.segment_interval = seg.get("interval", 1.0)
+        self.segment_interval_calc = build_interval_calc(seg.get("interval", 1.0))
+        self.segment_interval_raw = seg.get("interval", 1.0)
         self.max_segment_chars = seg.get("max_segment_chars", 300)
 
         memory_cfg = config.get("memory", {})
@@ -743,7 +744,7 @@ class Main(Star):
                     send_fn,
                     delimiter=self.segment_delimiter,
                     escape_char=self.segment_escape,
-                    interval=self.segment_interval,
+                    interval=self.segment_interval_calc,
                     max_segment_chars=self.max_segment_chars,
                     interrupt_check=task.signal,
                 )
@@ -1901,7 +1902,7 @@ class Main(Star):
             f"- 撤回取消: {'启用' if self.recall_cancel_enabled else '关闭'} "
             f"(已取消 {self.recalls_cancelled} 次)",
             f"- 分段符: {self.segment_delimiter!r}",
-            f"- 分段间隔: {self.segment_interval}s",
+            f"- 分段间隔: {self.segment_interval_raw!r}（按公式）",
             f"- 正在进行的对话: {len(self.active_tasks)}",
         ]
         yield event.plain_result("\n".join(lines))

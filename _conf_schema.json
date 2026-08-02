@@ -166,9 +166,9 @@
       },
       "interval": {
         "description": "分段发送间隔(秒)",
-        "type": "float",
-        "default": 1.0,
-        "hint": "每段之间等待的时长"
+        "type": "string",
+        "default": "1+length*0.07",
+        "hint": "每段发送后的等待秒数。可以是固定数字（如 1），或按段字数计算的公式，公式中 length 代表该段字数，可用 log/sqrt/abs/min/max/floor/ceil 等，如 1+length*0.07（20 字段约等 2.4 秒）、log(length)、1。留空回退 1 秒"
       },
       "max_segment_chars": {
         "description": "单段最大字符数",

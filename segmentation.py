@@ -6,12 +6,78 @@ escaped so the AI can output it literally when needed.
 """
 
 import asyncio
+import math
 import re
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import Any
 
 _SENTENCE_BOUNDARIES = {".", "!", "?", "。", "！", "？", "\n", "…"}
 _LINE_BREAK_RE = re.compile(r"\\n|\\r|\s")
+
+_SAFE_FORMULA_NAMES = {
+    "log": math.log,
+    "log10": math.log10,
+    "log2": math.log2,
+    "sqrt": math.sqrt,
+    "exp": math.exp,
+    "abs": abs,
+    "min": min,
+    "max": max,
+    "floor": math.floor,
+    "ceil": math.ceil,
+    "round": round,
+    "pow": pow,
+}
+
+
+def build_interval_calc(conf: Any) -> Callable[[int], float]:
+    """Build the per-segment pause calculator from the config value.
+
+    ``conf`` may be a plain number (fixed seconds) or a formula string using
+    ``length`` (the segment's character count) plus the safe math names,
+    e.g. ``1``, ``1+length*0.07``, ``log(length)``. Formulas are evaluated
+    in a restricted namespace (no builtins); anything unusable falls back to
+    a fixed pause of 1 second.
+
+    Args:
+        conf: The configured interval value.
+
+    Returns:
+        A callable mapping a segment length (chars) to a pause in seconds.
+    """
+
+    def _fixed(seconds: float) -> Callable[[int], float]:
+        return lambda _length: max(0.0, seconds)
+
+    if isinstance(conf, (int, float)):
+        return _fixed(float(conf))
+    expr = str(conf or "").strip()
+    if not expr:
+        return _fixed(1.0)
+    try:
+        # 先验证公式可编译（不含 length 的纯数字公式也接受）。
+        compile(expr, "<interval>", "eval")
+    except (SyntaxError, TypeError):
+        return _fixed(1.0)
+    if "length" not in expr:
+        # 无 length 的公式（如 "1"、"0.5+1"）当作固定值。
+        try:
+            return _fixed(float(eval(expr, {"__builtins__": {}}, {})))
+        except Exception:
+            return _fixed(1.0)
+
+    def _calc(length: int) -> float:
+        try:
+            value = eval(
+                expr,
+                {"__builtins__": {}},
+                {"length": max(1, length), **_SAFE_FORMULA_NAMES},
+            )
+            return max(0.0, float(value))
+        except Exception:
+            return 0.0
+
+    return _calc
 
 
 def _delimiter_core(delimiter: str) -> str:
@@ -272,18 +338,20 @@ async def stream_respond(
     *,
     delimiter: str,
     escape_char: str = "\\",
-    interval: float = 1.0,
+    interval: float | Callable[[int], float] | None = 1.0,
     max_segment_chars: int = 0,
     interrupt_check: Callable[[], Any] | None = None,
     finish_timeout: float = 2.0,
 ) -> tuple[str | None, Any] | None:
     """Consume a text stream, segment it and send each segment.
 
-    Segments are sent with a small ``interval`` pause in between so the user
-    perceives natural typing while the AI keeps generating. If
-    ``interrupt_check`` returns a truthy value (e.g. a debounced new message or
-    a recall cancel), the current sentence is allowed to finish (bounded by
-    ``finish_timeout``); its trailing remainder is returned along with the
+    Segments are sent with a pause in between so the user perceives natural
+    typing while the AI keeps generating. ``interval`` may be a fixed float
+    or a callable that receives the segment's character count and returns
+    the pause in seconds (e.g. for length-based typing simulation). If
+    ``interrupt_check`` returns a truthy value (e.g. a debounced new message
+    or a recall cancel), the current sentence is allowed to finish (bounded
+    by ``finish_timeout``); its trailing remainder is returned along with the
     interrupt value so the caller decides how to proceed.
 
     Args:
@@ -291,7 +359,8 @@ async def stream_respond(
         send_fn: Async callback to send a finished segment.
         delimiter: Segment delimiter used by the AI.
         escape_char: Escape char for the delimiter.
-        interval: Pause between segments, in seconds.
+        interval: Fixed pause in seconds, or a callable mapping the segment
+            length (chars) to a pause. None/<=0 disables the pause.
         max_segment_chars: Hard cap per segment (0 disables).
         interrupt_check: Optional callable returning ``(text, cancelled)`` when
             interrupted, else None.
@@ -301,6 +370,12 @@ async def stream_respond(
         A ``(trailing_text, (text, cancelled))`` tuple when interrupted, else
         None. ``trailing_text`` is the current sentence's remainder to deliver.
     """
+
+    def _pause_for(seg: str) -> float:
+        if callable(interval):
+            return max(0.0, float(interval(len(seg))))
+        return max(0.0, float(interval or 0))
+
     segmenter = StreamSegmenter(delimiter, escape_char, max_segment_chars)
     try:
         async for chunk in stream_gen:
@@ -319,8 +394,9 @@ async def stream_respond(
                 return trailing, newer or signal
             for seg in segmenter.feed(chunk):
                 await send_fn(seg)
-                if interval > 0:
-                    await asyncio.sleep(interval)
+                pause = _pause_for(seg)
+                if pause > 0:
+                    await asyncio.sleep(pause)
         final = segmenter.flush()
         if final:
             await send_fn(final)
