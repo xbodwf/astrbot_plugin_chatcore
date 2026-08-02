@@ -441,6 +441,12 @@
         "type": "text",
         "default": "",
         "hint": "用于描述并分类表情包的视觉模型 provider id；留空则复用对话模型"
+      },
+      "collect_probability": {
+        "description": "收集概率",
+        "type": "float",
+        "default": 0.6,
+        "hint": "带图消息入库表情包库的概率（0~1）。入库后由视觉模型分类并生成唯一 id，AI 可用 [[emoji:id]] 发送"
       }
     }
   },

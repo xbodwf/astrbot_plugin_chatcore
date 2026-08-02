@@ -100,18 +100,121 @@ class EmojiStore:
         src = Path(source_file)
         if not src.is_file():
             return None
+        emoji_id, dest = self._new_destination(src.suffix or ".image")
+        try:
+            shutil.copy2(src, dest)
+        except OSError:
+            return None
+        return self._register(
+            emoji_id,
+            dest,
+            source_group=source_group,
+            source_sender=source_sender,
+            source_message_id=source_message_id,
+            source_text=source_text,
+            source_context=source_context,
+        )
+
+    async def collect_from_url(
+        self,
+        url: str,
+        *,
+        source_group: str,
+        source_sender: str,
+        source_message_id: str,
+        source_text: str,
+        source_context: str,
+    ) -> str | None:
+        """Download an image URL into the library and record its provenance.
+
+        OneBot image components usually carry only a network URL, so
+        collection must fetch the bytes itself.
+
+        Args:
+            url: The image URL.
+            source_group: Group id where it was collected.
+            source_sender: Sender who posted it.
+            source_message_id: Original message id.
+            source_text: Text of the original message.
+            source_context: Surrounding conversation window.
+
+        Returns:
+            The new emoji id, or None on any failure.
+        """
+        import aiohttp
+        from urllib.parse import urlparse
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.read()
+        except Exception:
+            return None
+        if not data:
+            return None
+        ext = Path(urlparse(url).path).suffix or ".image"
+        emoji_id, dest = self._new_destination(ext)
+        try:
+            dest.write_bytes(data)
+        except OSError:
+            return None
+        return self._register(
+            emoji_id,
+            dest,
+            source_group=source_group,
+            source_sender=source_sender,
+            source_message_id=source_message_id,
+            source_text=source_text,
+            source_context=source_context,
+        )
+
+    def _new_destination(self, ext: str) -> tuple[str, Path]:
+        """Allocate a fresh emoji id and its destination file path.
+
+        Args:
+            ext: File extension for the stored image.
+
+        Returns:
+            A ``(emoji_id, dest_path)`` tuple.
+        """
         now = time.time()
         emoji_id = f"emoji_{int(now * 1000)}"
         while emoji_id in self._records:
             now += 1.0
             emoji_id = f"emoji_{int(now * 1000)}"
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        ext = src.suffix.lower() if src.suffix else ".image"
-        dest = self.data_dir / f"{emoji_id}{ext}"
-        try:
-            shutil.copy2(src, dest)
-        except OSError:
-            return None
+        return emoji_id, self.data_dir / f"{emoji_id}{ext}"
+
+    def _register(
+        self,
+        emoji_id: str,
+        dest: Path,
+        *,
+        source_group: str,
+        source_sender: str,
+        source_message_id: str,
+        source_text: str,
+        source_context: str,
+    ) -> str:
+        """Record an emoji entry, evicting the oldest when over capacity.
+
+        Args:
+            emoji_id: The allocated emoji id.
+            dest: The stored image file.
+            source_group: Group id where it was collected.
+            source_sender: Sender who posted it.
+            source_message_id: Original message id.
+            source_text: Text of the original message.
+            source_context: Surrounding conversation window.
+
+        Returns:
+            The emoji id.
+        """
         self._records[emoji_id] = {
             "emoji_id": emoji_id,
             "file": str(dest),
@@ -120,7 +223,7 @@ class EmojiStore:
             "source_message_id": source_message_id or "",
             "source_text": (source_text or "")[:200],
             "source_context": (source_context or "")[:500],
-            "collected_at": now,
+            "collected_at": time.time(),
             "category": "",
             "tags": [],
             "usage_count": 0,

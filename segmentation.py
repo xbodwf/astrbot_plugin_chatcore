@@ -13,6 +13,8 @@ from typing import Any
 
 _SENTENCE_BOUNDARIES = {".", "!", "?", "。", "！", "？", "\n", "…"}
 _LINE_BREAK_RE = re.compile(r"\\n|\\r|\s")
+_EMOJI_MARKER_OPEN = "[[emoji:"
+_EMOJI_MARKER_CLOSE = "]]"
 
 _SAFE_FORMULA_NAMES = {
     "log": math.log,
@@ -211,6 +213,30 @@ class StreamSegmenter:
                 self._prev_char = ch
                 continue
             self._chars.append(ch)
+            joined = "".join(self._chars)
+            if joined.endswith(_EMOJI_MARKER_CLOSE) and _EMOJI_MARKER_OPEN in joined:
+                # [[emoji:xxx]] 完成：标记前内容为一段，标记本身为一段。
+                start = joined.rfind(_EMOJI_MARKER_OPEN)
+                prefix = joined[:start]
+                marker = joined[start:]
+                self._chars = []
+                seg = self._emit_plain(prefix)
+                if seg:
+                    segments.append(seg)
+                marker = marker.strip()
+                if marker:
+                    segments.append(marker)
+                self._prev_char = ch
+                continue
+            if joined.endswith(_EMOJI_MARKER_OPEN):
+                # 标记开始：把标记前的内容先切出来（保证换行使用时的独立性）。
+                prefix = joined[: -len(_EMOJI_MARKER_OPEN)]
+                self._chars = list(_EMOJI_MARKER_OPEN)
+                seg = self._emit_plain(prefix)
+                if seg:
+                    segments.append(seg)
+                self._prev_char = ch
+                continue
             seg = self._try_exact(ch) or self._try_standalone_line(ch)
             if seg:
                 self._prev_char = ch
@@ -225,6 +251,25 @@ class StreamSegmenter:
                     segments.append(seg)
             self._prev_char = ch
         return segments
+
+    def _emit_plain(self, text: str) -> str | None:
+        """Emit an arbitrary text prefix as a segment (state-resetting).
+
+        Used for content cut around an emoji marker so the surrounding line
+        state stays consistent.
+
+        Args:
+            text: The text to emit.
+
+        Returns:
+            The stripped text, or None when blank.
+        """
+        text = text.strip()
+        if text:
+            self._line_start = 0
+            self._line_has_escape = False
+            self._delim_pos = 0
+        return text or None
 
     def has_boundary(self) -> bool:
         """Whether the pending buffer ends on a sentence boundary.
@@ -373,7 +418,9 @@ async def stream_respond(
 
     def _pause_for(seg: str) -> float:
         if callable(interval):
-            return max(0.0, float(interval(len(seg))))
+            # 表情包段按 5 个字计时（发送图片也需要"打字"时间）。
+            length = 5 if _EMOJI_MARKER_OPEN in seg else len(seg)
+            return max(0.0, float(interval(length)))
         return max(0.0, float(interval or 0))
 
     segmenter = StreamSegmenter(delimiter, escape_char, max_segment_chars)

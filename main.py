@@ -285,6 +285,9 @@ class Main(Star):
         emoji_cfg = config.get("emoji", {})
         self.emoji_store = None
         self.emoji_vision_client = None
+        self.emoji_collect_probability = float(
+            emoji_cfg.get("collect_probability", 0.6)
+        )
         if emoji_cfg.get("enabled", True):
             emoji_root = (
                 Path(get_astrbot_plugin_data_path())
@@ -1722,19 +1725,26 @@ class Main(Star):
         """
         if not self.emoji_store:
             return
-        image = images[0]
-        source_file = image.file or image.path
-        if not source_file or not Path(source_file).is_file():
+        if random.random() >= self.emoji_collect_probability:
+            # 概率筛选：不是每条图都值得入库。
             return
+        image = images[0]
         context_window = self.context_mgr.summary_text(conv_id, max_chars=300)
-        emoji_id = self.emoji_store.collect(
-            source_file,
+        source_kw = dict(
             source_group=conv_id,
             source_sender=event.get_sender_name() or "",
             source_message_id=str(getattr(event.message_obj, "message_id", "") or ""),
             source_text=text,
             source_context=context_window,
         )
+        url = getattr(image, "url", "") or ""
+        if url.startswith(("http://", "https://")):
+            emoji_id = await self.emoji_store.collect_from_url(url, **source_kw)
+        else:
+            local = getattr(image, "path", "") or getattr(image, "file", "") or ""
+            if not local or not Path(str(local)).is_file():
+                return
+            emoji_id = self.emoji_store.collect(local, **source_kw)
         if not emoji_id:
             return
         self.logger.info(f"ChatCore emoji | collected {emoji_id} from {conv_id}")
