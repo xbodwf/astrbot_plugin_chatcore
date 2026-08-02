@@ -661,7 +661,16 @@ class Main(Star):
                 prev_result = event.get_result()
                 was_stopped = event.is_stopped()
                 try:
-                    await call_event_hook(event, EventType.OnLLMRequestEvent, req)
+                    # 第三方 on_llm_request 插件不应无限拖慢核心链路：5 秒
+                    # 超时后放弃等待（req 上的变更可能不完整，但能继续）。
+                    await asyncio.wait_for(
+                        call_event_hook(event, EventType.OnLLMRequestEvent, req),
+                        timeout=5,
+                    )
+                except asyncio.TimeoutError:
+                    self.logger.warning(
+                        "ChatCore: OnLLMRequestEvent hooks timed out after 5s"
+                    )
                 finally:
                     event.set_result(prev_result)
                     if was_stopped:
@@ -729,6 +738,26 @@ class Main(Star):
                     max_segment_chars=self.max_segment_chars,
                     interrupt_check=task.signal,
                 )
+                # 一轮生成结束：通知 vanilla 生态（如 input_state 的
+                # "正在输入"停止、LLMPerception 等），否则它们会一直等待。
+                if pending is None:
+                    try:
+                        from astrbot.core.provider.entities import LLMResponse
+
+                        await asyncio.wait_for(
+                            call_event_hook(
+                                event,
+                                EventType.OnLLMResponseEvent,
+                                LLMResponse("assistant", completion_text=""),
+                            ),
+                            timeout=5,
+                        )
+                    except asyncio.TimeoutError:
+                        self.logger.warning(
+                            "ChatCore: OnLLMResponseEvent hooks timed out"
+                        )
+                    except Exception:
+                        pass
                 tool_round = False
                 if pending is None:
                     # 无工具轮中模型声明需要工具: 升级为带工具的请求重试一轮。
