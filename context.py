@@ -179,6 +179,7 @@ class ContextManager:
         message_id: str = "",
         images: list[str] | None = None,
         quote: str = "",
+        ts: float | None = None,
     ) -> None:
         """Append a message to a conversation, trimming the oldest.
 
@@ -191,6 +192,7 @@ class ContextManager:
             message_id: Platform message id.
             images: Image URLs attached to the message.
             quote: Quoted-message content this message replies to.
+            ts: Original message timestamp (epoch seconds); defaults to now.
         """
         history = self._history(conv_id)
         history.append(
@@ -202,6 +204,7 @@ class ContextManager:
                 sender_id=sender_id,
                 message_id=message_id,
                 quote=quote,
+                ts=ts if ts is not None else time.time(),
             )
         )
         cap = self.recent_count + self.history_count

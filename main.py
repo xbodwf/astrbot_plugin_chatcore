@@ -392,6 +392,7 @@ class Main(Star):
             message_id=msg_id,
             images=[img.url or img.file for img in images if img.url or img.file],
             quote=self._extract_quote_chain(conv_id, components, self.quote_max_depth),
+            ts=float(getattr(event.message_obj, "timestamp", 0) or 0) or None,
         )
         self._schedule_summary(conv_id)
 
