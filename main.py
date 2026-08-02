@@ -143,6 +143,7 @@ class Main(Star):
         self._init_from_config(config)
         self.active_tasks: dict[str, GenerationTask] = {}
         self._interrupted: dict[str, float] = {}
+        self._last_reply: dict[str, tuple[str, float]] = {}
         self._analysis_task: asyncio.Task | None = None
         self._expression_task: asyncio.Task | None = None
         self._scheduled_jobs: dict[str, dict] = {}
@@ -618,6 +619,12 @@ class Main(Star):
                         history_blocks = list(history_blocks) + [
                             "【提示】你上一条回复因故中断了，如果合适，请自然地接着把没说完的话补完。"
                         ]
+                    last_reply = self._last_reply.get(conv_id)
+                    if last_reply and time.time() - last_reply[1] < 300:
+                        history_blocks = list(history_blocks) + [
+                            f"【提示】你刚刚才说过「{last_reply[0][:60]}」。"
+                            "除非对方明确追问，不要重复类似的话；回应新消息要说新内容。"
+                        ]
                     system_prompt = await self._build_system_prompt(
                         conv_id, event.get_sender_id()
                     )
@@ -706,6 +713,7 @@ class Main(Star):
                         self.context_mgr.record(conv_id, "assistant", "bot", segment)
                         self._schedule_summary(conv_id)
                     self.logger.info(f"ChatCore send | {conv_id} | bot: {segment}")
+                    self._last_reply[conv_id] = (segment, time.time())
                     await self.context.send_message(
                         conv_id,
                         MessageChain(chain=chain),
@@ -792,6 +800,7 @@ class Main(Star):
                             )
                             self._schedule_summary(conv_id)
                         self.logger.info(f"ChatCore send | {conv_id} | bot: {trailing}")
+                        self._last_reply[conv_id] = (trailing, time.time())
                         await self.context.send_message(
                             conv_id,
                             MessageChain(chain=chain),

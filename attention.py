@@ -267,6 +267,19 @@ class AttentionManager:
         )
         return max(0.0, min(self.active_cap, prob))
 
+    def in_cooldown(self, group_id: str) -> bool:
+        """Whether the group is inside the post-reply cooldown window.
+
+        Args:
+            group_id: Group identifier.
+
+        Returns:
+            True when the AI replied recently and hard triggers should be
+            suppressed to avoid spamming the group.
+        """
+        state = self._get_state(group_id)
+        return time.time() - state["last_reply_ts"] < self.cool_down_seconds
+
     def should_respond(self, group_id: str) -> bool:
         """Roll the dice for a soft-trigger reply.
 
