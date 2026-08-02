@@ -1730,13 +1730,15 @@ class Main(Star):
             return
         image = images[0]
         context_window = self.context_mgr.summary_text(conv_id, max_chars=300)
-        source_kw = dict(
-            source_group=conv_id,
-            source_sender=event.get_sender_name() or "",
-            source_message_id=str(getattr(event.message_obj, "message_id", "") or ""),
-            source_text=text,
-            source_context=context_window,
-        )
+        source_kw = {
+            "source_group": conv_id,
+            "source_sender": event.get_sender_name() or "",
+            "source_message_id": str(
+                getattr(event.message_obj, "message_id", "") or ""
+            ),
+            "source_text": text,
+            "source_context": context_window,
+        }
         url = getattr(image, "url", "") or ""
         if url.startswith(("http://", "https://")):
             emoji_id = await self.emoji_store.collect_from_url(url, **source_kw)
