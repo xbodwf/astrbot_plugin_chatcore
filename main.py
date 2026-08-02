@@ -201,6 +201,7 @@ class Main(Star):
             read_air_factor=attn.get("read_air_factor", 0.5),
             others_density_threshold=attn.get("others_density_threshold", 3),
             followup_boost=attn.get("followup_boost", 0.05),
+            poke_probability=attn.get("poke_probability", 0.3),
         )
         self.hard_trigger_force = attn.get("hard_trigger_force", True)
         self.wake_prefix = [str(w).lower() for w in attn.get("wake_prefix", [])]
@@ -515,6 +516,12 @@ class Main(Star):
         )
         if self.affinity_mgr and sender_id:
             self.affinity_mgr.interact(sender_id, 2.0)
+        # 概率触发：每次戳记一次硬触发（累积活跃度），多次戳提高回复概率。
+        if self.attention:
+            self.attention.record_hard_trigger(conv_id)
+            if not self.attention.should_respond_poke(conv_id):
+                event.stop_event()
+                return
         task = GenerationTask(conv_id, "")
         self.active_tasks[conv_id] = task
         event.stop_event()

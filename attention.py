@@ -76,6 +76,7 @@ class AttentionManager:
         others_density_threshold: int = 3,
         followup_boost: float = 0.05,
         followup_window_seconds: float = 180.0,
+        poke_probability: float = 0.3,
     ) -> None:
         self.bubble_base = max(0.0, min(bubble_base, 1.0))
         self.active_cap = max(self.bubble_base, min(active_cap, 1.0))
@@ -90,6 +91,7 @@ class AttentionManager:
         self.others_density_threshold = max(1, int(others_density_threshold))
         self.followup_boost = max(0.0, followup_boost)
         self.followup_window_seconds = max(1.0, followup_window_seconds)
+        self.poke_probability = max(0.0, min(poke_probability, 1.0))
         self._states: dict[str, dict] = {}
 
     def _get_state(self, group_id: str) -> dict:
@@ -266,6 +268,28 @@ class AttentionManager:
             * self._read_air_multiplier(state, now)
         )
         return max(0.0, min(self.active_cap, prob))
+
+    def should_respond_poke(self, group_id: str) -> bool:
+        """Roll the dice for a poke-triggered reply.
+
+        Repeated pokes act like repeated chat: every poke records a hard
+        trigger (accumulating boosts), so the chance rises with the poke
+        frequency, capped at ``active_cap``. The post-reply cooldown is
+        intentionally skipped here so a poke burst stays responsive.
+
+        Args:
+            group_id: Group identifier.
+
+        Returns:
+            True when the AI should reply to this poke.
+        """
+        state = self._get_state(group_id)
+        now = time.time()
+        prob = self.poke_probability + sum(
+            b["value"] * self._decay((now - b["ts"]) / 60.0) for b in state["boosts"]
+        )
+        prob = max(0.0, min(self.active_cap, prob))
+        return random.random() < prob
 
     def in_cooldown(self, group_id: str) -> bool:
         """Whether the group is inside the post-reply cooldown window.

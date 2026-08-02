@@ -15,7 +15,9 @@ from pathlib import Path
 from typing import Any
 
 _ANALYZE_PROMPT = (
-    "下面是一个聊天群最近的发言记录。请分析这个群的表达风格，输出 JSON：\n"
+    "下面是一个聊天群最近的发言记录。请分析这个群的表达风格，"
+    "只保留真正有群特色、值得长期记住的内容（过滤一次性话题、寒暄、"
+    "无意义的语气词）；拿不准就不输出。输出 JSON：\n"
     "{\n"
     '  "summary": "一句话概括该群表达风格（如：短句流、爱用表情、阴阳怪气等）",\n'
     '  "patterns": ["常见句式或语气词，带一个例句，如：笑死，这操作真的6"],\n'
@@ -27,6 +29,8 @@ _ANALYZE_PROMPT = (
 
 _MAX_PATTERNS = 12
 _MAX_JARGON = 12
+_RENDER_MAX_PATTERNS = 3
+_RENDER_MAX_JARGON = 3
 
 
 def _parse_analysis(raw: str) -> dict:
@@ -213,15 +217,16 @@ class ExpressionStore:
         lines: list[str] = []
         if style["summary"]:
             lines.append(f"该群整体表达风格: {style['summary']}")
+        # 按需注入：只给少量代表性内容，避免风格堆砌。
         if style["patterns"]:
             lines.append("可参考的常见表达:")
-            lines.extend(f"- {p}" for p in style["patterns"])
+            lines.extend(f"- {p}" for p in style["patterns"][:_RENDER_MAX_PATTERNS])
         if style["jargon"]:
             lines.append("群内黑话表（带推断含义）:")
             lines.extend(
                 f"- {j['term']}（{j['meaning']}）"
                 + (f"，例: {j['example']}" if j.get("example") else "")
-                for j in style["jargon"]
+                for j in style["jargon"][:_RENDER_MAX_JARGON]
             )
         if not lines:
             return None
