@@ -76,7 +76,7 @@ class AttentionManager:
         others_density_threshold: int = 3,
         followup_boost: float = 0.05,
         followup_window_seconds: float = 180.0,
-        poke_probability: float = 0.3,
+        poke_decay_seconds: float = 300.0,
     ) -> None:
         self.bubble_base = max(0.0, min(bubble_base, 1.0))
         self.active_cap = max(self.bubble_base, min(active_cap, 1.0))
@@ -91,7 +91,7 @@ class AttentionManager:
         self.others_density_threshold = max(1, int(others_density_threshold))
         self.followup_boost = max(0.0, followup_boost)
         self.followup_window_seconds = max(1.0, followup_window_seconds)
-        self.poke_probability = max(0.0, min(poke_probability, 1.0))
+        self.poke_decay_seconds = max(1.0, poke_decay_seconds)
         self._states: dict[str, dict] = {}
 
     def _get_state(self, group_id: str) -> dict:
@@ -103,6 +103,9 @@ class AttentionManager:
                 "last_reply_ts": 0.0,
                 "soft_misses": 0,
                 "others_ts": [],
+                "last_poke_ts": 0.0,
+                "poke_total": 0.0,
+                "poke_count": 0,
             }
             self._states[group_id] = state
         return state
@@ -269,13 +272,64 @@ class AttentionManager:
         )
         return max(0.0, min(self.active_cap, prob))
 
+    def record_poke(self, group_id: str) -> None:
+        """Record a poke and update the poke-only reply probability.
+
+        The first poke lifts the poke probability to 50%; each further poke
+        adds 20% scaled by the poke cadence (dense pokes add more, sparse
+        ones less). Three consecutive dense pokes force a guaranteed reply.
+        Poke state never touches the normal chat probability.
+
+        Args:
+            group_id: Group identifier.
+        """
+        state = self._get_state(group_id)
+        now = time.time()
+        last = state.get("last_poke_ts", 0.0)
+        if last <= 0:
+            boost = 0.5
+        else:
+            gap = now - last
+            if gap <= 15:
+                factor = 1.0
+            elif gap <= 120:
+                factor = 0.5
+            else:
+                factor = 0.15
+            boost = state.get("poke_total", 0.0) + 0.2 * factor
+        state["poke_total"] = min(1.0, boost)
+        state["last_poke_ts"] = now
+        state["poke_count"] = state.get("poke_count", 0) + 1
+        if state["poke_count"] >= 3 and now - last <= 30:
+            state["poke_total"] = 1.0
+
+    def effective_poke_probability(self, group_id: str) -> float:
+        """Effective poke reply probability with natural decay.
+
+        Before any poke this equals the normal chat probability; after pokes
+        it is the max of that and the poke-accumulated target, which decays
+        linearly back to the chat baseline over ``poke_decay_seconds``.
+
+        Args:
+            group_id: Group identifier.
+
+        Returns:
+            Probability in ``[0, 1]``.
+        """
+        state = self._get_state(group_id)
+        now = time.time()
+        poke_total = state.get("poke_total", 0.0)
+        last = state.get("last_poke_ts", 0.0)
+        if last > 0 and poke_total > 0:
+            poke_total = max(
+                0.0,
+                poke_total - (now - last) / self.poke_decay_seconds,
+            )
+        base = self.current_probability(group_id)
+        return max(0.0, min(1.0, max(base, poke_total)))
+
     def should_respond_poke(self, group_id: str) -> bool:
         """Roll the dice for a poke-triggered reply.
-
-        Repeated pokes act like repeated chat: every poke records a hard
-        trigger (accumulating boosts), so the chance rises with the poke
-        frequency, capped at ``active_cap``. The post-reply cooldown is
-        intentionally skipped here so a poke burst stays responsive.
 
         Args:
             group_id: Group identifier.
@@ -283,13 +337,7 @@ class AttentionManager:
         Returns:
             True when the AI should reply to this poke.
         """
-        state = self._get_state(group_id)
-        now = time.time()
-        prob = self.poke_probability + sum(
-            b["value"] * self._decay((now - b["ts"]) / 60.0) for b in state["boosts"]
-        )
-        prob = max(0.0, min(self.active_cap, prob))
-        return random.random() < prob
+        return random.random() < self.effective_poke_probability(group_id)
 
     def in_cooldown(self, group_id: str) -> bool:
         """Whether the group is inside the post-reply cooldown window.

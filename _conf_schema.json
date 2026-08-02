@@ -146,11 +146,11 @@
         "default": 0.05,
         "hint": "bot 上次发言后话题仍在延续时，给概率的额外提升"
       },
-      "poke_probability": {
-        "description": "戳一戳触发概率",
-        "type": "float",
-        "default": 0.3,
-        "hint": "被戳一戳时调用 LLM 回复的基础概率（0~1）。每次被戳都会累积活跃度，短时间内多次戳会提高概率，封顶 active_max_prob"
+      "poke_decay_seconds": {
+        "description": "戳一戳概率衰减时间(秒)",
+        "type": "int",
+        "default": 300,
+        "hint": "被戳后 poke 触发概率自然衰减回聊天概率所需时长。概率机制：戳前=普通聊天概率；戳 1 次后升到 50%；再戳在当前基础上 +20%（按戳的间隔缩放，密集戳加得多）；连续 3 次密集戳必触发。poke 概率独立于聊天概率"
       }
     }
   },
