@@ -419,12 +419,15 @@ class Main(Star):
 
         if self.affinity_mgr:
             # 私聊互动涨好感最多，硬触发(@/回复)次之，普通互动最少。
-            if is_private:
-                self.affinity_mgr.interact(conv_id, 3.0)
-            elif hard:
-                self.affinity_mgr.interact(conv_id, 2.0)
-            else:
-                self.affinity_mgr.interact(conv_id, 1.0)
+            # 按发送者计好感，群/私聊共用同一份。
+            sender_id = event.get_sender_id()
+            if sender_id:
+                if is_private:
+                    self.affinity_mgr.interact(sender_id, 3.0)
+                elif hard:
+                    self.affinity_mgr.interact(sender_id, 2.0)
+                else:
+                    self.affinity_mgr.interact(sender_id, 1.0)
 
         if self.emoji_store and images:
             asyncio.create_task(
@@ -607,7 +610,9 @@ class Main(Star):
                         history_blocks = list(history_blocks) + [
                             "【提示】你上一条回复因故中断了，如果合适，请自然地接着把没说完的话补完。"
                         ]
-                    system_prompt = await self._build_system_prompt(conv_id)
+                    system_prompt = await self._build_system_prompt(
+                        conv_id, event.get_sender_id()
+                    )
                     if self.reminder:
                         system_prompt = f"{system_prompt}\n\n{self.reminder}"
                     messages = self.context_mgr.build_messages(
@@ -815,7 +820,7 @@ class Main(Star):
         finally:
             self.active_tasks.pop(conv_id, None)
 
-    async def _build_system_prompt(self, conv_id: str) -> str:
+    async def _build_system_prompt(self, conv_id: str, sender_id: str = "") -> str:
         """Build the system prompt for a conversation.
 
         The persona (人格) is taken from AstrBot's own persona manager, so it
@@ -824,6 +829,7 @@ class Main(Star):
 
         Args:
             conv_id: Conversation identifier (unified_msg_origin).
+            sender_id: Sender's platform id, used for the affinity note.
 
         Returns:
             The full system prompt.
@@ -878,8 +884,8 @@ class Main(Star):
             )
         if self.emotion_mgr:
             rules += self.emotion_mgr.inject_text(conv_id)
-        if self.affinity_mgr:
-            rules += self.affinity_mgr.inject_text(conv_id)
+        if self.affinity_mgr and sender_id:
+            rules += self.affinity_mgr.inject_text(sender_id)
         return persona + rules
 
     def _merge_llm_request(
@@ -1781,11 +1787,16 @@ class Main(Star):
 
     @filter.command("chatcore")
     async def chatcore(self, event: AstrMessageEvent):
-        """Show ChatCore runtime status.
+        """Show ChatCore runtime status / affinity.
 
         Args:
             event: Current platform message event.
         """
+        text = event.get_message_str().strip()
+        parts = text.split()
+        if len(parts) > 1 and parts[1].lower() == "affinity":
+            yield self._chatcore_affinity(event, parts)
+            return
         lines = [
             "ChatCore 运行状态：",
             f"- 聊天模型: {self.chat_provider_id or '(未配置)'}",
@@ -1810,6 +1821,48 @@ class Main(Star):
             f"- 正在进行的对话: {len(self.active_tasks)}",
         ]
         yield event.plain_result("\n".join(lines))
+
+    def _chatcore_affinity(self, event: AstrMessageEvent, parts: list[str]):
+        """Resolve the ``chatcore affinity`` sub-command.
+
+        ``chatcore affinity`` shows the caller's own affinity; admins may
+        append a user id to query another user's affinity.
+
+        Args:
+            event: Current platform message event.
+            parts: Whitespace-split message words.
+
+        Returns:
+            The plain result to send.
+        """
+        if not self.affinity_mgr:
+            return event.plain_result("好感度系统未启用。")
+        if len(parts) > 2:
+            target_id = parts[2].strip()
+            if target_id == str(event.get_sender_id()):
+                return self._format_affinity(event, str(event.get_sender_id()))
+            if not event.is_admin():
+                return event.plain_result("只有管理员可以查询其他用户的好感度。")
+            return self._format_affinity(event, target_id)
+        return self._format_affinity(event, str(event.get_sender_id()))
+
+    def _format_affinity(
+        self, event: AstrMessageEvent, user_id: str
+    ) -> MessageEventResult:
+        """Render one user's affinity as a reply.
+
+        Args:
+            event: Current platform message event.
+            user_id: The user id to query.
+
+        Returns:
+            The plain result to send.
+        """
+        value = self.affinity_mgr.get(user_id)
+        tier, desc = self.affinity_mgr.tier(user_id)
+        return event.plain_result(
+            f"好感度（用户 {user_id}）: {round(value)} / 100\n关系: {tier}（{desc}）"
+        )
 
     async def initialize(self) -> None:
         """Start background tasks when the plugin is activated."""

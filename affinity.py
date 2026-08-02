@@ -1,9 +1,10 @@
-"""Per-conversation affinity (好感度) tracking.
+"""Per-user affinity (好感度) tracking.
 
-A single closeness score per conversation (0-100) that grows with
-interaction, decays over idle time, and shapes how the AI talks to the user
-(from distant/formal at low affinity to familiar/casual at high affinity).
-Persisted as JSON.
+A single closeness score per user (0-100) that grows with interaction,
+decays over idle time, and shapes how the AI talks to that person (from
+distant/formal at low affinity to familiar/casual at high affinity). Keys
+are the platform user ids, so group and private chats of the same person
+share one affinity. Persisted as JSON.
 """
 
 import json
@@ -71,60 +72,60 @@ class AffinityManager:
         except OSError:
             pass
 
-    def interact(self, conv_id: str, amount: float = 1.0) -> None:
-        """Bump a conversation's affinity and refresh its last-interaction time.
+    def interact(self, user_id: str, amount: float = 1.0) -> None:
+        """Bump a user's affinity and refresh the last-interaction time.
 
         Args:
-            conv_id: Conversation identifier.
+            user_id: Platform user id.
             amount: Affinity delta (positive for friendly interaction).
         """
-        current = self.get(conv_id)
-        self._values[conv_id] = max(0.0, min(100.0, current + amount))
-        self._last_ts[conv_id] = time.time()
+        current = self.get(user_id)
+        self._values[user_id] = max(0.0, min(100.0, current + amount))
+        self._last_ts[user_id] = time.time()
         self._save()
 
-    def get(self, conv_id: str) -> float:
-        """Current affinity for a conversation, applying idle decay.
+    def get(self, user_id: str) -> float:
+        """Current affinity for a user, applying idle decay.
 
         Args:
-            conv_id: Conversation identifier.
+            user_id: Platform user id.
 
         Returns:
             The affinity in ``[0, 100]``.
         """
-        value = self._values.get(conv_id, self.initial)
-        last_ts = self._last_ts.get(conv_id, 0.0)
+        value = self._values.get(user_id, self.initial)
+        last_ts = self._last_ts.get(user_id, 0.0)
         if last_ts > 0 and self.decay_per_day > 0:
             idle_days = max(0.0, (time.time() - last_ts) / 86400.0)
             value = max(0.0, value - idle_days * self.decay_per_day)
         return value
 
-    def tier(self, conv_id: str) -> tuple[str, str]:
-        """Resolve the affinity tier of a conversation.
+    def tier(self, user_id: str) -> tuple[str, str]:
+        """Resolve the affinity tier of a user.
 
         Args:
-            conv_id: Conversation identifier.
+            user_id: Platform user id.
 
         Returns:
             A ``(tier_name, description)`` tuple.
         """
-        value = self.get(conv_id)
+        value = self.get(user_id)
         for threshold, name, desc in _TIERS:
             if value < threshold:
                 return name, desc
         return _TIERS[-1][1], _TIERS[-1][2]
 
-    def inject_text(self, conv_id: str) -> str:
-        """Build the system-prompt fragment for the current affinity.
+    def inject_text(self, user_id: str) -> str:
+        """Build the system-prompt fragment for a user's affinity.
 
         Args:
-            conv_id: Conversation identifier.
+            user_id: Platform user id.
 
         Returns:
-            A short block describing the closeness to the other party.
+            A short block describing the closeness to that user.
         """
-        name, desc = self.tier(conv_id)
-        value = round(self.get(conv_id))
+        name, desc = self.tier(user_id)
+        value = round(self.get(user_id))
         return (
             f"\n\n【当前关系】你与对方现在是{name}的关系（好感度 {value}），"
             f"{desc}。按这个亲疏程度自然把握语气和称呼，不要提及这条说明。"
@@ -134,23 +135,23 @@ class AffinityManager:
         """Export all affinity states for the WebUI.
 
         Returns:
-            One summary dict per conversation.
+            One summary dict per user.
         """
         return [
             {
-                "conv_id": conv_id,
-                "value": round(self.get(conv_id), 1),
-                "tier": self.tier(conv_id)[0],
+                "user_id": user_id,
+                "value": round(self.get(user_id), 1),
+                "tier": self.tier(user_id)[0],
             }
-            for conv_id in self._values
+            for user_id in self._values
         ]
 
-    def reset(self, conv_id: str) -> None:
-        """Drop a conversation's affinity back to the initial value.
+    def reset(self, user_id: str) -> None:
+        """Drop a user's affinity back to the initial value.
 
         Args:
-            conv_id: Conversation identifier.
+            user_id: Platform user id.
         """
-        self._values.pop(conv_id, None)
-        self._last_ts.pop(conv_id, None)
+        self._values.pop(user_id, None)
+        self._last_ts.pop(user_id, None)
         self._save()
