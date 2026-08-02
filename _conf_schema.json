@@ -89,7 +89,11 @@
       "wake_prefix": {
         "description": "唤醒前缀列表",
         "type": "list",
-        "default": ["bot", "ai", "机器人"],
+        "default": [
+          "bot",
+          "ai",
+          "机器人"
+        ],
         "hint": "不带 @ 直接喊也能触发"
       },
       "cool_down_seconds": {
@@ -448,17 +452,37 @@
         "type": "string",
         "default": "neutral",
         "hint": "决定情绪基线：rational_calm（理性克制）/ neutral（中性）/ sentimental（感性细腻）",
-        "choices": ["rational_calm", "neutral", "sentimental"]
+        "choices": [
+          "rational_calm",
+          "neutral",
+          "sentimental"
+        ]
       },
       "states": {
         "description": "可切换状态列表",
         "type": "list",
         "item_type": "object",
         "default": [
-          {"key": "兴奋", "description": "热情、话变多、可以多用感叹号", "switch_prob": 0.2},
-          {"key": "慵懒", "description": "话少、简短、慢悠悠", "switch_prob": 0.2},
-          {"key": "严肃", "description": "认真、正经、尽量客观严谨", "switch_prob": 0.15},
-          {"key": "调侃", "description": "带点玩笑、损友风格，但不过分", "switch_prob": 0.15}
+          {
+            "key": "兴奋",
+            "description": "热情、话变多、可以多用感叹号",
+            "switch_prob": 0.2
+          },
+          {
+            "key": "慵懒",
+            "description": "话少、简短、慢悠悠",
+            "switch_prob": 0.2
+          },
+          {
+            "key": "严肃",
+            "description": "认真、正经、尽量客观严谨",
+            "switch_prob": 0.15
+          },
+          {
+            "key": "调侃",
+            "description": "带点玩笑、损友风格，但不过分",
+            "switch_prob": 0.15
+          }
         ],
         "hint": "每项含 key / description / switch_prob（被选中概率）"
       },
@@ -473,6 +497,30 @@
         "type": "int",
         "default": 1800,
         "hint": "该时长无互动后情绪回到基线，避免一直停留在一个状态"
+      }
+    }
+  },
+  "affinity": {
+    "description": "好感度系统",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "好感度开关",
+        "type": "bool",
+        "default": true,
+        "hint": "每会话维护好感度（0~100），互动增加、久不互动衰减，按亲疏程度影响回复语气与称呼"
+      },
+      "initial": {
+        "description": "初始好感度",
+        "type": "float",
+        "default": 50,
+        "hint": "新会话的好感度起点（0~100）"
+      },
+      "decay_per_day": {
+        "description": "每日衰减值",
+        "type": "float",
+        "default": 2,
+        "hint": "无互动时每天衰减的好感度"
       }
     }
   }

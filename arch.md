@@ -253,6 +253,16 @@ AstrBot 4.23.4+ 插件页机制（`pages/<页面>/index.html` 由 dashboard ifra
 - **回传协议**：OpenAI 要求 tool 结果跟在带 `tool_calls` 声明的 assistant 消息之后，否则 AstrBot 的 `_sanitize_assistant_messages` 当作孤儿消息丢弃（表现为模型反复调用同一工具）。工具轮先 append assistant 声明（`tool_calls` 含 id/name/arguments JSON），再 append 各 tool 结果。
 - **定时任务调度**：`_scheduler_loop`（20s 轮询，JSON 持久化 `scheduled_jobs.json`）触发到期任务，构造 `CronMessageEvent` 走 `_run_conversation` 完整链路（人格/情绪/记忆/分段/表情）投递到目标会话。AstrBot 原生 cron 触发固定走 vanilla agent，无法注入，故调度器自研。
 
+### 4.19 好感度系统（affinity.py）
+
+MaiBot 风格的关系亲密度：每会话（conv_id，群/私聊天然隔离）维护好感度 0~100：
+
+- **增减**：私聊互动 +3、硬触发（@/reply） +2、普通互动 +1；封顶 100、下限 0。
+- **衰减**：无互动时按天惰性衰减（`decay_per_day`，默认 2），`get()` 时按距上次互动时间计算，不依赖定时器。
+- **档位**：冷淡(<20) / 疏离(<40) / 普通(<60) / 熟络(<80) / 亲密(>=80)，`inject_text` 生成「当前关系」块注入 system prompt（自然措辞、禁止模型提及该说明），影响语气与称呼。
+- **持久化**：JSON（插件数据目录 `affinity.json`），重载不丢；WebUI 监控 tab 展示好感度与档位。
+- **配置**：`affinity.*`（开关、初始值、每日衰减）。
+
 ### 4.18 回复中断续聊
 
 生成被中断（异常/取消/插件重载）时标记该会话（`_interrupted`，1 小时内有效）；下次该会话互动时在背景块注入「你上一条回复因故中断了，如果合适请接着把没说完的话补完」，让 AI 自然续上（详见 4.2 背景块注入路径）。
@@ -308,4 +318,6 @@ AstrBot 4.23.4+ 插件页机制（`pages/<页面>/index.html` 由 dashboard ifra
 - `2026-08-02` 补充：工具调用——按需下发（模型自主声明 `[[tools]]`，常规轮不携带工具 schema）、`_build_tool_set`（插件工具 + `FutureTaskTool` + `schedule_task`）、`FunctionToolExecutor` 复用、tool 结果回传协议（assistant tool_calls 声明先行，防孤儿丢弃）、自研定时任务调度器（`_scheduler_loop` + `CronMessageEvent` 复用完整回复链路）、回复中断续聊标记（见 4.17/4.18）。
 - `2026-08-02` 调整：工具请求标记 `[[tools]]` 在无工具轮被分段层拦截丢弃，模型声明后插件升级为带工具请求重试（仅允许一次升级，防循环）。
 - `2026-08-02` 补充：对话历史持久化——`ContextManager` 可选 `persist_path`（插件数据目录 `context_history.json`），`record`/`set_image_description`/`remove_message`/`clear` 原子写盘（tmp+rename，失败静默）；插件重载后恢复每会话逐字历史（含图片描述/引用/发送者 ID），WebUI「活跃会话」不再因重载清空；无路径时保持纯内存（测试兼容）。
+- `2026-08-02` 补充：好感度系统——`affinity.py` 每会话好感度（互动增减、按天惰性衰减、五档位注入 system prompt），JSON 持久化，WebUI 展示，配置 `affinity.*`（见 4.19）。
+- `2026-08-02` 调整：system prompt 规则精简——分段/标记/防伪/工具/图片说明由约 700 字压缩为约 250 字编号短句（自然语气「一些约定，记住即可」），降低工程指令密度，恢复人格主导的角色扮演味道。
 

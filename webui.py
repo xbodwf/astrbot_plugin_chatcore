@@ -114,6 +114,9 @@ class ChatCoreWebUI:
                 if plugin.context_mgr
                 else [],
                 "emotion": plugin.emotion_mgr.snapshot() if plugin.emotion_mgr else [],
+                "affinity": plugin.affinity_mgr.snapshot()
+                if getattr(plugin, "affinity_mgr", None)
+                else [],
             }
         )
 
