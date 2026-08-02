@@ -416,12 +416,13 @@ class ContextManager:
         return text[-max_chars:]
 
     def clear(self, conv_id: str) -> None:
-        """Drop a conversation's history.
+        """Drop a conversation's history and summary cache.
 
         Args:
             conv_id: Conversation identifier.
         """
         self._histories.pop(conv_id, None)
+        self._summaries.pop(conv_id, None)
         self._persist()
 
     def remove_message(self, conv_id: str, message_id: str) -> None:

@@ -1813,6 +1813,9 @@ class Main(Star):
         if len(parts) > 1 and parts[1].lower() == "affinity":
             yield self._chatcore_affinity(event, parts)
             return
+        if len(parts) > 1 and parts[1].lower() == "reset":
+            yield await self._chatcore_reset(event)
+            return
         lines = [
             "ChatCore 运行状态：",
             f"- 聊天模型: {self.chat_provider_id or '(未配置)'}",
@@ -1879,6 +1882,41 @@ class Main(Star):
         return event.plain_result(
             f"好感度（用户 {user_id}）: {round(value)} / 100\n关系: {tier}（{desc}）"
         )
+
+    async def _chatcore_reset(self, event: AstrMessageEvent) -> MessageEventResult:
+        """Reset the current session's conversation (``chatcore reset``).
+
+        Mirrors AstrBot's vanilla ``/reset``: group chats require admin,
+        private chats are open to members. Stops the in-flight reply, clears
+        ChatCore's in-memory and persisted history (including the summary
+        cache), and clears AstrBot's persisted conversation for the session.
+
+        Args:
+            event: Current platform message event.
+
+        Returns:
+            The plain result to send.
+        """
+        conv_id = event.unified_msg_origin
+        if not event.is_private_chat() and not event.is_admin():
+            return event.plain_result("群聊中只有管理员可以重置会话。")
+        task = self.active_tasks.get(conv_id)
+        if task:
+            task.request_cancel()
+            self.active_tasks.pop(conv_id, None)
+        self.context_mgr.clear(conv_id)
+        try:
+            cid = await self.context.conversation_manager.get_curr_conversation_id(
+                conv_id
+            )
+            if cid:
+                await self.context.conversation_manager.update_conversation(
+                    conv_id, cid, []
+                )
+        except Exception as e:
+            self.logger.warning(f"ChatCore reset: clear astrbot history failed: {e}")
+        self.logger.info(f"ChatCore reset | {conv_id} | by {event.get_sender_id()}")
+        return event.plain_result("✅ ChatCore 会话已重置。")
 
     async def initialize(self) -> None:
         """Start background tasks when the plugin is activated."""
