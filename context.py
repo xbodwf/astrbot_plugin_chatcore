@@ -5,8 +5,11 @@ layered context: recent messages kept verbatim, older history compressed per
 message, plus recalled global memories and image descriptions.
 """
 
+import json
+import os
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .history import escape_user_markers
 
@@ -40,10 +43,15 @@ class MessageRecord:
 class ContextManager:
     """Per-conversation history and OpenAI message building.
 
+    History is optionally persisted to a JSON file so a plugin reload keeps
+    the verbatim per-conversation context (``persist_path``). Without a path
+    everything stays in memory (tests / backwards compatibility).
+
     Args:
         recent_count: How many recent messages stay verbatim.
         history_count: How many older messages are kept (compressed).
         old_msg_chars: Per-message char cap for compressed history.
+        persist_path: Optional JSON file to load/save conversation history.
     """
 
     def __init__(
@@ -51,12 +59,108 @@ class ContextManager:
         recent_count: int = 10,
         history_count: int = 30,
         old_msg_chars: int = 40,
+        persist_path: str | Path | None = None,
     ) -> None:
         self.recent_count = max(1, recent_count)
         self.history_count = max(0, history_count)
         self.old_msg_chars = max(1, old_msg_chars)
+        self._persist_path = Path(persist_path) if persist_path else None
         self._histories: dict[str, list[MessageRecord]] = {}
         self._summaries: dict[str, dict] = {}
+        if self._persist_path:
+            self._load()
+
+    @staticmethod
+    def _record_to_dict(record: MessageRecord) -> dict:
+        """Serialize one message record.
+
+        Args:
+            record: The record to serialize.
+
+        Returns:
+            A JSON-able dict.
+        """
+        return {
+            "role": record.role,
+            "sender_name": record.sender_name,
+            "text": record.text,
+            "images": record.images,
+            "description": record.description,
+            "sender_id": record.sender_id,
+            "message_id": record.message_id,
+            "quote": record.quote,
+            "ts": record.ts,
+        }
+
+    @staticmethod
+    def _record_from_dict(data: dict) -> MessageRecord | None:
+        """Deserialize one message record, tolerating corrupt entries.
+
+        Args:
+            data: The serialized dict.
+
+        Returns:
+            The record, or None when the dict is invalid.
+        """
+        if not isinstance(data, dict) or not isinstance(data.get("text"), str):
+            return None
+        return MessageRecord(
+            role=str(data.get("role") or "user"),
+            sender_name=str(data.get("sender_name") or ""),
+            text=data["text"],
+            images=[str(i) for i in data.get("images") or [] if isinstance(i, str)],
+            description=str(data.get("description") or ""),
+            sender_id=str(data.get("sender_id") or ""),
+            message_id=str(data.get("message_id") or ""),
+            quote=str(data.get("quote") or ""),
+            ts=float(data.get("ts") or time.time()),
+        )
+
+    def _load(self) -> None:
+        """Load persisted conversation history from disk."""
+        path = self._persist_path
+        if path is None:
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(raw, dict):
+            return
+        for conv_id, records in raw.items():
+            if not isinstance(conv_id, str) or not isinstance(records, list):
+                continue
+            loaded = [
+                r
+                for r in (self._record_from_dict(item) for item in records)
+                if r is not None
+            ]
+            if loaded:
+                self._histories[conv_id] = loaded
+
+    def _persist(self) -> None:
+        """Atomically persist conversation history to disk.
+
+        Failures are silent (history is best-effort cache).
+        """
+        if not self._persist_path:
+            return
+        try:
+            self._persist_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._persist_path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(
+                    {
+                        conv_id: [self._record_to_dict(r) for r in records]
+                        for conv_id, records in self._histories.items()
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            os.replace(tmp, self._persist_path)
+        except OSError:
+            pass
 
     def _history(self, conv_id: str) -> list[MessageRecord]:
         history = self._histories.get(conv_id)
@@ -102,6 +206,7 @@ class ContextManager:
         )
         cap = self.recent_count + self.history_count
         del history[: max(0, len(history) - cap)]
+        self._persist()
 
     def set_image_description(
         self, conv_id: str, message_id: str, description: str
@@ -121,6 +226,7 @@ class ContextManager:
         for record in reversed(self._history(conv_id)):
             if record.role == "user" and record.message_id == message_id:
                 record.description = description
+                self._persist()
                 return
 
     def set_summary(self, conv_id: str, text: str, covered_count: int) -> None:
@@ -316,6 +422,7 @@ class ContextManager:
             conv_id: Conversation identifier.
         """
         self._histories.pop(conv_id, None)
+        self._persist()
 
     def remove_message(self, conv_id: str, message_id: str) -> None:
         """Remove a user message from a conversation's history.
@@ -334,6 +441,7 @@ class ContextManager:
             for record in history
             if not (record.role == "user" and record.message_id == message_id)
         ]
+        self._persist()
 
     @staticmethod
     def _sender_label(record: MessageRecord) -> str:

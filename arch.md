@@ -307,4 +307,5 @@ AstrBot 4.23.4+ 插件页机制（`pages/<页面>/index.html` 由 dashboard ifra
 - `2026-08-01` 补充：表情包 WebUI 内联预览——iframe sandbox 无 `allow-same-origin`，不可直读二进制，新增 `GET .../emojis/<emoji_id>/image/data` 返回 base64 data URI JSON；父桥 `apiGet` 会解包 `response.data?.data`，故该路由返回 `{"data": "data:image/<mime>;base64,..."}` 后前端直接拿到 URI 字符串（`EmojiThumb` 处理）。
 - `2026-08-02` 补充：工具调用——按需下发（模型自主声明 `[[tools]]`，常规轮不携带工具 schema）、`_build_tool_set`（插件工具 + `FutureTaskTool` + `schedule_task`）、`FunctionToolExecutor` 复用、tool 结果回传协议（assistant tool_calls 声明先行，防孤儿丢弃）、自研定时任务调度器（`_scheduler_loop` + `CronMessageEvent` 复用完整回复链路）、回复中断续聊标记（见 4.17/4.18）。
 - `2026-08-02` 调整：工具请求标记 `[[tools]]` 在无工具轮被分段层拦截丢弃，模型声明后插件升级为带工具请求重试（仅允许一次升级，防循环）。
+- `2026-08-02` 补充：对话历史持久化——`ContextManager` 可选 `persist_path`（插件数据目录 `context_history.json`），`record`/`set_image_description`/`remove_message`/`clear` 原子写盘（tmp+rename，失败静默）；插件重载后恢复每会话逐字历史（含图片描述/引用/发送者 ID），WebUI「活跃会话」不再因重载清空；无路径时保持纯内存（测试兼容）。
 

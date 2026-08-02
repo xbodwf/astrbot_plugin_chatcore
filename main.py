@@ -203,6 +203,11 @@ class Main(Star):
             recent_count=ctx.get("recent_count", 10),
             history_count=ctx.get("history_count", 30),
             old_msg_chars=ctx.get("old_msg_chars", 40),
+            persist_path=(
+                Path(get_astrbot_plugin_data_path())
+                / "astrbot_plugin_chatcore"
+                / "context_history.json"
+            ),
         )
         self.llm_summarize = ctx.get("llm_summarize", True)
         self.quote_max_depth = max(1, int(ctx.get("quote_max_depth", 15)))
