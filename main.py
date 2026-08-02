@@ -863,9 +863,9 @@ class Main(Star):
             + "`（独占一行、不带反斜杠或反引号；想原样输出它时前面加 `"
             + self.segment_escape
             + "`）。"
-            "② 回复直接说人话：不要带任何说话者前缀（如 `你:`、`bot:`、"
-            "`X说:`），不要照抄上下文里的系统格式（如 `[图片]`、`[引用了…]`、"
-            "`[图片描述: …]`），回复里出现这些就是错误；"
+            "② 回复直接说人话：不要带任何说话者前缀或 `<message ...>` 这类"
+            "格式，不要照抄上下文里的系统格式（如 `[图片]`、`[引用了…]`、"
+            "`<message user=...>`），回复里出现这些就是错误；"
             "想回复某人的消息用 `[[reply:昵称]]`。"
         )
         if self.markers_enabled:
@@ -958,13 +958,13 @@ class Main(Star):
             merged = merged.strip()
             if not merged:
                 return messages
-            prefix = f"{sender_name}: "
-            id_prefix = f"{sender_name}("
             if current_text and current_text in merged:
                 for i in range(len(messages) - 1, -1, -1):
                     content = str(messages[i].get("content") or "")
-                    if messages[i].get("role") == "user" and (
-                        content.startswith(prefix) or content.startswith(id_prefix)
+                    if (
+                        messages[i].get("role") == "user"
+                        and content.startswith("<message ")
+                        and f'user="{sender_name}' in content
                     ):
                         messages[i]["content"] = merged
                         return messages
@@ -1563,7 +1563,7 @@ class Main(Star):
                             max_messages=self.history_max_messages,
                             max_chars=self.history_max_chars,
                             header=(
-                                "【记忆参考】以下是你与该用户在其他私聊中的最近"
+                                "[参考消息]以下是你与该用户在其他私聊中的最近"
                                 "对话记录，仅作背景参考，与当前群聊无关；除非用户"
                                 "问起，不要主动提起其中内容:"
                             ),

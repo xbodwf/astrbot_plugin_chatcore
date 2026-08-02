@@ -148,7 +148,11 @@ def render_history_block(
         return ""
     recent = messages[-max_messages:]
     lines = [
-        f"{'用户' if m['role'] == 'user' else 'bot'}: {escape_user_markers(clean_placeholder_text(m['content']))}"
+        (
+            f'<message user="用户">{escape_user_markers(clean_placeholder_text(m["content"]))}</message>'
+            if m["role"] == "user"
+            else f'<message self="bot">{escape_user_markers(clean_placeholder_text(m["content"]))}</message>'
+        )
         for m in recent
     ]
     block = "\n".join(lines)

@@ -465,7 +465,11 @@ class ContextManager:
     def _format_record(self, record: MessageRecord) -> str:
         if record.role == "assistant":
             return record.text
-        prefix = f"{self._sender_label(record)}: "
+        attrs = [f'user="{self._sender_label(record)}"']
+        if record.message_id:
+            attrs.append(f'msg_id="{record.message_id}"')
+        if record.ts:
+            attrs.append(f'time="{time.strftime("%H:%M", time.localtime(record.ts))}"')
         body = ""
         if record.quote:
             body += f"[引用了消息: {escape_user_markers(record.quote)}] "
@@ -476,17 +480,17 @@ class ContextManager:
             )
         elif record.text:
             body += escape_user_markers(record.text)
-        if body:
-            return prefix + body
-        return f"{prefix}[图片]"
+        if not body:
+            body = "[图片]"
+        return f"<message {' '.join(attrs)}>{body}</message>"
 
     def _compress_record(self, record: MessageRecord) -> str | None:
         """Format a record for the compressed older-history block.
 
-        Image placeholders (``[图片]`` with no description) carry no real
-        content and are dropped entirely so they don't pollute the summary;
-        a stored description participates as real text. Assistant lines get a
-        ``bot:`` prefix so the speaker is unambiguous.
+        Uses a compact ``[名字]`` shape (not the verbose ``<message>`` XML)
+        so truncated lines keep the speaker. Image placeholders (``[图片]``
+        with no description) are dropped entirely; a stored description
+        participates as real text.
 
         Args:
             record: The record to compress.
@@ -496,7 +500,7 @@ class ContextManager:
         """
         if record.role == "assistant":
             text = record.text or ""
-            return f"bot: {text}" if text else None
+            return f"[bot]{text}" if text else None
         body = ""
         if record.quote:
             body += f"[引用了消息: {escape_user_markers(record.quote)}] "
@@ -509,7 +513,7 @@ class ContextManager:
             body += escape_user_markers(record.text)
         if record.images and not body:
             return None
-        return f"{self._sender_label(record)}: {body}" if body else None
+        return f"[{self._sender_label(record)}]{body}" if body else None
 
     def _truncate(self, text: str, limit: int) -> str:
         """Truncate text at a boundary, appending an ellipsis.
@@ -582,22 +586,23 @@ class ContextManager:
             background.append(block)
         if memory_texts:
             background.append(
-                "以下是你回忆起的过往片段（可能来自其他群聊、私聊或很久以前，"
-                "不代表当前发生的事，也不代表你本人执行过任何操作）。它们只是"
-                "背景知识：除非用户明确问起，不要在当前对话中主动提起或当作"
-                "当前聊天的话题或依据:"
+                "[参考消息]以下是你回忆起的过往片段（可能来自其他群聊、私聊或"
+                "很久以前，不代表当前发生的事，也不代表你本人执行过任何操作）。"
+                "它们只是背景知识：除非用户明确问起，不要在当前对话中主动提起"
+                "或当作当前聊天的话题或依据:"
             )
             background.extend(f"- {escape_user_markers(text)}" for text in memory_texts)
         if profile_texts:
             background.append(
-                "以下是你对该用户的了解（人物画像，可能随时间更新）。自然融入"
-                "即可，不要主动复述画像内容，也不要把它当作当前对话的依据:"
+                "[参考消息]以下是你对该用户的了解（人物画像，可能随时间更新）。"
+                "自然融入即可，不要主动复述画像内容，也不要把它当作当前对话的"
+                "依据:"
             )
             background.extend(escape_user_markers(text) for text in profile_texts)
         if older:
             summary = self.get_summary(conv_id)
             if summary:
-                background.append("更早的对话（已压缩摘要）:")
+                background.append("[参考消息]更早的对话（已压缩摘要）:")
                 background.append(escape_user_markers(summary))
             else:
                 compressed = [
@@ -606,7 +611,7 @@ class ContextManager:
                     if (line := self._compress_record(record))
                 ]
                 if compressed:
-                    background.append("更早的对话（已压缩）:")
+                    background.append("[参考消息]更早的对话（已压缩）:")
                     background.extend(f"- {line}" for line in compressed)
 
         if background:
