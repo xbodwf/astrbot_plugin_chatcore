@@ -228,7 +228,7 @@ class Main(Star):
         self.segment_delimiter = seg.get("delimiter", "\n---\n").replace("\\n", "\n")
         self.segment_escape = seg.get("escape_char", "\\")
         self.segment_interval = seg.get("interval", 1.0)
-        self.max_segment_chars = seg.get("max_segment_chars", 600)
+        self.max_segment_chars = seg.get("max_segment_chars", 300)
 
         memory_cfg = config.get("memory", {})
         self.memory_shared = memory_cfg.get("shared_across_groups", True)
@@ -848,7 +848,8 @@ class Main(Star):
         delim = self.segment_delimiter.strip() or self.segment_delimiter
         rules = (
             "\n\n一些约定，记住即可："
-            "① 长回复可以拆成多条消息，分段时在两段之间单独写一行 `"
+            "① 回复要像真人聊天一样拆成多条消息：内容稍长（两三句以上）就分段，"
+            "每段只讲一件事、短小口语。分段方法：在两段之间单独写一行 `"
             + delim
             + "`（独占一行、不带反斜杠或反引号；想原样输出它时前面加 `"
             + self.segment_escape
@@ -879,6 +880,9 @@ class Main(Star):
             "就只回应那个动作，不要脑补出没发生的事（如没人戳你尾巴就不要"
             "说自己被戳了、没人提到的人名和话题不要自己引出）；"
             "记忆和画像只是背景知识，除非用户问起，不要主动提起。"
+            "⑧ 像真人一样聊天：短句、口语化，别把话说满、别一次回答所有点、"
+            "别写得像作文；可以自然用'嗯''诶''笑死''草'等语气词，"
+            "偶尔带点小吐槽。宁可短，不要长。"
         )
         style = (
             self.expression_store.render(

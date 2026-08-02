@@ -173,8 +173,8 @@
       "max_segment_chars": {
         "description": "单段最大字符数",
         "type": "int",
-        "default": 600,
-        "hint": "AI 忘了分段时的兜底保护，0 为不限制"
+        "default": 300,
+        "hint": "AI 忘了分段时的兜底保护，0 为不限制。群聊建议 200~300，越小分段越勤"
       }
     }
   },
