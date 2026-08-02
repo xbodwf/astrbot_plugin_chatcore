@@ -16,6 +16,7 @@ logger = logging.getLogger("astrbot")
 _MARKER_ESCAPE_RE = re.compile(
     r"\[\[|\[引用了|\[引用消息|\[图片|\[媒体|\[转发|\[@|\[At|\[表情"
 )
+_XML_TAG_RE = re.compile(r"</?[A-Za-z]")
 
 _ONE_BOT_FORWARD_RE = re.compile(
     r"查看\s*\d+\s*条转发消息|群聊的聊天记录|合并转发|转发消息"
@@ -31,13 +32,20 @@ def escape_user_markers(text: str) -> str:
     width ``[`` with its full width ``［`` makes those a distinctive format
     the AI cannot mistake for, or imitate as, system markers.
 
+    XML-ish tags (``<refuse>``, ``<message>`` ...) are also escaped to full
+    width ``＜`` / ``＞`` so they cannot nest inside the rendered
+    ``<message>`` records or be read as system instructions.
+
     Args:
         text: The user-authored text.
 
     Returns:
         The text with marker prefixes escaped.
     """
-    return _MARKER_ESCAPE_RE.sub(lambda m: "［" + m.group(0)[1:], text)
+    text = _MARKER_ESCAPE_RE.sub(lambda m: "［" + m.group(0)[1:], text)
+    text = _XML_TAG_RE.sub(lambda m: "＜" + m.group(0)[1:], text)
+    text = text.replace(">", "＞")
+    return text
 
 
 def clean_placeholder_text(text: str) -> str:
