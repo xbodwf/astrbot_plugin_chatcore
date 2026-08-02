@@ -611,8 +611,12 @@ class Main(Star):
             tool_rounds = 0
             tools_armed = False
             tools_requested = False
+            t_round_start = time.monotonic()
+            t_first_token: float | None = None
+            t_first_send: float | None = None
             while True:
                 if not tool_round:
+                    t_ctx_start = time.monotonic()
                     task.suppress_record = False
                     history_blocks = await self._inject_history_blocks(event, conv_id)
                     interrupted = self._interrupted.pop(conv_id, None)
@@ -638,6 +642,7 @@ class Main(Star):
                         history_texts=history_blocks,
                         profile_texts=await self._inject_profile(event),
                     )
+                    ctx_ms = (time.monotonic() - t_ctx_start) * 1000
 
                 # Replay OnLLMRequestEvent hooks (e.g. LLMPerception) so
                 # vanilla-ecosystem reminders still reach the model, then
@@ -689,7 +694,7 @@ class Main(Star):
                 stripper = ThinkStripper()
 
                 async def stream_gen():
-                    nonlocal tool_calls
+                    nonlocal tool_calls, t_first_token
                     async for resp in self.chat_client.chat_stream_raw(
                         messages,
                         images=image_urls,
@@ -698,6 +703,8 @@ class Main(Star):
                         if resp.is_chunk:
                             text = self.chat_client._to_text(resp)
                             if text:
+                                if t_first_token is None:
+                                    t_first_token = time.monotonic()
                                 for delta in stripper.feed(text):
                                     if delta:
                                         yield delta
@@ -711,7 +718,9 @@ class Main(Star):
                 image_urls = []
 
                 async def send_fn(segment: str) -> None:
-                    nonlocal tools_requested
+                    nonlocal tools_requested, t_first_send
+                    if t_first_send is None:
+                        t_first_send = time.monotonic()
                     # 无工具轮中模型声明需要工具: 丢弃该段，下一轮带工具重试。
                     if not tools_armed and _TOOLS_REQUEST_MARK in segment:
                         tools_requested = True
@@ -760,6 +769,13 @@ class Main(Star):
                         pass
                 tool_round = False
                 if pending is None:
+                    self.logger.info(
+                        f"ChatCore timing | {conv_id} | round={tool_rounds + 1}"
+                        f" ctx={ctx_ms:.0f}ms"
+                        f" first_token={((t_first_token or time.monotonic()) - t_round_start) * 1000:.0f}ms"
+                        f" first_send={((t_first_send or time.monotonic()) - t_round_start) * 1000:.0f}ms"
+                        f" total={(time.monotonic() - t_round_start) * 1000:.0f}ms"
+                    )
                     # 无工具轮中模型声明需要工具: 升级为带工具的请求重试一轮。
                     if (
                         tools_requested
@@ -1848,9 +1864,11 @@ class Main(Star):
         except Exception as e:
             self.logger.debug(f"Memory add failed: {e}")
 
-    @filter.command("chatcore")
+    @filter.command("chatcore", alias={"cxc", "ctc"})
     async def chatcore(self, event: AstrMessageEvent):
-        """Show ChatCore runtime status / affinity.
+        """Show ChatCore runtime status / affinity / reset.
+
+        Aliases: ``cxc`` and ``ctc`` (e.g. ``cxc affinity``).
 
         Args:
             event: Current platform message event.
