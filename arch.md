@@ -332,4 +332,6 @@ MaiBot 风格的关系亲密度：每会话（conv_id，群/私聊天然隔离�
 - `2026-08-02` 补充：兼容与诊断——每轮生成结束后触发 `OnLLMResponseEvent`（让 input_state 等插件停止"正在输入"循环）；`OnLLMRequestEvent`/`OnLLMResponseEvent` hook 调用加 5s 超时；`ChatCore timing` 日志输出每轮 ctx/首 token/首发送/总耗时；`chatcore` 指令别名 `c2c`（chat-to-core，对齐 llm2api 的数字缩写方式）/`ctc`。
 - `2026-08-02` 调整：动态分段间隔——`segment.interval` 支持公式（`length` 为段字数，可用 `log`/`sqrt`/`abs`/`min`/`max`/`floor`/`ceil` 等），如 `1+length*0.07`（长段停顿更长，模拟打字）；纯数字仍为固定间隔；公式在受限命名空间求值（无 builtins，防注入），非法回退 1 秒。
 - `2026-08-02` 修复+集成：表情包收集——根因：OneBot 图片组件只有网络 URL（`image.url`），旧代码按本地文件路径判断导致收集恒 0 个。现 `EmojiStore.collect_from_url` 用 aiohttp 下载入库；`_collect_emoji` 优先 URL、概率筛选（`emoji.collect_probability` 默认 0.6），入库后视觉模型分类。使用：`[[emoji:id]]` 精确 id（也支持按意图搜索），标记触发分段（`a\n[[emoji:01]]bcd` → a、表情、bcd 三段），表情段计时按 length=5。
+- `2026-08-02` 补充：引用图片可见——`_resolve_quote_node` 在被引用消息无文本时检查消息链组件，图片标记 `[图片]`、文件标记 `[文件: 名]`，Bot 不再对引用的图片/文件一无所知。
+- `2026-08-02` 补充：表情包手动导入——WebUI `emojis/import` 路由（前端「导入表情包」按钮上传图片 → 入库 → 视觉模型自动分类），导入源标记为「手动导入」。
 

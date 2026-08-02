@@ -12,9 +12,13 @@ and live monitoring (attention, context windows, emotion, backoff cooldowns).
 
 import base64
 import mimetypes
+import time
 from pathlib import Path
 
 from astrbot.api.web import error_response, file_response, json_response, request
+from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+
+from .emoji import classify_emoji
 
 PLUGIN_NAME = "astrbot_plugin_chatcore"
 _PREFIX = f"/{PLUGIN_NAME}"
@@ -54,6 +58,12 @@ class ChatCoreWebUI:
                 self.update_emoji,
                 ["POST"],
                 "ChatCore update emoji meta",
+            ),
+            (
+                f"{_PREFIX}/emojis/import",
+                self.import_emoji,
+                ["POST"],
+                "ChatCore import emoji",
             ),
             (
                 f"{_PREFIX}/emojis/<emoji_id>/image",
@@ -191,6 +201,64 @@ class ChatCoreWebUI:
             tags = []
         store.set_meta(str(emoji_id), category, [str(t) for t in tags])
         return json_response({"updated": emoji_id})
+
+    async def import_emoji(self) -> dict:
+        """Import an uploaded image into the emoji library.
+
+        The uploaded file is saved into the store, then classified by the
+        vision model (source context is empty for manual imports).
+
+        Returns:
+            A payload with the imported emoji id.
+        """
+        store = self.plugin.emoji_store
+        if not store:
+            return error_response("emoji store disabled", status_code=404)
+        files = await request.files()
+        upload = files.get("file")
+        if not upload:
+            return error_response("file is required")
+        tmp_dir = (
+            Path(get_astrbot_plugin_data_path())
+            / "astrbot_plugin_chatcore"
+            / "emoji"
+            / "tmp"
+        )
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        ext = Path(upload.filename or "img").suffix or ".image"
+        tmp = tmp_dir / f"import_{int(time.time() * 1000)}{ext}"
+        try:
+            await upload.save(tmp)
+            emoji_id = store.collect(
+                tmp,
+                source_group="手动导入",
+                source_sender="admin",
+                source_message_id="",
+                source_text="",
+                source_context="",
+            )
+            if emoji_id:
+                stored = store.file_path(emoji_id)
+                plugin = self.plugin
+                vision = plugin.emoji_vision_client or plugin.vision_client
+                category, tags = await classify_emoji(
+                    vision,
+                    plugin.summary_client,
+                    stored or str(tmp),
+                    "",
+                )
+                if category or tags:
+                    store.set_meta(emoji_id, category, tags)
+        except Exception as e:
+            return error_response(f"import failed: {e}", status_code=500)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if not emoji_id:
+            return error_response("import failed", status_code=500)
+        return json_response({"imported": emoji_id})
 
     async def get_emoji_image(self, emoji_id: str) -> dict:
         """Serve an emoji's stored image file.

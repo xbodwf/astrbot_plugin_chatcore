@@ -472,6 +472,8 @@ function EmojisPanel() {
   const { data, error, loading, reload } = useLoad(() => bridge.apiGet("emojis"));
   const [busy, setBusy] = React.useState(false);
   const [editing, setEditing] = React.useState(null);
+  const [importing, setImporting] = React.useState(false);
+  const fileInputRef = React.useRef(null);
   const emojis = data?.emojis || [];
 
   const doDelete = async (emojiId) => {
@@ -481,6 +483,20 @@ function EmojisPanel() {
       await reload();
     } finally {
       setBusy(false);
+    }
+  };
+
+  const doImport = async (file) => {
+    if (!file) return;
+    setImporting(true);
+    try {
+      await bridge.upload("emojis/import", file);
+      await reload();
+    } catch (e) {
+      console.error("emoji import failed", e);
+    } finally {
+      setImporting(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
     }
   };
 
@@ -509,6 +525,28 @@ function EmojisPanel() {
     Box,
     null,
     h(ErrorBanner, { error }),
+    h(
+      Stack,
+      { direction: "row", spacing: 1, alignItems: "center", mb: 1.5 },
+      h(
+        Button,
+        {
+          size: "small",
+          variant: "tonal",
+          disabled: importing,
+          onClick: () => fileInputRef.current?.click(),
+        },
+        importing ? "导入中…" : "导入表情包",
+      ),
+      h(Typography, { variant: "caption", color: "text.secondary" }, `共 ${emojis.length} 个`),
+      h("input", {
+        ref: fileInputRef,
+        type: "file",
+        accept: "image/*",
+        style: { display: "none" },
+        onChange: (e) => doImport(e.target.files?.[0]),
+      }),
+    ),
     emojis.length === 0
       ? h(Typography, { variant: "body2", color: "text.secondary" }, "暂无表情包")
       : h(

@@ -17,7 +17,7 @@ from typing import Any
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import At, Image, Plain, Reply
+from astrbot.api.message_components import At, File, Image, Plain, Reply
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.agent.run_context import ContextWrapper
@@ -1567,6 +1567,16 @@ class Main(Star):
             record = self.context_mgr.find_message(conv_id, str(reply.id))
             if record:
                 direct = record.text.strip()
+        # 被引用消息可能是图片/文件等非文本消息（其 message_str 为空），
+        # 从消息链组件里识别出来并标记，Bot 至少知道引用了什么。
+        if not direct:
+            for inner in reply.chain or []:
+                if isinstance(inner, Image):
+                    direct = "[图片]"
+                    break
+                if isinstance(inner, File):
+                    direct = f"[文件: {getattr(inner, 'name', '') or '未知文件'}]"
+                    break
         nested = ""
         for inner in reply.chain or []:
             if isinstance(inner, Reply):
