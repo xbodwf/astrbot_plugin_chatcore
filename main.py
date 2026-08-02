@@ -471,6 +471,60 @@ class Main(Star):
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
+    async def on_poke(self, event: AstrMessageEvent) -> None:
+        """Handle OneBot poke (戳一戳) events through the ChatCore pipeline.
+
+        Poke notices arrive as ``notify`` events. ChatCore takes them over so
+        the reply uses the same persona/context as normal chat; otherwise the
+        vanilla pipeline answers with out-of-character repeats (the "戳什么戳"
+        loop the user saw). Stops the event so vanilla / poke plugins stay
+        silent.
+
+        Args:
+            event: The poke notice event.
+        """
+        if event.get_platform_name() != "aiocqhttp":
+            return
+        raw = getattr(event.message_obj, "raw_message", None)
+        if not isinstance(raw, dict):
+            return
+        if (
+            raw.get("post_type") != "notice"
+            or raw.get("notice_type") != "notify"
+            or raw.get("sub_type") != "poke"
+        ):
+            return
+        if str(raw.get("target_id") or "") != str(raw.get("self_id") or ""):
+            return  # 戳的不是 bot
+        chat_cfg = self._config.get("chat", {})
+        if not chat_cfg.get("enabled", True) or not self.chat_provider_id:
+            return
+        conv_id = event.unified_msg_origin
+        if conv_id in self.llm_blacklist:
+            return
+        sender_id = str(raw.get("user_id") or "")
+        sender_name = event.get_sender_name() or (sender_id or "有人")
+        poke_text = f"（{sender_name} 戳了戳你）"
+        self.context_mgr.record(
+            conv_id,
+            "user",
+            sender_name,
+            poke_text,
+            sender_id=sender_id,
+            message_id="",
+        )
+        if self.affinity_mgr and sender_id:
+            self.affinity_mgr.interact(sender_id, 2.0)
+        task = GenerationTask(conv_id, "")
+        self.active_tasks[conv_id] = task
+        event.stop_event()
+        self.logger.info(f"ChatCore poke | {conv_id} | {sender_name}")
+        asyncio.create_task(
+            self._run_conversation(task, event, conv_id, poke_text, []),
+        )
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
     async def on_recall_notice(self, event: AstrMessageEvent) -> None:
         """Cancel an in-flight reply when its triggering message is recalled.
 
@@ -957,8 +1011,9 @@ class Main(Star):
         )
         if style:
             rules += (
-                "\n\n【表达风格参考】以下是从本群聊天中学到的表达风格与黑话，"
-                "请自然地融入你的回复（不要生硬套用，不要引用本段原文）:"
+                "\n\n【表达风格参考】以下是从本群聊天里学到的真实说话风格，"
+                "说话时模仿它的句式和长度（短句、口语、像群里的人），"
+                "但不要复述本段原文，也不要说'参考'、'风格'这类词:"
                 f"\n{style}"
             )
         if self.emotion_mgr:
