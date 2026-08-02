@@ -57,6 +57,7 @@ class StreamSegmenter:
         self._delim_pos = 0
         self._line_start = 0
         self._line_has_escape = False
+        self._prev_char = ""
 
     def _emit(self) -> str | None:
         text = "".join(self._chars).strip()
@@ -114,11 +115,15 @@ class StreamSegmenter:
     def feed(self, text: str) -> list[str]:
         """Feed a chunk of streamed text.
 
+        A blank line (two consecutive newlines) is treated as a segment
+        boundary, matching how humans separate chat messages; the explicit
+        delimiter line (``---``) works the same.
+
         Args:
             text: The chunk of text.
 
         Returns:
-            Completed segments split out by the delimiter.
+            Completed segments split out by the boundary rules.
         """
         segments: list[str] = []
         for ch in text:
@@ -127,13 +132,22 @@ class StreamSegmenter:
                 self._line_has_escape = True
                 self._escaped = False
                 self._delim_pos = 0
+                self._prev_char = ch
                 continue
             if self.escape_char and ch == self.escape_char:
                 self._escaped = True
                 continue
+            if ch == "\n" and self._prev_char == "\n":
+                # 空行 = 分段（第二个换行不进入缓冲）。
+                seg = self._emit()
+                if seg:
+                    segments.append(seg)
+                self._prev_char = ch
+                continue
             self._chars.append(ch)
             seg = self._try_exact(ch) or self._try_standalone_line(ch)
             if seg:
+                self._prev_char = ch
                 segments.append(seg)
                 continue
             if ch == "\n":
@@ -143,6 +157,7 @@ class StreamSegmenter:
                 seg = self._emit()
                 if seg:
                     segments.append(seg)
+            self._prev_char = ch
         return segments
 
     def has_boundary(self) -> bool:
