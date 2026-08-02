@@ -77,6 +77,14 @@ class AttentionManager:
         followup_boost: float = 0.05,
         followup_window_seconds: float = 180.0,
         poke_decay_seconds: float = 300.0,
+        poke_first_boost: float = 0.5,
+        poke_step_boost: float = 0.2,
+        poke_dense_window: float = 15.0,
+        poke_sparse_window: float = 120.0,
+        poke_sparse_factor: float = 0.5,
+        poke_weak_factor: float = 0.15,
+        poke_force_count: int = 3,
+        poke_force_window: float = 30.0,
     ) -> None:
         self.bubble_base = max(0.0, min(bubble_base, 1.0))
         self.active_cap = max(self.bubble_base, min(active_cap, 1.0))
@@ -92,6 +100,14 @@ class AttentionManager:
         self.followup_boost = max(0.0, followup_boost)
         self.followup_window_seconds = max(1.0, followup_window_seconds)
         self.poke_decay_seconds = max(1.0, poke_decay_seconds)
+        self.poke_first_boost = max(0.0, min(poke_first_boost, 1.0))
+        self.poke_step_boost = max(0.0, min(poke_step_boost, 1.0))
+        self.poke_dense_window = max(1.0, poke_dense_window)
+        self.poke_sparse_window = max(self.poke_dense_window, poke_sparse_window)
+        self.poke_sparse_factor = max(0.0, min(poke_sparse_factor, 1.0))
+        self.poke_weak_factor = max(0.0, min(poke_weak_factor, 1.0))
+        self.poke_force_count = max(2, int(poke_force_count))
+        self.poke_force_window = max(1.0, poke_force_window)
         self._states: dict[str, dict] = {}
 
     def _get_state(self, group_id: str) -> dict:
@@ -287,20 +303,23 @@ class AttentionManager:
         now = time.time()
         last = state.get("last_poke_ts", 0.0)
         if last <= 0:
-            boost = 0.5
+            boost = self.poke_first_boost
         else:
             gap = now - last
-            if gap <= 15:
+            if gap <= self.poke_dense_window:
                 factor = 1.0
-            elif gap <= 120:
-                factor = 0.5
+            elif gap <= self.poke_sparse_window:
+                factor = self.poke_sparse_factor
             else:
-                factor = 0.15
-            boost = state.get("poke_total", 0.0) + 0.2 * factor
+                factor = self.poke_weak_factor
+            boost = state.get("poke_total", 0.0) + self.poke_step_boost * factor
         state["poke_total"] = min(1.0, boost)
         state["last_poke_ts"] = now
         state["poke_count"] = state.get("poke_count", 0) + 1
-        if state["poke_count"] >= 3 and now - last <= 30:
+        if (
+            state["poke_count"] >= self.poke_force_count
+            and now - last <= self.poke_force_window
+        ):
             state["poke_total"] = 1.0
 
     def effective_poke_probability(self, group_id: str) -> float:

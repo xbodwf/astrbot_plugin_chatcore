@@ -202,6 +202,14 @@ class Main(Star):
             others_density_threshold=attn.get("others_density_threshold", 3),
             followup_boost=attn.get("followup_boost", 0.05),
             poke_decay_seconds=float(attn.get("poke_decay_seconds", 300)),
+            poke_first_boost=float(attn.get("poke_first_boost", 0.5)),
+            poke_step_boost=float(attn.get("poke_step_boost", 0.2)),
+            poke_dense_window=float(attn.get("poke_dense_window", 15)),
+            poke_sparse_window=float(attn.get("poke_sparse_window", 120)),
+            poke_sparse_factor=float(attn.get("poke_sparse_factor", 0.5)),
+            poke_weak_factor=float(attn.get("poke_weak_factor", 0.15)),
+            poke_force_count=int(attn.get("poke_force_count", 3)),
+            poke_force_window=float(attn.get("poke_force_window", 30)),
         )
         self.hard_trigger_force = attn.get("hard_trigger_force", True)
         self.wake_prefix = [str(w).lower() for w in attn.get("wake_prefix", [])]

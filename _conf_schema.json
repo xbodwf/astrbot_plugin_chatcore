@@ -150,7 +150,55 @@
         "description": "戳一戳概率衰减时间(秒)",
         "type": "int",
         "default": 300,
-        "hint": "被戳后 poke 触发概率自然衰减回聊天概率所需时长。概率机制：戳前=普通聊天概率；戳 1 次后升到 50%；再戳在当前基础上 +20%（按戳的间隔缩放，密集戳加得多）；连续 3 次密集戳必触发。poke 概率独立于聊天概率"
+        "hint": "poke 概率自然衰减回聊天概率所需时长"
+      },
+      "poke_first_boost": {
+        "description": "首次戳提升概率",
+        "type": "float",
+        "default": 0.5,
+        "hint": "第一次被戳后 poke 触发概率升到的值（0~1）"
+      },
+      "poke_step_boost": {
+        "description": "每次戳增量",
+        "type": "float",
+        "default": 0.2,
+        "hint": "后续每次戳在当前 poke 概率上增加的值（按间隔缩放）"
+      },
+      "poke_dense_window": {
+        "description": "密集戳窗口(秒)",
+        "type": "float",
+        "default": 15,
+        "hint": "两次戳间隔 <= 该值时按满额增量（factor=1.0）"
+      },
+      "poke_sparse_window": {
+        "description": "稀疏戳窗口(秒)",
+        "type": "float",
+        "default": 120,
+        "hint": "间隔在该窗口内按 poke_sparse_factor 缩放增量"
+      },
+      "poke_sparse_factor": {
+        "description": "稀疏戳增量系数",
+        "type": "float",
+        "default": 0.5,
+        "hint": "稀疏戳（非密集）时的增量缩放系数"
+      },
+      "poke_weak_factor": {
+        "description": "低频戳增量系数",
+        "type": "float",
+        "default": 0.15,
+        "hint": "间隔超过 poke_sparse_window 时的增量缩放系数"
+      },
+      "poke_force_count": {
+        "description": "必触发戳数",
+        "type": "int",
+        "default": 3,
+        "hint": "窗口内连续戳达到该次数则必触发"
+      },
+      "poke_force_window": {
+        "description": "必触发窗口(秒)",
+        "type": "float",
+        "default": 30,
+        "hint": "判定'连续戳'的间隔窗口"
       }
     }
   },
