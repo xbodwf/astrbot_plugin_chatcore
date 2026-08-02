@@ -581,12 +581,17 @@ class ContextManager:
             background.append(block)
         if memory_texts:
             background.append(
-                "以下是你回忆起的过往对话片段（可能来自其他对话或其他人，"
-                "不代表你本人执行过任何操作，不要当成你做过的事）:"
+                "以下是你回忆起的过往片段（可能来自其他群聊、私聊或很久以前，"
+                "不代表当前发生的事，也不代表你本人执行过任何操作）。它们只是"
+                "背景知识：除非用户明确问起，不要在当前对话中主动提起或当作"
+                "当前聊天的话题或依据:"
             )
             background.extend(f"- {escape_user_markers(text)}" for text in memory_texts)
         if profile_texts:
-            background.append("以下是你对该用户的了解（人物画像，可能随时间更新）:")
+            background.append(
+                "以下是你对该用户的了解（人物画像，可能随时间更新）。自然融入"
+                "即可，不要主动复述画像内容，也不要把它当作当前对话的依据:"
+            )
             background.extend(escape_user_markers(text) for text in profile_texts)
         if older:
             summary = self.get_summary(conv_id)
