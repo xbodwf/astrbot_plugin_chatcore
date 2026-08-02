@@ -329,5 +329,5 @@ MaiBot 风格的关系亲密度：每会话（conv_id，群/私聊天然隔离�
 - `2026-08-02` 调整：消息格式 metadata 化（借鉴 MaiBot）——recent 用户消息渲染为 `<message user="昵称(QQ)" msg_id=".." time="..">内容</message>`（元信息与正文分离）；压缩历史用紧凑 `[昵称]内容`（省 token、截断保留说话者）；AstrBot 持久化历史注入同用 `<message user="用户">` / `<message self="bot">`；背景块（记忆/画像/摘要/压缩历史/私聊历史）统一 `[参考消息]` 前缀，与实时对话明确分离，降低"串"。
 - `2026-08-02` 补充：XML 标签防注入——`escape_user_markers` 把用户内容里形如 `<字母...>` 的标签转义为全角 `＜...＞`（`>` 全转），防止插件/机器人产生的 `<refuse>` 等标签嵌套进 `<message>` 渲染或被模型当成系统指令。
 - `2026-08-02` 调整：空行分段——`StreamSegmenter` 把连续两个换行（空行）作为分段边界（与 `---` 分隔符等效），符合真人聊天用空行分段的习惯；prompt ① 改为「分段就在两段之间空一行」，模型不再依赖写 `---`。
-- `2026-08-02` 补充：兼容与诊断——每轮生成结束后触发 `OnLLMResponseEvent`（让 input_state 等插件停止"正在输入"循环）；`OnLLMRequestEvent`/`OnLLMResponseEvent` hook 调用加 5s 超时；`ChatCore timing` 日志输出每轮 ctx/首 token/首发送/总耗时；`chatcore` 指令别名 `cxc`/`ctc`。
+- `2026-08-02` 补充：兼容与诊断——每轮生成结束后触发 `OnLLMResponseEvent`（让 input_state 等插件停止"正在输入"循环）；`OnLLMRequestEvent`/`OnLLMResponseEvent` hook 调用加 5s 超时；`ChatCore timing` 日志输出每轮 ctx/首 token/首发送/总耗时；`chatcore` 指令别名 `c2c`（chat-to-core，对齐 llm2api 的数字缩写方式）/`ctc`。
 

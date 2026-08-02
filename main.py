@@ -1864,11 +1864,11 @@ class Main(Star):
         except Exception as e:
             self.logger.debug(f"Memory add failed: {e}")
 
-    @filter.command("chatcore", alias={"cxc", "ctc"})
+    @filter.command("chatcore", alias={"c2c", "ctc"})
     async def chatcore(self, event: AstrMessageEvent):
         """Show ChatCore runtime status / affinity / reset.
 
-        Aliases: ``cxc`` and ``ctc`` (e.g. ``cxc affinity``).
+        Aliases: ``c2c`` (chat-to-core) and ``ctc`` (e.g. ``c2c affinity``).
 
         Args:
             event: Current platform message event.
