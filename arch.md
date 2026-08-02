@@ -321,4 +321,5 @@ MaiBot 风格的关系亲密度：每会话（conv_id，群/私聊天然隔离�
 - `2026-08-02` 补充：好感度系统——`affinity.py` 每会话好感度（互动增减、按天惰性衰减、五档位注入 system prompt），JSON 持久化，WebUI 展示，配置 `affinity.*`（见 4.19）。
 - `2026-08-02` 调整：system prompt 规则精简——分段/标记/防伪/工具/图片说明由约 700 字压缩为约 250 字编号短句（自然语气「一些约定，记住即可」），降低工程指令密度，恢复人格主导的角色扮演味道。
 - `2026-08-02` 调整：好感度按用户存储——键从 conv_id 改为 sender_id（群/私聊共用同一份好感），`chatcore affinity` 指令（无指令组，在 `chatcore` handler 内手动匹配子命令）：查询自己；管理员可 `chatcore affinity <用户ID>` 查询指定用户；非管理员查询他人返回权限提示。
+- `2026-08-02` 补充：LLM 黑名单——`chat.llm_blacklist`（会话 UMO 列表，如 `Sylvia:GroupMessage:384128966`）中的会话完全禁用 LLM：消息照常记录但不回复（含硬触发），接管模式下 stop_event 阻止 vanilla 回复。
 

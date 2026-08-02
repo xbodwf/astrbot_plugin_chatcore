@@ -166,6 +166,11 @@ class Main(Star):
         chat_main_cfg = config.get("chat", {})
         self.markers_enabled = chat_main_cfg.get("markers_enabled", True)
         self.reminder = str(chat_main_cfg.get("reminder", "")).strip()
+        self.llm_blacklist = [
+            str(x).strip()
+            for x in chat_main_cfg.get("llm_blacklist", [])
+            if str(x).strip()
+        ]
         self.tools_enabled = chat_main_cfg.get("tools_enabled", True)
         self.max_tool_rounds = max(1, int(chat_main_cfg.get("max_tool_rounds", 3)))
         self._tool_set: ToolSet | None = None
@@ -392,25 +397,28 @@ class Main(Star):
         hard = self._is_hard_trigger(event, text)
 
         should_reply = False
-        if is_private:
-            should_reply = chat_cfg.get("private_force_reply", True)
-        elif chat_cfg.get("group_enabled", True):
-            self.attention.record_others_message(conv_id)
-            if hard:
-                self.attention.record_hard_trigger(conv_id)
-                should_reply = self.hard_trigger_force or self.attention.should_respond(
-                    conv_id
-                )
-            elif self._addresses_other_user(event):
-                # Directed at someone else; don't chime in on a soft trigger.
-                should_reply = False
-            else:
-                should_reply = self.attention.should_respond(conv_id)
-                if should_reply:
-                    self.attention.record_interaction(conv_id)
-                    self.attention.record_soft_hit(conv_id)
+        if conv_id not in self.llm_blacklist:
+            # 黑名单会话完全禁用 LLM：消息照常记录，但任何触发都不回复。
+            if is_private:
+                should_reply = chat_cfg.get("private_force_reply", True)
+            elif chat_cfg.get("group_enabled", True):
+                self.attention.record_others_message(conv_id)
+                if hard:
+                    self.attention.record_hard_trigger(conv_id)
+                    should_reply = (
+                        self.hard_trigger_force
+                        or self.attention.should_respond(conv_id)
+                    )
+                elif self._addresses_other_user(event):
+                    # Directed at someone else; don't chime in on a soft trigger.
+                    should_reply = False
                 else:
-                    self.attention.record_soft_miss(conv_id)
+                    should_reply = self.attention.should_respond(conv_id)
+                    if should_reply:
+                        self.attention.record_interaction(conv_id)
+                        self.attention.record_soft_hit(conv_id)
+                    else:
+                        self.attention.record_soft_miss(conv_id)
 
         if self.memory:
             asyncio.create_task(

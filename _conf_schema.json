@@ -49,6 +49,13 @@
         "type": "int",
         "default": 3,
         "hint": "防止工具调用死循环，达到轮数后强制输出文本回复"
+      },
+      "llm_blacklist": {
+        "description": "LLM 黑名单",
+        "type": "list",
+        "item_type": "text",
+        "default": [],
+        "hint": "填会话 UMO（如 Sylvia:GroupMessage:384128966 或 平台:私聊类型:QQ号）后，这些会话完全禁用 LLM：消息照常记录但不回复。可在 AstrBot 日志 ChatCore recv 行看到 conv_id（即 UMO）"
       }
     }
   },
