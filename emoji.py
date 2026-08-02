@@ -141,8 +141,9 @@ class EmojiStore:
         Returns:
             The new emoji id, or None on any failure.
         """
-        import aiohttp
         from urllib.parse import urlparse
+
+        import aiohttp
 
         try:
             async with aiohttp.ClientSession() as session:
