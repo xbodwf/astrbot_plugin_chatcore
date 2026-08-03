@@ -259,7 +259,7 @@ class ExpressionStore:
             lines.append("群内黑话表（带推断含义）:")
             lines.extend(
                 f"- {j['term']}（推断: {j.get('guessedMeaning', j.get('meaning', ''))}）"
-                f"，例: {j['example']}，来源: {j['source']}"
+                f"，例: {j.get('example', '无')}，来源: {j.get('source', '旧记录无来源')}"
                 for j in style["jargon"][:max_jargon]
             )
         if not lines:
