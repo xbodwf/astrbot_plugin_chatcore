@@ -96,6 +96,18 @@ class ChatCoreWebUI:
                 ["POST"],
                 "ChatCore delete expression style",
             ),
+            (
+                f"{_PREFIX}/expressions/add",
+                self.add_expression,
+                ["POST"],
+                "ChatCore add expression entry",
+            ),
+            (
+                f"{_PREFIX}/expressions/update",
+                self.update_expression,
+                ["POST"],
+                "ChatCore update expression entry",
+            ),
         ]
         for route, handler, methods, desc in routes:
             register(route, handler, methods, desc)
@@ -357,3 +369,38 @@ class ChatCoreWebUI:
         if not store.delete(str(group_id)):
             return error_response("style not found", status_code=404)
         return json_response({"deleted": group_id})
+
+    async def add_expression(self) -> dict:
+        """Add a manually curated pattern or jargon entry."""
+        payload = await request.json(default={})
+        store = self.plugin.expression_store
+        group_id = str(payload.get("group_id", "")).strip()
+        if not store or not group_id:
+            return error_response("group_id is required")
+        if not store.add_entry(
+            group_id,
+            pattern=str(payload.get("pattern", "")),
+            term=str(payload.get("term", "")),
+            guessed_meaning=str(payload.get("guessedMeaning", "")),
+            example=str(payload.get("example", "")),
+            source=str(payload.get("source", "manual")),
+        ):
+            return error_response("pattern or complete jargon fields are required")
+        return json_response({"added": group_id})
+
+    async def update_expression(self) -> dict:
+        """Update or disable one manually learned jargon entry."""
+        payload = await request.json(default={})
+        store = self.plugin.expression_store
+        group_id = str(payload.get("group_id", "")).strip()
+        term = str(payload.get("term", "")).strip()
+        if not store or not group_id or not term:
+            return error_response("group_id and term are required")
+        updates = {
+            key: payload[key]
+            for key in ("guessedMeaning", "example", "source", "enabled")
+            if key in payload
+        }
+        if not store.update_jargon(group_id, term, **updates):
+            return error_response("expression entry not found", status_code=404)
+        return json_response({"updated": term})

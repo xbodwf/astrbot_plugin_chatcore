@@ -41,6 +41,7 @@ const {
   TableRow,
   Tabs,
   Tab,
+  Tooltip,
   TextField,
   Typography,
   createTheme,
@@ -344,7 +345,7 @@ function ProfilesPanel() {
                 h(Typography, { variant: "caption", color: "text.secondary" }, profile.person_id),
                 h(Divider, { sx: { my: 1 } }),
                 (profile.facts || []).map((fact, idx) =>
-                  h(Typography, { key: idx, variant: "body2", sx: { my: 0.25 } }, `· ${fact}`),
+                  h(Typography, { key: idx, variant: "body2", sx: { my: 0.25 } }, `· ${fact.fact || fact}${fact.evidence ? `（依据: ${fact.evidence}）` : ""}`),
                 ),
               ),
             ),
@@ -670,7 +671,27 @@ function EmojisPanel() {
 function ExpressionsPanel() {
   const { data, error, loading, reload } = useLoad(() => bridge.apiGet("expressions"));
   const [busy, setBusy] = React.useState(false);
+  const [form, setForm] = React.useState({ groupId: "", pattern: "", term: "", meaning: "", example: "", source: "" });
   const expressions = data?.expressions || [];
+
+  const addEntry = async () => {
+    if (!form.groupId || (!form.pattern && (!form.term || !form.meaning || !form.example))) return;
+    setBusy(true);
+    try {
+      await bridge.apiPost("expressions/add", {
+        group_id: form.groupId,
+        pattern: form.pattern,
+        term: form.term,
+        guessedMeaning: form.meaning,
+        example: form.example,
+        source: form.source || "manual",
+      });
+      setForm({ ...form, pattern: "", term: "", meaning: "", example: "", source: "" });
+      await reload();
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const doDelete = async (groupId) => {
     setBusy(true);
@@ -687,6 +708,18 @@ function ExpressionsPanel() {
     Box,
     null,
     h(ErrorBanner, { error }),
+    h(
+      Paper,
+      { variant: "outlined", sx: { p: 1.5, mb: 1.5 } },
+      h(Typography, { variant: "subtitle2" }, "手动添加表达风格"),
+      h(TextField, { size: "small", label: "群组 ID", value: form.groupId, onChange: (e) => setForm({ ...form, groupId: e.target.value }), sx: { mt: 1, mr: 1 } }),
+      h(TextField, { size: "small", label: "句式（可选）", value: form.pattern, onChange: (e) => setForm({ ...form, pattern: e.target.value }), sx: { mt: 1, mr: 1 } }),
+      h(TextField, { size: "small", label: "黑话", value: form.term, onChange: (e) => setForm({ ...form, term: e.target.value }), sx: { mt: 1, mr: 1 } }),
+      h(TextField, { size: "small", label: "guessedMeaning", value: form.meaning, onChange: (e) => setForm({ ...form, meaning: e.target.value }), sx: { mt: 1, mr: 1 } }),
+      h(TextField, { size: "small", label: "example", value: form.example, onChange: (e) => setForm({ ...form, example: e.target.value }), sx: { mt: 1, mr: 1 } }),
+      h(TextField, { size: "small", label: "source", value: form.source, onChange: (e) => setForm({ ...form, source: e.target.value }), sx: { mt: 1, mr: 1 } }),
+      h(Button, { variant: "contained", onClick: addEntry, disabled: busy, sx: { mt: 1 } }, "添加"),
+    ),
     expressions.length === 0
       ? h(Typography, { variant: "body2", color: "text.secondary" }, "暂无表达风格")
       : h(
@@ -716,15 +749,24 @@ function ExpressionsPanel() {
                 h(
                   Stack,
                   { direction: "row", spacing: 0.5, mt: 0.75, flexWrap: "wrap" },
-                  style.jargon.map((item) =>
-                    h(Chip, {
-                      key: item.term,
-                      label: item.term,
-                      size: "small",
-                      variant: "outlined",
-                      title: `${item.meaning || ""}${item.example ? `（例: ${item.example}）` : ""}`,
-                    }),
+                   style.jargon.map((item) =>
+                    h(
+                      Tooltip,
+                      { key: item.term, title: `${item.guessedMeaning || item.meaning || ""}｜例: ${item.example || "无"}｜来源: ${item.source || "旧记录无来源"}` },
+                      h(Chip, {
+                        label: item.term,
+                        size: "small",
+                        variant: "outlined",
+                      }),
+                    ),
                   ),
+              (style.jargon || []).map((item, idx) =>
+                h(
+                  Typography,
+                  { key: `source-${idx}`, variant: "caption", color: "text.secondary", sx: { display: "block", mt: 0.25 } },
+                  `${item.term}: ${item.guessedMeaning || item.meaning || ""}｜例: ${item.example || "无"}｜来源: ${item.source || "旧记录无来源"}`,
+                ),
+              ),
                 ),
               (style.samples || []).slice(0, 3).map((sample, idx) =>
                 h(Typography, { key: idx, variant: "body2", color: "text.secondary", sx: { mt: 0.5 } }, sample),

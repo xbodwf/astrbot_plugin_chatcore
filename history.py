@@ -157,9 +157,10 @@ def render_history_block(
     recent = messages[-max_messages:]
     lines = [
         (
-            f'<message user="用户">{escape_user_markers(clean_placeholder_text(m["content"]))}</message>'
+            f'<message uid="unknown" nickname="用户">{escape_user_markers(clean_placeholder_text(m["content"]))}</message>'
             if m["role"] == "user"
-            else f'<message self="bot">{escape_user_markers(clean_placeholder_text(m["content"]))}</message>'
+            else '<!-- <message from="yourself"/> 表明这条消息由你发送。 -->\n'
+            f'<message from="yourself">{escape_user_markers(clean_placeholder_text(m["content"]))}</message>'
         )
         for m in recent
     ]

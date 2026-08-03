@@ -97,6 +97,10 @@
 | `reply_decision.timeout_seconds` | `8` | 延迟判断最长等待时间，不阻塞首段发送 |
 | `embedding.provider_id` | 空 | Embedding 提供商 ID，用于全局记忆向量检索 |
 
+上下文中的当前聊天和压缩历史统一使用用户 `<message uid="..." nickname="...">...</message>`；机器人使用
+`<message from="yourself">...</message>`，并有 XML 注释标识自身消息。记忆、画像和外部历史位于 `<reference>` 块中。工具采用按需 schema：系统提示
+只注入极短工具目录，需要时输出 `[[tools]]`，下一轮才发送完整 schema。
+
 ### memory — 全局记忆与自我学习
 
 | 配置项 | 默认值 | 说明 |

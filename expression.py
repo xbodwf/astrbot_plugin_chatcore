@@ -21,7 +21,7 @@ _ANALYZE_PROMPT = (
     "{\n"
     '  "summary": "一句话概括该群表达风格（如：短句流、爱用表情、阴阳怪气等）",\n'
     '  "patterns": ["常见句式或语气词，带一个例句，如：笑死，这操作真的6"],\n'
-    '  "jargon": [{"term": "群内黑话/梗词", "meaning": "推断的含义", "example": "使用例句"}]\n'
+    '  "jargon": [{"term": "群内黑话/梗词", "guessedMeaning": "有证据支持的推断含义", "example": "原始使用例句", "source": "发言者/消息片段"}]\n'
     "}\n"
     "只输出 JSON，不要其他内容。\n"
     "发言记录:\n{sample}"
@@ -67,13 +67,20 @@ def _parse_analysis(raw: str) -> dict:
         if not isinstance(item, dict):
             continue
         term = str(item.get("term", "")).strip()
-        meaning = str(item.get("meaning", "")).strip()
-        if term:
+        meaning = str(item.get("guessedMeaning", item.get("meaning", ""))).strip()
+        example = str(item.get("example", "")).strip()
+        source = str(item.get("source", "")).strip()
+        if term and meaning:
+            if not source:
+                jargon.append({"term": term, "meaning": meaning, "example": example})
+                continue
             jargon.append(
                 {
                     "term": term,
+                    "guessedMeaning": meaning,
                     "meaning": meaning,
-                    "example": str(item.get("example", "")).strip(),
+                    "example": example,
+                    "source": source,
                 }
             )
     return {
@@ -139,6 +146,8 @@ class ExpressionStore:
                 if p not in merged["patterns"]:
                     merged["patterns"].append(p)
             for j in style.get("jargon", []):
+                if not j.get("enabled", True):
+                    continue
                 if not any(x.get("term") == j.get("term") for x in merged["jargon"]):
                     merged["jargon"].append(j)
         return merged
@@ -177,6 +186,11 @@ class ExpressionStore:
         except Exception:
             return False
         parsed = _parse_analysis(raw)
+        parsed["jargon"] = [
+            item
+            for item in parsed["jargon"]
+            if item.get("source") and item.get("example")
+        ]
         if not parsed["summary"] and not parsed["patterns"] and not parsed["jargon"]:
             return False
         style = self._styles.setdefault(
@@ -191,6 +205,8 @@ class ExpressionStore:
         existing = {j.get("term") for j in style["jargon"]}
         for j in parsed["jargon"]:
             if j["term"] not in existing:
+                j.setdefault("enabled", True)
+                j.setdefault("origin", "learned")
                 style["jargon"].append(j)
                 existing.add(j["term"])
         style["patterns"] = style["patterns"][-_MAX_PATTERNS:]
@@ -203,6 +219,9 @@ class ExpressionStore:
         self,
         group_id: str,
         shared_groups: list[str] | None = None,
+        query: str = "",
+        max_patterns: int = _RENDER_MAX_PATTERNS,
+        max_jargon: int = _RENDER_MAX_JARGON,
     ) -> str | None:
         """Render a group's learned style as a prompt block.
 
@@ -214,19 +233,34 @@ class ExpressionStore:
             The rendered style text, or None when nothing was learned.
         """
         style = self.get_style(group_id, shared_groups)
+        terms = set((query or "").lower().split())
+        if terms:
+            style["patterns"] = [
+                item
+                for item in style["patterns"]
+                if any(term in item.lower() for term in terms)
+            ] or style["patterns"][:1]
+            style["jargon"] = [
+                item
+                for item in style["jargon"]
+                if any(
+                    term in (item.get("term", "") + item.get("example", "")).lower()
+                    for term in terms
+                )
+            ] or style["jargon"][:1]
         lines: list[str] = []
         if style["summary"]:
             lines.append(f"该群整体表达风格: {style['summary']}")
         # 按需注入：只给少量代表性内容，避免风格堆砌。
         if style["patterns"]:
             lines.append("可参考的常见表达:")
-            lines.extend(f"- {p}" for p in style["patterns"][:_RENDER_MAX_PATTERNS])
+            lines.extend(f"- {p}" for p in style["patterns"][:max_patterns])
         if style["jargon"]:
             lines.append("群内黑话表（带推断含义）:")
             lines.extend(
-                f"- {j['term']}（{j['meaning']}）"
-                + (f"，例: {j['example']}" if j.get("example") else "")
-                for j in style["jargon"][:_RENDER_MAX_JARGON]
+                f"- {j['term']}（推断: {j.get('guessedMeaning', j.get('meaning', ''))}）"
+                f"，例: {j['example']}，来源: {j['source']}"
+                for j in style["jargon"][:max_jargon]
             )
         if not lines:
             return None
@@ -242,6 +276,60 @@ class ExpressionStore:
             List of style dicts (with their group id attached).
         """
         return [{"group_id": gid, **style} for gid, style in self._styles.items()]
+
+    def add_entry(
+        self,
+        group_id: str,
+        *,
+        pattern: str = "",
+        term: str = "",
+        guessed_meaning: str = "",
+        example: str = "",
+        source: str = "manual",
+    ) -> bool:
+        """Add a manually curated expression entry."""
+        pattern = pattern.strip()
+        term = term.strip()
+        if not group_id or (not pattern and not (term and guessed_meaning and example)):
+            return False
+        style = self._styles.setdefault(
+            group_id,
+            {"summary": "", "patterns": [], "jargon": [], "updated_at": 0.0},
+        )
+        if pattern and pattern not in style["patterns"]:
+            style["patterns"].append(pattern)
+        if term and not any(item.get("term") == term for item in style["jargon"]):
+            meaning = guessed_meaning.strip()
+            style["jargon"].append(
+                {
+                    "term": term,
+                    "guessedMeaning": meaning,
+                    "meaning": meaning,
+                    "example": example.strip(),
+                    "source": source.strip() or "manual",
+                    "enabled": True,
+                    "origin": "manual",
+                }
+            )
+        style["updated_at"] = time.time()
+        self._save()
+        return True
+
+    def update_jargon(self, group_id: str, term: str, **updates: Any) -> bool:
+        """Update one jargon entry, including its enabled state."""
+        style = self._styles.get(group_id)
+        if not style:
+            return False
+        for item in style.get("jargon", []):
+            if item.get("term") != term:
+                continue
+            for key in ("guessedMeaning", "example", "source", "enabled"):
+                if key in updates:
+                    item[key] = updates[key]
+            item["meaning"] = item.get("guessedMeaning", item.get("meaning", ""))
+            self._save()
+            return True
+        return False
 
     def delete(self, group_id: str) -> bool:
         """Delete a group's learned style.

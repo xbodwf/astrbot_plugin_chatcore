@@ -112,7 +112,7 @@
       "no_action_backoff": {
         "description": "落空退避系数",
         "type": "float",
-        "default": 0.6,
+        "default": 1.0,
         "hint": "连续软触发落空（没轮到说话）时，每落空一次把概率乘以该系数"
       },
       "backoff_floor": {
@@ -405,6 +405,18 @@
         "description": "每次请求最多召回的记忆片段数",
         "type": "int",
         "default": 5
+      },
+      "max_entries": {
+        "description": "记忆库存上限",
+        "type": "int",
+        "default": 10000,
+        "hint": "最多保存多少条向量记忆，超出后淘汰最早记录"
+      },
+      "min_score": {
+        "description": "记忆召回最低相似度",
+        "type": "float",
+        "default": 0.4,
+        "hint": "越高越严格，避免无关记忆进入上下文"
       }
     }
   },
@@ -496,12 +508,30 @@
         "default": 800,
         "hint": "注入系统提示的表达风格文本最大字符数"
       },
+      "render_max_patterns": {
+        "description": "每次注入句式数量",
+        "type": "int",
+        "default": 2,
+        "hint": "只注入少量与当前聊天相关的句式，避免占用上下文"
+      },
+      "render_max_jargon": {
+        "description": "每次注入黑话数量",
+        "type": "int",
+        "default": 3,
+        "hint": "只注入少量与当前聊天相关的黑话"
+      },
       "shared_groups": {
         "description": "表达互通群列表",
         "type": "list",
         "item_type": "text",
         "default": [],
         "hint": "这些群的表达风格会互相借鉴（只有风格受影响，记忆不受影响）。填 unified_msg_origin"
+      },
+      "require_evidence": {
+        "description": "黑话必须有来源证据",
+        "type": "bool",
+        "default": true,
+        "hint": "学习到的黑话必须同时有 guessedMeaning、example、source 才入库"
       }
     }
   },
@@ -530,8 +560,8 @@
       "collect_probability": {
         "description": "收集概率",
         "type": "float",
-        "default": 0.6,
-        "hint": "带图消息入库表情包库的概率（0~1）。入库后由视觉模型分类并生成唯一 id，AI 可用 [[emoji:id]] 发送"
+        "default": 1.0,
+        "hint": "兼容旧配置；当前默认收集所有图片，是否使用由 AI 根据来源语境决定"
       }
     }
   },

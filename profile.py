@@ -20,8 +20,9 @@ _EXTRACT_PROMPT = (
     "的稳定、有价值的人物事实，例如身份、职业、称呼偏好、喜好、习惯、性格特点、"
     "与其他人/群的关系等。忽略一次性的话题内容（如某件事的讨论、临时求助）。"
     "没有有价值信息就输出空数组。\n"
-    '只输出 JSON 字符串数组，例如 ["小明是大学生", "喜欢喝奶茶"].\n'
-    "发言记录:\n{text}"
+    '只输出 JSON 对象数组，例如 [{{"fact":"喜欢喝奶茶","evidence":"我每天都喝奶茶","confidence":0.9,"action":"add"}}].\n'
+    "已有画像（只能基于证据修订，不要盲目保留）:\n{existing}\n"
+    "本次发言记录:\n{text}"
 )
 
 _MAX_FACTS = 30
@@ -52,6 +53,46 @@ def _parse_fact_list(raw: str) -> list[str]:
         for item in parsed
         if isinstance(item, str) and str(item).strip()
     ]
+
+
+def _parse_fact_items(raw: str) -> list[dict]:
+    """Parse evidence-backed profile updates from model output."""
+    text = raw.strip()
+    match = re.search(r"\[.*\]", text, flags=re.DOTALL)
+    if match:
+        text = match.group(0)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    result = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        fact = str(item.get("fact", "")).strip()
+        evidence = str(item.get("evidence", "")).strip()
+        action = str(item.get("action", "add")).strip().lower()
+        try:
+            confidence = float(item.get("confidence", 0))
+        except (TypeError, ValueError):
+            confidence = 0
+        if (
+            fact
+            and evidence
+            and confidence >= 0.75
+            and action in {"add", "replace", "remove"}
+        ):
+            result.append(
+                {
+                    "fact": fact,
+                    "evidence": evidence,
+                    "confidence": confidence,
+                    "action": action,
+                }
+            )
+    return result
 
 
 class ProfileStore:
@@ -128,7 +169,7 @@ class ProfileStore:
         self,
         person_id: str,
         nickname: str,
-        facts: list[str],
+        facts: list[str | dict],
     ) -> None:
         """Merge new facts into a person's profile.
 
@@ -153,14 +194,35 @@ class ProfileStore:
         profile["nickname"] = nickname or profile.get("nickname", "")
         existing = profile.get("facts", []) or []
         added = []
-        for fact in facts:
+        for item in facts:
+            fact = item.get("fact", "") if isinstance(item, dict) else str(item)
+            if not fact:
+                continue
+            if isinstance(item, dict) and item.get("action") == "remove":
+                existing = [
+                    old
+                    for old in existing
+                    if (old.get("fact", "") if isinstance(old, dict) else old) != fact
+                ]
+                continue
+            if isinstance(item, dict) and item.get("action") == "replace":
+                existing = [
+                    old
+                    for old in existing
+                    if (old.get("fact", "") if isinstance(old, dict) else old) != fact
+                ]
             # 近似去重: LLM 措辞变体（"小明是大学生" vs "小明在读大学"）不重复累积
             if any(
-                difflib.SequenceMatcher(None, fact, old).ratio() > 0.65
+                difflib.SequenceMatcher(
+                    None,
+                    fact,
+                    old.get("fact", "") if isinstance(old, dict) else old,
+                ).ratio()
+                > 0.65
                 for old in existing + added
             ):
                 continue
-            added.append(fact)
+            added.append(item if isinstance(item, dict) else fact)
         if added:
             profile["facts"] = (existing + added)[-_MAX_FACTS:]
             profile["updated_at"] = now
@@ -183,7 +245,10 @@ class ProfileStore:
             return None
         nickname = profile.get("nickname", "") or person_id
         parts = [f"该用户昵称: {nickname}"]
-        parts.extend(f"- {fact}" for fact in facts)
+        for item in facts:
+            fact = item.get("fact", "") if isinstance(item, dict) else str(item)
+            evidence = item.get("evidence", "") if isinstance(item, dict) else ""
+            parts.append(f"- {fact}" + (f"（依据: {evidence}）" if evidence else ""))
         text = "\n".join(parts)
         if len(text) > self.max_chars:
             text = text[: self.max_chars] + "..."
@@ -194,7 +259,8 @@ class ProfileStore:
         client: Any,
         name: str,
         text: str,
-    ) -> list[str]:
+        existing_facts: list[str] | None = None,
+    ) -> list[dict] | list[str]:
         """Extract stable facts about a speaker from one message.
 
         Args:
@@ -208,7 +274,15 @@ class ProfileStore:
         message = text.strip()
         if not message:
             return []
-        prompt = _EXTRACT_PROMPT.format(name=name, text=message[:1500])
+        prompt = _EXTRACT_PROMPT.format(
+            name=name,
+            existing="\n".join(
+                f"- {item.get('fact', '') if isinstance(item, dict) else item}"
+                for item in (existing_facts or [])[-30:]
+            )
+            or "（无）",
+            text=message[:1500],
+        )
         try:
             raw = await client.chat(
                 [
@@ -219,7 +293,7 @@ class ProfileStore:
             )
         except Exception:
             return []
-        return _parse_fact_list(raw)
+        return _parse_fact_items(raw)
 
     def count(self) -> int:
         """Number of profiles.

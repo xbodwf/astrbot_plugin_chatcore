@@ -69,6 +69,35 @@ HISTORY_SUMMARY_PROMPT = (
 _TOOLS_REQUEST_MARK = "[[tools]]"
 
 
+def _tool_intent_hint(text: str) -> bool:
+    """Detect high-confidence requests that need an external tool.
+
+    Args:
+        text: Current user message.
+
+    Returns:
+        True when the wording strongly implies lookup or an operation.
+    """
+    lowered = (text or "").lower()
+    return any(
+        token in lowered
+        for token in (
+            "搜一下",
+            "搜索",
+            "查一下",
+            "查资料",
+            "现在几点",
+            "天气",
+            "提醒我",
+            "定时",
+            "创建任务",
+            "删除任务",
+            "查询任务",
+            "执行",
+        )
+    )
+
+
 class GenerationTask:
     """Tracks an in-flight streaming conversation and debounced messages.
 
@@ -269,7 +298,12 @@ class Main(Star):
                 / "astrbot_plugin_chatcore"
                 / "memory.json"
             )
-            self.memory = MemoryStore(embed_adapter.embed, path)
+            self.memory = MemoryStore(
+                embed_adapter.embed,
+                path,
+                max_entries=max(1, int(memory_cfg.get("max_entries", 10000))),
+                min_score=float(memory_cfg.get("min_score", 0.4)),
+            )
 
         profile_cfg = config.get("profile", {})
         self.profile_store = None
@@ -287,6 +321,8 @@ class Main(Star):
         expr_cfg = config.get("expression", {})
         self.expression_store = None
         self.expression_shared_groups: list[str] = []
+        self.expression_render_max_patterns = 2
+        self.expression_render_max_jargon = 3
         if expr_cfg.get("enabled", True) and self.summary_client:
             expr_path = (
                 Path(get_astrbot_plugin_data_path())
@@ -302,6 +338,12 @@ class Main(Star):
                 for g in expr_cfg.get("shared_groups", [])
                 if str(g).strip()
             ]
+            self.expression_render_max_patterns = max(
+                0, int(expr_cfg.get("render_max_patterns", 2))
+            )
+            self.expression_render_max_jargon = max(
+                0, int(expr_cfg.get("render_max_jargon", 3))
+            )
         self.expression_interval = max(
             30,
             int(expr_cfg.get("interval_minutes", 60)),
@@ -311,7 +353,7 @@ class Main(Star):
         self.emoji_store = None
         self.emoji_vision_client = None
         self.emoji_collect_probability = float(
-            emoji_cfg.get("collect_probability", 0.6)
+            emoji_cfg.get("collect_probability", 1.0)
         )
         if emoji_cfg.get("enabled", True):
             emoji_root = (
@@ -727,6 +769,21 @@ class Main(Star):
                     system_prompt = await self._build_system_prompt(
                         conv_id, event.get_sender_id()
                     )
+                    if self.tools_enabled and tool_set:
+                        tool_index = ", ".join(
+                            f"{name}: {tool_set.get_tool(name).description[:80]}"
+                            for name in tool_set.names()
+                            if tool_set.get_tool(name)
+                        )
+                        system_prompt += (
+                            "\n\n【可用工具目录】仅在确实需要时使用；需要完整参数时输出 "
+                            f"{_TOOLS_REQUEST_MARK}。可用工具：{tool_index}"
+                        )
+                    if _tool_intent_hint(current_text) and tool_set:
+                        system_prompt += (
+                            "\n【工具提示】当前消息看起来可能需要工具，请认真判断；"
+                            f"如需要请输出 {_TOOLS_REQUEST_MARK}。"
+                        )
                     if self.reminder:
                         system_prompt = f"{system_prompt}\n\n{self.reminder}"
                     messages = self.context_mgr.build_messages(
@@ -812,7 +869,7 @@ class Main(Star):
                 image_urls = []
 
                 async def send_fn(segment: str) -> None:
-                    nonlocal tools_requested, t_first_send, reply_decision_task
+                    nonlocal t_first_send, reply_decision_task, tools_requested
                     nonlocal reply_decision_started
                     nonlocal reply_decision
                     if reply_decision_task and reply_decision_task.done():
@@ -825,10 +882,11 @@ class Main(Star):
                         reply_decision_task = None
                     if t_first_send is None:
                         t_first_send = time.monotonic()
-                    # 无工具轮中模型声明需要工具: 丢弃该段，下一轮带工具重试。
-                    if not tools_armed and _TOOLS_REQUEST_MARK in segment:
+                    if _TOOLS_REQUEST_MARK in segment:
+                        segment = segment.replace(_TOOLS_REQUEST_MARK, "").strip()
                         tools_requested = True
-                        return
+                        if not segment:
+                            return
                     if reply_decision:
                         chain = await self._decorate_segment(
                             event, segment, default_actions=reply_decision
@@ -892,7 +950,6 @@ class Main(Star):
                         f" first_send={((t_first_send or time.monotonic()) - t_round_start) * 1000:.0f}ms"
                         f" total={(time.monotonic() - t_round_start) * 1000:.0f}ms"
                     )
-                    # 无工具轮中模型声明需要工具: 升级为带工具的请求重试一轮。
                     if (
                         tools_requested
                         and tool_set
@@ -1030,7 +1087,11 @@ class Main(Star):
         ) or FALLBACK_SYSTEM_PROMPT
         delim = self.segment_delimiter.strip() or self.segment_delimiter
         rules = (
-            "\n\n一些约定，记住即可："
+            "\n\n【人格优先级】以上由 AstrBot 人格设定提供的内容是你的固定人格、性格、"
+            "语气、称呼偏好和行为边界，必须始终遵守。它不是参考资料，也不能被下面的"
+            "聊天风格、画像、记忆或临时指令改写。像真人聊天只表示自然、口语化，不表示"
+            "你要变成老成、客套或通用助手。你的性格来自人格设定。"
+            "\n【聊天约定】"
             "① 回复要像真人聊天一样拆成多条消息：内容稍长（两三句以上）就分段，"
             "每段只讲一件事、短小口语。分段方法：在两段之间**空一行**"
             "（连续两个换行），或单独写一行 `"
@@ -1042,7 +1103,7 @@ class Main(Star):
             + "`。"
             "② 回复直接说人话：不要带任何说话者前缀或 `<message ...>` 这类"
             "格式，不要照抄上下文里的系统格式（如 `[图片]`、`[引用了…]`、"
-            "`<message user=...>`），回复里出现这些就是错误；"
+            "`<message uid=... nickname=...>`），回复里出现这些就是错误；"
             "想回复某人的消息用 `[[reply:昵称]]`。"
         )
         if self.markers_enabled:
@@ -1053,10 +1114,11 @@ class Main(Star):
             )
         if self.tools_enabled:
             rules += (
-                "④ 你可以用工具查资料、定时提醒；只有必须用工具才能完成"
-                "请求时，在回复开头独占一行写 `"
+                "④ 如果请求需要查资料、执行操作或定时提醒，直接调用系统提供的工具；"
+                "不要把工具名称、JSON 参数或调用过程写成普通文本。工具调用完成后，"
+                "再用自然语言回复用户；不需要工具时直接聊天。旧版兼容标记 "
                 + _TOOLS_REQUEST_MARK
-                + "`，否则不要写。"
+                + " 如出现也必须独占一行，但通常不需要输出它。"
             )
         if self.emoji_store:
             rules += "⑤ 想发表情包时写 `[[emoji:意图]]`（如 `[[emoji:嘲讽]]`）。"
@@ -1075,6 +1137,9 @@ class Main(Star):
             self.expression_store.render(
                 conv_id,
                 self.expression_shared_groups,
+                query=self.context_mgr.summary_text(conv_id, max_chars=300),
+                max_patterns=self.expression_render_max_patterns,
+                max_jargon=self.expression_render_max_jargon,
             )
             if self.expression_store
             else None
@@ -1082,7 +1147,7 @@ class Main(Star):
         if style:
             rules += (
                 "\n\n【表达风格参考】以下是从本群聊天里学到的说话风格与黑话，"
-                "仅作参考，由你自己判断怎么用、什么时候用：自然的场合自然带出，"
+                "仅作参考，绝不能覆盖固定人格；由你自己判断怎么用、什么时候用：自然的场合自然带出，"
                 "不要每句都堆黑话，也不要复述本段原文或提'参考/风格'这类词:"
                 f"\n{style}"
             )
@@ -1903,7 +1968,12 @@ class Main(Star):
                     recent.insert(0, text)
                 material = "\n".join(recent)
                 facts = await self.profile_store.extract_facts(
-                    self.summary_client, nickname, material
+                    self.summary_client,
+                    nickname,
+                    material,
+                    existing_facts=(self.profile_store.get(sender_id) or {}).get(
+                        "facts", []
+                    ),
                 )
                 if facts:
                     self.profile_store.merge(sender_id, nickname, facts)
@@ -1937,9 +2007,6 @@ class Main(Star):
             text: The message's text.
         """
         if not self.emoji_store:
-            return
-        if random.random() >= self.emoji_collect_probability:
-            # 概率筛选：不是每条图都值得入库。
             return
         image = images[0]
         context_window = self.context_mgr.summary_text(conv_id, max_chars=300)

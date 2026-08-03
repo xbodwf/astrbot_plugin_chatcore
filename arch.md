@@ -117,9 +117,15 @@ AI 回复中途用户发新消息（无论这条消息是否命中普通回复�
 1. 新消息先并入历史上下文并进入当前会话的 pending 状态。
 2. 等**当前段**凑满/收尾 → 立即结束本次流式。
 3. 以包含全部新消息的新上下文发起新一轮请求。
-3. 消除"AI 继续发过时回复"的信息差。
+4. 消除"AI 继续发过时回复"的信息差。
 
 实现：每会话一个 `GenerationTask`，持有流式任务 + 新消息队列 + 中断标记；分段循环在段边界检查中断。
+
+### 4.4.1 统一消息协议与工具调用
+
+- 用户消息统一使用 `<message uid="..." nickname="...">...</message>`；bot 消息使用 `<message from="yourself">...</message>`，并在上下文中首次出现 bot 消息前插入 `<!-- <message from="yourself"/> 表明这条消息由你发送。 -->`，避免与真实昵称为 bot 的用户混淆。
+- 压缩历史只截断 XML 内容，不切换为另一种说话人格式；记忆、画像、外部持久化历史放在 `<reference>` 中，与当前聊天消息区分。
+- 工具采用两级路由：系统提示始终提供极短的工具名称/用途目录；模型确实需要时输出 `[[tools]]`，下一轮才下发完整 schema，避免 schema 挤压上下文。
 
 ### 4.5 AstrBot 提供商访问层（llm.py）
 
@@ -188,6 +194,7 @@ AI 回复中途用户发新消息（无论这条消息是否命中普通回复�
 为每个用户维护**结构化画像**（区别于 4.6 的文本片段向量记忆），让 AI "越来越懂这个人"：
 
 - **画像字段**：`person_id`（platform+user_id）、昵称、稳定事实（`facts`）、偏好（`preferences`）、互动特点（`interaction`）、最近活跃时间。
+- **事实格式**：新事实必须包含 `fact`、原文 `evidence`、`confidence`（最低 0.75）和 `action`（`add`/`replace`/`remove`）；生成时同时提供上一次画像，允许修订或删除，不再只增不改。
 - **写回**：每次回复后异步 `_extract_person_facts`——用摘要模型从本轮对话提取**稳定的人物事实**（不是流水账），去重合并进该用户画像。
 - **注入**：`build_messages` 时把当前发送者的画像压缩成背景块注入（与记忆召回同级），`_truncate` 限长。
 - **持久化**：JSON 文件（插件数据目录），重启不丢。
@@ -204,7 +211,9 @@ AI 回复中途用户发新消息（无论这条消息是否命中普通回复�
   - 黑话词条及 LLM 推断的含义（`?` 有歧义时保留来源例句）；
   - 该群表达风格的一句话总结。
 - **注入**：对应群的 system prompt 追加「表达风格」块，包含句式偏好 + 黑话表（带例句）。
+- **证据约束**：黑话必须保存 `guessedMeaning`、`example`、`source`，缺任何一项不入库；注入时按当前对话相关性选少量条目，并可在 WebUI 查看原始来源。
 - **共享组**：`expression.shared_groups` 允许跨群互通表达风格（可选，默认仅本群生效）。
+- **人工维护**：WebUI 支持手动添加句式或黑话，并填写 `guessedMeaning`、`example`、`source`；每条黑话可启用/禁用，人工条目标记 `origin=manual`，不会被自动学习覆盖。
 
 ### 4.13 表情包系统（带溯源）（emoji.py）
 
@@ -212,7 +221,7 @@ AI 回复中途用户发新消息（无论这条消息是否命中普通回复�
 
 - **数据模型**：每条表情包携带完整来源——
   `emoji_id`、本地 `file_path`、`source_group`、`source_sender`、`source_message_id`、`source_text`（偷包时该消息的文字）、`source_context`（原上下文窗口）、`collected_at`、`category`（VLM 分类：开心/嘲讽/敷衍…）、`tags`、`usage_count`。
-- **收集（偷包）**：群消息带图且开启收集时，落库图片**并记录来源语境**（发送者/群/原消息文字/上下文窗口）；异步用视觉模型打分类与标签。**不是无意识偷图，每张都带出处**。
+- **收集（偷包）**：群消息带图且开启收集时，默认先落库图片**并记录来源语境**（发送者/群/原消息文字/上下文窗口）；异步用视觉模型打描述，再由分析模型判断是否值得长期保留并分类。**不是无意识使用，每张都带出处**。
 - **检索使用**：AI 通过工具 `search_emoji(意图)` 检索，返回的条目**附来源语境原文**（如 `[表情: 草.jpg] 来源语境: "笑死，你这头像跟哈批一样"）——AI 先读到"这张图当初是配什么话用的"，再决定用不用，语义精准。
 - **使用回写**：AI 选用后 `usage_count+1`；WebUI 可查看、分类、删除、编辑标签。
 
@@ -256,11 +265,11 @@ AstrBot 4.23.4+ 插件页机制（`pages/<页面>/index.html` 由 dashboard ifra
 - **后端 API**：`register_web_api` 注册 `/chatcore/{profiles|memories|emoji|stats}` 等 REST 路由，页内 `apiGet/apiPost` 调用。
 - **资源合规**：`vendor/` 内每个第三方资源在 `pages/LICENSE` 注明协议（如 MIT/Apache-2.0）+ 作者 + 来源 URL；`.gitattributes` 标记 vendored 以免污染语言统计。
 
-### 4.17 工具调用（按需下发）（main.py / llm.py）
+### 4.17 工具调用（main.py / llm.py）
 
 让 AI 具备 function calling（查资料、定时提醒等），但**普通闲聊零工具开销**：
 
-- **按需下发（模型自主声明）**：常规轮次**不携带工具 schema**（回复快、token 省）。system prompt 告知模型：完成请求必须使用工具时，在回复最开头独占一行输出 `[[tools]]`。插件在分段发送时拦截该标记（该段不发送），下一轮以**带工具**的请求重试。是否需要工具由模型自己判断，无硬编码关键词。
+- **两级按需下发**：系统提示始终带极短工具目录；模型输出 `[[tools]]` 后，下一轮才携带完整 schema，随后使用 provider 标准 tool call。这样模型知道能力但不会被完整 schema 挤压上下文。
 - **工具集**：`_build_tool_set()` 懒构建缓存——AstrBot 全局注册表 `llm_tools.func_list`（其他插件注册的工具）+ 内置 `FutureTaskTool`（复用 AstrBot 定时任务）+ 自研 `schedule_task`（`create/list/delete` 一次性提醒）。`chat.tools_enabled` 总开关，`chat.max_tool_rounds` 上限。
 - **执行**：`_execute_tool` 复用 AstrBot `FunctionToolExecutor`（构造最小 `AstrAgentContext` wrapper），内置/插件工具行为与 vanilla 一致；结果以 `role:"tool"` 回传。
 - **回传协议**：OpenAI 要求 tool 结果跟在带 `tool_calls` 声明的 assistant 消息之后，否则 AstrBot 的 `_sanitize_assistant_messages` 当作孤儿消息丢弃（表现为模型反复调用同一工具）。工具轮先 append assistant 声明（`tool_calls` 含 id/name/arguments JSON），再 append 各 tool 结果。
@@ -328,8 +337,8 @@ MaiBot 风格的关系亲密度：每会话（conv_id，群/私聊天然隔离�
 - `2026-08-01` 设计：追赶 MaiBot 聊天能力（写入本文档，逐步开工）——人物画像+记忆写回（4.11）、表达风格学习（4.12）、带溯源的表情包系统（4.13）、情绪/状态系统（4.14）、退避策略读空气（4.15）、PluginPage WebUI（4.16，MUI MD3 + vendor 资源 + `.gitattributes`/LICENSE 合规）。
 - `2026-08-01` 实现：PluginPage WebUI 前端落地——MUI v9（MD3）经 esbuild 预构建为自包含 ESM `pages/dashboard/vendor/mui.full.js`（内联 React 19/ReactDOM/Emotion，离线可跑、页面无构建步骤）；`app.js` 用 `React.createElement` 免 JSX/Babel；双 Tab：监控（数据统计 + 注意力/上下文/情绪实况）+ 管理（画像/记忆/表情包/表达风格 CRUD）；`styles.css` 提供页面骨架样式；主题经 MutationObserver 监听宿主 `data-theme` 驱动 `useColorScheme().setMode` 深浅色自适应（见 4.16）。
 - `2026-08-01` 补充：表情包 WebUI 内联预览——iframe sandbox 无 `allow-same-origin`，不可直读二进制，新增 `GET .../emojis/<emoji_id>/image/data` 返回 base64 data URI JSON；父桥 `apiGet` 会解包 `response.data?.data`，故该路由返回 `{"data": "data:image/<mime>;base64,..."}` 后前端直接拿到 URI 字符串（`EmojiThumb` 处理）。
-- `2026-08-02` 补充：工具调用——按需下发（模型自主声明 `[[tools]]`，常规轮不携带工具 schema）、`_build_tool_set`（插件工具 + `FutureTaskTool` + `schedule_task`）、`FunctionToolExecutor` 复用、tool 结果回传协议（assistant tool_calls 声明先行，防孤儿丢弃）、自研定时任务调度器（`_scheduler_loop` + `CronMessageEvent` 复用完整回复链路）、回复中断续聊标记（见 4.17/4.18）。
-- `2026-08-02` 调整：工具请求标记 `[[tools]]` 在无工具轮被分段层拦截丢弃，模型声明后插件升级为带工具请求重试（仅允许一次升级，防循环）。
+- `2026-08-02` 补充：工具调用——`_build_tool_set`（插件工具 + `FutureTaskTool` + `schedule_task`）、`FunctionToolExecutor` 复用、tool 结果回传协议（assistant tool_calls 声明先行，防孤儿丢弃）、自研定时任务调度器（`_scheduler_loop` + `CronMessageEvent` 复用完整回复链路）、回复中断续聊标记（见 4.17/4.18）。
+- `2026-08-03` 调整：工具改为“短目录常驻、完整 schema 按需下发”；统一近期消息、压缩历史和持久化参考中的 bot/user XML 格式。
 - `2026-08-02` 补充：对话历史持久化——`ContextManager` 可选 `persist_path`（插件数据目录 `context_history.json`），`record`/`set_image_description`/`remove_message`/`clear` 原子写盘（tmp+rename，失败静默）；插件重载后恢复每会话逐字历史（含图片描述/引用/发送者 ID），WebUI「活跃会话」不再因重载清空；无路径时保持纯内存（测试兼容）。
 - `2026-08-02` 补充：好感度系统——`affinity.py` 每会话好感度（互动增减、按天惰性衰减、五档位注入 system prompt），JSON 持久化，WebUI 展示，配置 `affinity.*`（见 4.19）。
 - `2026-08-02` 调整：system prompt 规则精简——分段/标记/防伪/工具/图片说明由约 700 字压缩为约 250 字编号短句（自然语气「一些约定，记住即可」），降低工程指令密度，恢复人格主导的角色扮演味道。

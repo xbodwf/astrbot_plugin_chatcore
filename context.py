@@ -5,6 +5,7 @@ layered context: recent messages kept verbatim, older history compressed per
 message, plus recalled global memories and image descriptions.
 """
 
+import html
 import json
 import os
 import time
@@ -467,10 +468,14 @@ class ContextManager:
 
     def _format_record(self, record: MessageRecord) -> str:
         if record.role == "assistant":
-            return record.text
-        attrs = [f'user="{self._sender_label(record)}"']
+            attrs = ['from="yourself"']
+        else:
+            attrs = [
+                f'uid="{html.escape(record.sender_id, quote=True)}"',
+                f'nickname="{html.escape(record.sender_name or "未知用户", quote=True)}"',
+            ]
         if record.message_id:
-            attrs.append(f'msg_id="{record.message_id}"')
+            attrs.append(f'msg_id="{html.escape(record.message_id, quote=True)}"')
         if record.ts:
             attrs.append(f'time="{time.strftime("%H:%M", time.localtime(record.ts))}"')
         body = ""
@@ -490,10 +495,9 @@ class ContextManager:
     def _compress_record(self, record: MessageRecord) -> str | None:
         """Format a record for the compressed older-history block.
 
-        Uses a compact ``[名字]`` shape (not the verbose ``<message>`` XML)
-        so truncated lines keep the speaker. Image placeholders (``[图片]``
-        with no description) are dropped entirely; a stored description
-        participates as real text.
+        Uses the same ``<message>`` XML shape as recent history, with a smaller
+        body budget. Image placeholders (``[图片]`` with no description) are
+        dropped entirely; a stored description participates as real text.
 
         Args:
             record: The record to compress.
@@ -501,9 +505,6 @@ class ContextManager:
         Returns:
             The compressed line, or None to skip this record.
         """
-        if record.role == "assistant":
-            text = record.text or ""
-            return f"[bot]{text}" if text else None
         body = ""
         if record.quote:
             body += f"[引用了消息: {escape_user_markers(record.quote)}] "
@@ -516,7 +517,15 @@ class ContextManager:
             body += escape_user_markers(record.text)
         if record.images and not body:
             return None
-        return f"[{self._sender_label(record)}]{body}" if body else None
+        if not body:
+            return None
+        if record.role == "assistant":
+            return f'<message from="yourself">{body}</message>'
+        return (
+            f'<message uid="{html.escape(record.sender_id, quote=True)}" '
+            f'nickname="{html.escape(record.sender_name or "未知用户", quote=True)}">'
+            f"{body}</message>"
+        )
 
     def _truncate(self, text: str, limit: int) -> str:
         """Truncate text at a boundary, appending an ellipsis.
@@ -576,13 +585,16 @@ class ContextManager:
         recent = all_records[-self.recent_count :]
         older = all_records[: -self.recent_count]
 
-        messages.extend(
-            {
-                "role": record.role,
-                "content": self._format_record(record),
-            }
-            for record in recent
-        )
+        has_self_marker = False
+        for record in recent:
+            content = self._format_record(record)
+            if record.role == "assistant" and not has_self_marker:
+                content = (
+                    '<!-- <message from="yourself"/> 表明这条消息由你发送。 -->\n'
+                    + content
+                )
+                has_self_marker = True
+            messages.append({"role": record.role, "content": content})
 
         background: list[str] = []
         for block in history_texts or []:
@@ -608,16 +620,42 @@ class ContextManager:
                 background.append("[参考消息]更早的对话（已压缩摘要）:")
                 background.append(escape_user_markers(summary))
             else:
-                compressed = [
-                    self._truncate(line, self.old_msg_chars)
-                    for record in older[-self.history_count :]
-                    if (line := self._compress_record(record))
-                ]
+                compressed = []
+                for record in older[-self.history_count :]:
+                    line = self._compress_record(record)
+                    if line:
+                        compressed.append(self._truncate_xml_message(line))
                 if compressed:
                     background.append("[参考消息]更早的对话（已压缩）:")
                     background.extend(f"- {line}" for line in compressed)
 
         if background:
-            messages.append({"role": "user", "content": "\n".join(background)})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "<reference>\n"
+                    + "\n".join(background)
+                    + "\n</reference>",
+                }
+            )
 
         return messages
+
+    def _truncate_xml_message(self, message: str) -> str:
+        """Truncate an XML message body without breaking its wrapper.
+
+        Args:
+            message: A complete ``<message>...</message>`` string.
+
+        Returns:
+            The original message or a valid shortened XML message.
+        """
+        if len(message) <= self.old_msg_chars:
+            return message
+        close = "</message>"
+        body_start = message.find(">") + 1
+        body_end = message.rfind(close)
+        if body_start <= 0 or body_end < body_start:
+            return message
+        body = self._truncate(message[body_start:body_end], self.old_msg_chars)
+        return f"{message[:body_start]}{body}{close}"
