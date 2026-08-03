@@ -117,6 +117,8 @@ def extract_text_history(history: list) -> list[dict]:
     for msg in history:
         if not isinstance(msg, dict) or msg.get("role") not in ("user", "assistant"):
             continue
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            continue
         content = msg.get("content")
         if isinstance(content, str):
             text = content
