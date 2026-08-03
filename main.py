@@ -112,12 +112,6 @@ def _tool_intent_hint(text: str) -> bool:
             "删除任务",
             "查询任务",
             "执行",
-            "公开信息",
-            "公开资料",
-            "我的信息",
-            "个人信息",
-            "用户信息",
-            "查我的",
         )
     )
 
@@ -798,21 +792,6 @@ class Main(Star):
                     system_prompts = await self._build_system_prompt(
                         conv_id, event.get_sender_id()
                     )
-                    if self.tools_enabled and tool_set:
-                        tool_index = ", ".join(
-                            f"{name}: {tool_set.get_tool(name).description[:80]}"
-                            for name in tool_set.names()
-                            if tool_set.get_tool(name)
-                        )
-                        system_prompts.append(
-                            "【可用工具】仅在确实需要时使用；需要完整参数时等待下一轮工具调用。"
-                            f"可用工具：{tool_index}"
-                        )
-                    if _tool_intent_hint(current_text) and tool_set:
-                        tools_armed = True
-                        system_prompts.append(
-                            "【工具提示】当前消息看起来可能需要工具，请认真判断。"
-                        )
                     if self.reminder:
                         system_prompts.append(self.reminder)
                     messages = self.context_mgr.build_messages(
@@ -869,6 +848,9 @@ class Main(Star):
                     event.get_sender_name(),
                 )
                 image_urls = req.image_urls
+                active_tool_set = (
+                    req.func_tool if req.func_tool is not None else tool_set
+                )
 
                 tool_calls: tuple | None = None
                 stripper = ThinkStripper()
@@ -878,7 +860,7 @@ class Main(Star):
                     async for resp in self.chat_client.chat_stream_raw(
                         messages,
                         images=image_urls,
-                        func_tool=(tool_set if (tool_round or tools_armed) else None),
+                        func_tool=active_tool_set,
                         log_name="chat",
                     ):
                         if resp.is_chunk:
@@ -907,7 +889,7 @@ class Main(Star):
                     if not segment:
                         return
                     tool_match = _TEXT_TOOL_USE_RE.search(segment)
-                    if tool_match and tool_set:
+                    if tool_match and active_tool_set:
                         try:
                             tool_name = tool_match.group(1).strip()
                             tool_args = json.loads(tool_match.group(2))
@@ -1003,7 +985,7 @@ class Main(Star):
                     )
                     if (
                         tools_requested
-                        and tool_set
+                        and active_tool_set
                         and not tools_armed
                         and not tool_calls
                         and tool_rounds == 0
@@ -1015,7 +997,11 @@ class Main(Star):
                     # calls, execute them, feed the results back and loop
                     # again without rebuilding the messages (the tool results
                     # live in `messages`).
-                    if tool_calls and tool_set and tool_rounds < self.max_tool_rounds:
+                    if (
+                        tool_calls
+                        and active_tool_set
+                        and tool_rounds < self.max_tool_rounds
+                    ):
                         tool_rounds += 1
                         names, args_list, ids = tool_calls
                         # OpenAI 协议: tool 结果必须跟在声明了这些 tool_calls
@@ -1043,7 +1029,7 @@ class Main(Star):
                         )
                         for name, args, tid in zip(names, args_list, ids):
                             result = await self._execute_tool(
-                                event, tool_set, name, args or {}
+                                event, active_tool_set, name, args or {}
                             )
                             messages.append(
                                 {
