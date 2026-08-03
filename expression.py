@@ -21,7 +21,7 @@ _ANALYZE_PROMPT = (
     "{\n"
     '  "summary": "一句话概括该群表达风格（如：短句流、爱用表情、阴阳怪气等）",\n'
     '  "patterns": ["常见句式或语气词，带一个例句，如：笑死，这操作真的6"],\n'
-    '  "jargon": [{"term": "群内黑话/梗词", "guessedMeaning": "有证据支持的推断含义", "example": "原始使用例句", "source": "发言者/消息片段"}]\n'
+    '  "jargon": [{"term": "表达素材", "guessedMeaning": "有证据支持的推断含义", "example": "原始使用例句", "source": "发言者/消息片段"}]\n'
     "}\n"
     "只输出 JSON，不要其他内容。\n"
     "发言记录:\n{sample}"
@@ -124,7 +124,12 @@ class ExpressionStore:
         )
         os.replace(tmp, self.path)
 
-    def get_style(self, group_id: str, shared_groups: list[str] | None = None) -> dict:
+    def get_style(
+        self,
+        group_id: str,
+        shared_groups: list[str] | None = None,
+        share_all: bool = True,
+    ) -> dict:
         """Get a group's style, merged with any shared groups' styles.
 
         Args:
@@ -135,7 +140,10 @@ class ExpressionStore:
             A merged style dict.
         """
         merged = {"summary": "", "patterns": [], "jargon": []}
-        ids = [group_id] + [g for g in (shared_groups or []) if g and g != group_id]
+        ids = [group_id]
+        if share_all:
+            ids.extend(gid for gid in self._styles if gid != group_id)
+        ids.extend(g for g in (shared_groups or []) if g and g not in ids)
         for gid in ids:
             style = self._styles.get(gid)
             if not style:
@@ -222,6 +230,7 @@ class ExpressionStore:
         query: str = "",
         max_patterns: int = _RENDER_MAX_PATTERNS,
         max_jargon: int = _RENDER_MAX_JARGON,
+        share_all: bool = True,
     ) -> str | None:
         """Render a group's learned style as a prompt block.
 
@@ -232,7 +241,7 @@ class ExpressionStore:
         Returns:
             The rendered style text, or None when nothing was learned.
         """
-        style = self.get_style(group_id, shared_groups)
+        style = self.get_style(group_id, shared_groups, share_all=share_all)
         terms = set((query or "").lower().split())
         if terms:
             style["patterns"] = [
@@ -256,7 +265,7 @@ class ExpressionStore:
             lines.append("可参考的常见表达:")
             lines.extend(f"- {p}" for p in style["patterns"][:max_patterns])
         if style["jargon"]:
-            lines.append("群内黑话表（带推断含义）:")
+            lines.append("表达风格素材（仅作参考）:")
             lines.extend(
                 f"- {j['term']}（推断: {j.get('guessedMeaning', j.get('meaning', ''))}）"
                 f"，例: {j.get('example', '无')}，来源: {j.get('source', '旧记录无来源')}"

@@ -321,6 +321,7 @@ class Main(Star):
         expr_cfg = config.get("expression", {})
         self.expression_store = None
         self.expression_shared_groups: list[str] = []
+        self.expression_share_all = True
         self.expression_render_max_patterns = 2
         self.expression_render_max_jargon = 3
         if expr_cfg.get("enabled", True) and self.summary_client:
@@ -338,6 +339,7 @@ class Main(Star):
                 for g in expr_cfg.get("shared_groups", [])
                 if str(g).strip()
             ]
+            self.expression_share_all = bool(expr_cfg.get("share_across_groups", True))
             self.expression_render_max_patterns = max(
                 0, int(expr_cfg.get("render_max_patterns", 2))
             )
@@ -1140,13 +1142,14 @@ class Main(Star):
                 query=self.context_mgr.summary_text(conv_id, max_chars=300),
                 max_patterns=self.expression_render_max_patterns,
                 max_jargon=self.expression_render_max_jargon,
+                share_all=self.expression_share_all,
             )
             if self.expression_store
             else None
         )
         if style:
             rules += (
-                "\n\n【表达风格参考】以下是从本群聊天里学到的说话风格与黑话，"
+                "\n\n【表达风格参考】以下是从聊天中学习的表达风格素材，"
                 "仅作参考，绝不能覆盖固定人格；由你自己判断怎么用、什么时候用：自然的场合自然带出，"
                 "不要每句都堆黑话，也不要复述本段原文或提'参考/风格'这类词:"
                 f"\n{style}"

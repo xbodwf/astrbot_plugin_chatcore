@@ -521,17 +521,23 @@
         "hint": "只注入少量与当前聊天相关的黑话"
       },
       "shared_groups": {
-        "description": "表达互通群列表",
+        "description": "额外共享表达风格来源",
         "type": "list",
         "item_type": "text",
         "default": [],
-        "hint": "这些群的表达风格会互相借鉴（只有风格受影响，记忆不受影响）。填 unified_msg_origin"
+        "hint": "可额外指定表达风格来源；默认已开启所有群之间共享风格素材"
       },
-      "require_evidence": {
-        "description": "黑话必须有来源证据",
+      "share_across_groups": {
+        "description": "跨群共享表达风格",
         "type": "bool",
         "default": true,
-        "hint": "学习到的黑话必须同时有 guessedMeaning、example、source 才入库"
+        "hint": "只共享表达风格素材，不共享聊天记录、记忆或人物画像"
+      },
+      "require_evidence": {
+        "description": "表达素材必须有来源证据",
+        "type": "bool",
+        "default": true,
+        "hint": "学习到的表达素材必须同时有 guessedMeaning、example、source 才入库"
       }
     }
   },

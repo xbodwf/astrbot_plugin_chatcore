@@ -711,14 +711,16 @@ function ExpressionsPanel() {
     h(
       Paper,
       { variant: "outlined", sx: { p: 1.5, mb: 1.5 } },
-      h(Typography, { variant: "subtitle2" }, "手动添加表达风格"),
-      h(TextField, { size: "small", label: "群组 ID", value: form.groupId, onChange: (e) => setForm({ ...form, groupId: e.target.value }), sx: { mt: 1, mr: 1 } }),
-      h(TextField, { size: "small", label: "句式（可选）", value: form.pattern, onChange: (e) => setForm({ ...form, pattern: e.target.value }), sx: { mt: 1, mr: 1 } }),
-      h(TextField, { size: "small", label: "黑话", value: form.term, onChange: (e) => setForm({ ...form, term: e.target.value }), sx: { mt: 1, mr: 1 } }),
-      h(TextField, { size: "small", label: "guessedMeaning", value: form.meaning, onChange: (e) => setForm({ ...form, meaning: e.target.value }), sx: { mt: 1, mr: 1 } }),
-      h(TextField, { size: "small", label: "example", value: form.example, onChange: (e) => setForm({ ...form, example: e.target.value }), sx: { mt: 1, mr: 1 } }),
-      h(TextField, { size: "small", label: "source", value: form.source, onChange: (e) => setForm({ ...form, source: e.target.value }), sx: { mt: 1, mr: 1 } }),
-      h(Button, { variant: "contained", onClick: addEntry, disabled: busy, sx: { mt: 1 } }, "添加"),
+      h(Typography, { variant: "subtitle2" }, "手动添加表达风格素材"),
+      h(Box, { className: "expression-form" },
+        h(TextField, { size: "small", label: "群组 ID", value: form.groupId, onChange: (e) => setForm({ ...form, groupId: e.target.value }) }),
+        h(TextField, { size: "small", label: "句式（可选）", value: form.pattern, onChange: (e) => setForm({ ...form, pattern: e.target.value }) }),
+        h(TextField, { size: "small", label: "表达素材", value: form.term, onChange: (e) => setForm({ ...form, term: e.target.value }) }),
+        h(TextField, { size: "small", label: "guessedMeaning", value: form.meaning, onChange: (e) => setForm({ ...form, meaning: e.target.value }) }),
+        h(TextField, { size: "small", label: "example", value: form.example, onChange: (e) => setForm({ ...form, example: e.target.value }) }),
+        h(TextField, { size: "small", label: "source", value: form.source, onChange: (e) => setForm({ ...form, source: e.target.value }) }),
+        h(Button, { variant: "contained", onClick: addEntry, disabled: busy }, "添加"),
+      ),
     ),
     expressions.length === 0
       ? h(Typography, { variant: "body2", color: "text.secondary" }, "暂无表达风格")
@@ -726,13 +728,13 @@ function ExpressionsPanel() {
           Stack,
           { direction: "column", spacing: 1 },
           expressions.map((style) =>
-            h(
-              Paper,
-              { key: style.group_id, variant: "outlined", sx: { p: 1.5 } },
+             h(
+               Paper,
+               { key: style.group_id, className: "expression-card", variant: "outlined", sx: { p: 1.5 } },
               h(
                 Stack,
                 { direction: "row", alignItems: "center", spacing: 1 },
-                h(Typography, { variant: "subtitle2" }, style.group_id),
+                  h(Typography, { variant: "subtitle2", className: "expression-group" }, style.group_id),
                 h(
                   Button,
                   {
@@ -748,7 +750,7 @@ function ExpressionsPanel() {
               (style.jargon || []).length > 0 &&
                 h(
                   Stack,
-                  { direction: "row", spacing: 0.5, mt: 0.75, flexWrap: "wrap" },
+                  { direction: "row", spacing: 0.5, mt: 0.75, flexWrap: "wrap", className: "expression-chips" },
                    style.jargon.map((item) =>
                     h(
                       Tooltip,
@@ -763,7 +765,7 @@ function ExpressionsPanel() {
               (style.jargon || []).map((item, idx) =>
                 h(
                   Typography,
-                  { key: `source-${idx}`, variant: "caption", color: "text.secondary", sx: { display: "block", mt: 0.25 } },
+                  { key: `source-${idx}`, variant: "caption", color: "text.secondary", className: "expression-source" },
                   `${item.term}: ${item.guessedMeaning || item.meaning || ""}｜例: ${item.example || "无"}｜来源: ${item.source || "旧记录无来源"}`,
                 ),
               ),

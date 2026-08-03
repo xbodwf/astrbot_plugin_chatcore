@@ -27,3 +27,35 @@ body,
 img {
   display: block;
 }
+
+.expression-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+  align-items: center;
+}
+
+.expression-card {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.expression-group,
+.expression-source {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.expression-chips {
+  max-height: 116px;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+@media (max-width: 600px) {
+  .expression-form {
+    grid-template-columns: 1fr;
+  }
+}
