@@ -67,6 +67,19 @@ HISTORY_SUMMARY_PROMPT = (
 
 # 模型声明"需要工具"的标记行（AI 在回复开头独占一行输出）。
 _TOOLS_REQUEST_MARK = "[[tools]]"
+_MESSAGE_TAG_RE = re.compile(r"</?message\b[^>]*>", re.IGNORECASE)
+
+
+def _clean_model_segment(text: str) -> str:
+    """Remove internal message wrappers accidentally emitted by the model.
+
+    Args:
+        text: A streamed model segment.
+
+    Returns:
+        Plain reply text with ``<message>`` wrappers removed.
+    """
+    return _MESSAGE_TAG_RE.sub("", text).strip()
 
 
 def _tool_intent_hint(text: str) -> bool:
@@ -875,6 +888,9 @@ class Main(Star):
                     nonlocal t_first_send, reply_decision_task, tools_requested
                     nonlocal reply_decision_started
                     nonlocal reply_decision
+                    segment = _clean_model_segment(segment)
+                    if not segment:
+                        return
                     if reply_decision_task and reply_decision_task.done():
                         try:
                             reply_decision = reply_decision_task.result()
@@ -1012,6 +1028,10 @@ class Main(Star):
                     break
                 trailing, (next_text, cancelled) = pending
                 if trailing:
+                    trailing = _clean_model_segment(trailing)
+                    if not trailing:
+                        current_text = next_text
+                        continue
                     # Deliver the finished current sentence; on recall it is
                     # sent but not recorded so it stops polluting the context.
                     if reply_decision_task and reply_decision_task.done():
@@ -1104,7 +1124,8 @@ class Main(Star):
             + "` 时前面加 `"
             + self.segment_escape
             + "`。"
-            "② 回复直接说人话：不要带任何说话者前缀或 `<message ...>` 这类"
+            "② 回复直接说人话：模型输出必须是纯文本，不要带任何说话者前缀或 "
+            "`<message ...>` 这类"
             "格式，不要照抄上下文里的系统格式（如 `[图片]`、`[引用了…]`、"
             "`<message uid=... nickname=...>`），回复里出现这些就是错误；"
             "想回复某人的消息用 `[[reply:昵称]]`。"
