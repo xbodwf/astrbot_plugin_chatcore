@@ -49,6 +49,7 @@ from .history import (
 from .llm import EmbeddingAdapter, LLMProvider, ThinkStripper
 from .memory import MemoryStore
 from .profile import ProfileStore
+from .request_log import write_latest
 from .segmentation import build_interval_calc, stream_respond
 from .webui import ChatCoreWebUI
 
