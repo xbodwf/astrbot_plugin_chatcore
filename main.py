@@ -112,6 +112,12 @@ def _tool_intent_hint(text: str) -> bool:
             "删除任务",
             "查询任务",
             "执行",
+            "公开信息",
+            "公开资料",
+            "我的信息",
+            "个人信息",
+            "用户信息",
+            "查我的",
         )
     )
 
@@ -803,6 +809,7 @@ class Main(Star):
                             f"可用工具：{tool_index}"
                         )
                     if _tool_intent_hint(current_text) and tool_set:
+                        tools_armed = True
                         system_prompts.append(
                             "【工具提示】当前消息看起来可能需要工具，请认真判断。"
                         )
