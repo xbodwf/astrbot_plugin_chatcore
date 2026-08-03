@@ -21,6 +21,7 @@ from astrbot.api.message_components import At, File, Image, Plain, Reply
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.agent.run_context import ContextWrapper
+from astrbot.core.agent.handoff import HandoffTool
 from astrbot.core.agent.tool import ToolSet
 from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
@@ -67,6 +68,7 @@ HISTORY_SUMMARY_PROMPT = (
 
 # 模型声明"需要工具"的标记行（AI 在回复开头独占一行输出）。
 _TOOLS_REQUEST_MARK = "[[tools]]"
+_SUBAGENT_TOOL_NAME = "call_subagent"
 _MESSAGE_TAG_RE = re.compile(r"</?message\b[^>]*>", re.IGNORECASE)
 _TEXT_TOOL_USE_RE = re.compile(
     r'<tool_use>\s*\{"tool_name"\s*:\s*"([^"\n]+)"\s*,\s*'
@@ -793,13 +795,10 @@ class Main(Star):
                         conv_id, event.get_sender_id()
                     )
                     if self.tools_enabled:
-                        maid_tool = self.context.get_llm_tool_manager().get_func(
-                            "call_maid"
-                        )
-                        if maid_tool is not None and getattr(maid_tool, "active", True):
+                        if tool_set is not None:
                             system_prompts.append(
                                 "【后台委托】当用户要求查询信息、执行操作或完成任何需要外部能力的"
-                                "事情时，静默调用 `call_maid` 委托后台执行；不要向用户提及工具、"
+                                "事情时，静默调用 `call_subagent` 委托后台执行；不要向用户提及工具、"
                                 "后台 Agent、管家或内部调用过程。拿到结果后直接用当前人格回复。"
                             )
                     if self.reminder:
@@ -861,11 +860,7 @@ class Main(Star):
                     event.get_sender_name(),
                 )
                 image_urls = req.image_urls
-                active_tool_set = req.func_tool if req.func_tool is not None else tool_set
-                maid_tool = self.context.get_llm_tool_manager().get_func("call_maid")
-                if maid_tool is not None and getattr(maid_tool, "active", True):
-                    active_tool_set = ToolSet()
-                    active_tool_set.add_tool(maid_tool)
+                active_tool_set = tool_set
 
                 tool_calls: tuple | None = None
                 stripper = ThinkStripper()
@@ -1314,55 +1309,31 @@ class Main(Star):
         if self._tool_set is not None:
             return self._tool_set
         try:
-            from astrbot.core.agent.tool import FunctionTool
-            from astrbot.core.provider.register import llm_tools
-            from astrbot.core.tools.cron_tools import FutureTaskTool
-
             ts = ToolSet()
-            for tool in llm_tools.func_list:
-                ts.add_tool(tool)
-            ts.add_tool(
-                self.context.get_llm_tool_manager().get_builtin_tool(FutureTaskTool)
+            orchestrator = getattr(self.context, "subagent_orchestrator", None)
+            handoffs = getattr(orchestrator, "handoffs", None) or []
+            handoff = next(
+                (
+                    item
+                    for item in handoffs
+                    if getattr(item, "agent", None) is not None
+                ),
+                None,
             )
-            ts.add_tool(
-                FunctionTool(
-                    name="schedule_task",
-                    description=(
-                        "Create, list or delete a scheduled reminder. "
-                        "Use action='create' with an ISO run_at datetime and a note "
-                        "describing what to say to the user when it fires; "
-                        "action='list' lists tasks; action='delete' removes one by job_id."
-                    ),
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "action": {
-                                "type": "string",
-                                "enum": ["create", "list", "delete"],
-                                "description": "Action to perform.",
-                            },
-                            "name": {
-                                "type": "string",
-                                "description": "Optional task label.",
-                            },
-                            "note": {
-                                "type": "string",
-                                "description": "What to say when the task fires.",
-                            },
-                            "run_at": {
-                                "type": "string",
-                                "description": "ISO datetime for one-time execution, e.g. 2026-02-02T08:00:00+08:00.",
-                            },
-                            "job_id": {
-                                "type": "string",
-                                "description": "Task id, required for delete.",
-                            },
-                        },
-                        "required": ["action"],
-                    },
-                    handler=self._schedule_tool_handler,
-                )
+            if handoff is None:
+                self.logger.warning("ChatCore: no configured subagent is available")
+                self._tool_set = None
+                return None
+            subagent_tool = HandoffTool(
+                agent=handoff.agent,
+                tool_description=(
+                    "静默委托任务给后台子 Agent。需要查询信息、执行操作或使用外部能力时调用；"
+                    "不要向用户透露子 Agent 或工具调用过程。"
+                ),
             )
+            subagent_tool.name = _SUBAGENT_TOOL_NAME
+            subagent_tool.provider_id = getattr(handoff, "provider_id", None)
+            ts.add_tool(subagent_tool)
             self._tool_set = ts if not ts.empty() else None
         except Exception as e:
             self.logger.warning(f"ChatCore: tool set build failed: {e}")
