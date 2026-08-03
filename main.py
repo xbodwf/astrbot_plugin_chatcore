@@ -781,7 +781,7 @@ class Main(Star):
                             f"【提示】你刚刚才说过「{last_reply[0][:60]}」。"
                             "除非对方明确追问，不要重复类似的话；回应新消息要说新内容。"
                         ]
-                    system_prompt = await self._build_system_prompt(
+                    system_prompts = await self._build_system_prompt(
                         conv_id, event.get_sender_id()
                     )
                     if self.tools_enabled and tool_set:
@@ -790,20 +790,19 @@ class Main(Star):
                             for name in tool_set.names()
                             if tool_set.get_tool(name)
                         )
-                        system_prompt += (
-                            "\n\n【可用工具目录】仅在确实需要时使用；需要完整参数时输出 "
-                            f"{_TOOLS_REQUEST_MARK}。可用工具：{tool_index}"
+                        system_prompts.append(
+                            "【可用工具】仅在确实需要时使用；需要完整参数时等待下一轮工具调用。"
+                            f"可用工具：{tool_index}"
                         )
                     if _tool_intent_hint(current_text) and tool_set:
-                        system_prompt += (
-                            "\n【工具提示】当前消息看起来可能需要工具，请认真判断；"
-                            f"如需要请输出 {_TOOLS_REQUEST_MARK}。"
+                        system_prompts.append(
+                            "【工具提示】当前消息看起来可能需要工具，请认真判断。"
                         )
                     if self.reminder:
-                        system_prompt = f"{system_prompt}\n\n{self.reminder}"
+                        system_prompts.append(self.reminder)
                     messages = self.context_mgr.build_messages(
                         conv_id,
-                        system_prompt=system_prompt,
+                        system_prompt=system_prompts,
                         memory_texts=await self._recall(conv_id, current_text),
                         history_texts=history_blocks,
                         profile_texts=await self._inject_profile(event),
@@ -826,7 +825,7 @@ class Main(Star):
                     session_id=conv_id,
                     image_urls=image_urls,
                     contexts=messages,
-                    system_prompt=system_prompt,
+                    system_prompt="\n\n".join(system_prompts),
                     extra_user_content_parts=[],
                 )
                 prev_result = event.get_result()
@@ -1091,7 +1090,9 @@ class Main(Star):
         finally:
             self.active_tasks.pop(conv_id, None)
 
-    async def _build_system_prompt(self, conv_id: str, sender_id: str = "") -> str:
+    async def _build_system_prompt(
+        self, conv_id: str, sender_id: str = ""
+    ) -> list[str]:
         """Build the system prompt for a conversation.
 
         The persona (人格) is taken from AstrBot's own persona manager, so it
@@ -1103,7 +1104,7 @@ class Main(Star):
             sender_id: Sender's platform id, used for the affinity note.
 
         Returns:
-            The full system prompt.
+            Ordered system prompt blocks for persona, rules, and references.
         """
         persona = (
             await self._resolve_persona_prompt(conv_id)
@@ -1180,7 +1181,7 @@ class Main(Star):
             rules += self.emotion_mgr.inject_text(conv_id)
         if self.affinity_mgr and sender_id:
             rules += self.affinity_mgr.inject_text(sender_id)
-        return persona + rules
+        return [persona, rules]
 
     def _merge_llm_request(
         self,
@@ -1206,13 +1207,16 @@ class Main(Star):
         Returns:
             The merged message list.
         """
-        if req.system_prompt:
-            if messages and messages[0].get("role") == "system":
-                messages[0]["content"] = req.system_prompt
-            else:
-                messages.insert(0, {"role": "system", "content": req.system_prompt})
         if req.contexts is not messages and req.contexts:
             messages = list(req.contexts)
+        if req.system_prompt:
+            existing_system = "\n\n".join(
+                str(message.get("content") or "")
+                for message in messages
+                if message.get("role") == "system"
+            )
+            if req.system_prompt != existing_system:
+                messages.append({"role": "system", "content": req.system_prompt})
         if req.prompt != current_text or req.extra_user_content_parts:
             merged = (req.prompt or "").strip()
             for part in req.extra_user_content_parts:
@@ -1228,12 +1232,7 @@ class Main(Star):
                 return messages
             if current_text and current_text in merged:
                 for i in range(len(messages) - 1, -1, -1):
-                    content = str(messages[i].get("content") or "")
-                    if (
-                        messages[i].get("role") == "user"
-                        and content.startswith("<message ")
-                        and f'user="{sender_name}' in content
-                    ):
+                    if messages[i].get("role") == "user":
                         messages[i]["content"] = merged
                         return messages
             messages.append({"role": "user", "content": merged})

@@ -553,7 +553,7 @@ class ContextManager:
         self,
         conv_id: str,
         *,
-        system_prompt: str,
+        system_prompt: str | list[str],
         memory_texts: list[str] | None = None,
         history_texts: list[str] | None = None,
         profile_texts: list[str] | None = None,
@@ -579,12 +579,22 @@ class ContextManager:
         Returns:
             OpenAI-style message dict list.
         """
-        messages: list[dict] = [{"role": "system", "content": system_prompt}]
+        system_prompts = (
+            [system_prompt] if isinstance(system_prompt, str) else system_prompt
+        )
+        messages: list[dict] = [
+            {"role": "system", "content": prompt}
+            for prompt in system_prompts
+            if prompt
+        ]
 
         all_records = self._history(conv_id)
-        recent = all_records[-self.recent_count :]
-        older = all_records[: -self.recent_count]
+        current = all_records[-1] if all_records else None
+        records = all_records[:-1] if current else all_records
+        recent = records[-self.recent_count :]
+        older = records[: -self.recent_count]
 
+        conversation: list[str] = []
         has_self_marker = False
         for record in recent:
             content = self._format_record(record)
@@ -594,31 +604,42 @@ class ContextManager:
                     + content
                 )
                 has_self_marker = True
-            messages.append({"role": record.role, "content": content})
+            conversation.append(content)
 
-        background: list[str] = []
+        if conversation:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "【近期聊天记录】\n" + "\n".join(conversation),
+                }
+            )
+
         for block in history_texts or []:
-            background.append(block)
+            if block:
+                messages.append({"role": "system", "content": block})
         if memory_texts:
-            background.append(
-                "[参考消息]以下是你回忆起的过往片段（可能来自其他群聊、私聊或"
-                "很久以前，不代表当前发生的事，也不代表你本人执行过任何操作）。"
-                "它们只是背景知识：除非用户明确问起，不要在当前对话中主动提起"
-                "或当作当前聊天的话题或依据:"
+            memory = (
+                "【记忆参考】以下是你回忆起的过往片段，可能来自其他群聊、私聊或很久以前，"
+                "不代表当前发生的事。除非用户明确问起，不要主动提起：\n"
+                + "\n".join(f"- {escape_user_markers(text)}" for text in memory_texts)
             )
-            background.extend(f"- {escape_user_markers(text)}" for text in memory_texts)
+            messages.append({"role": "system", "content": memory})
         if profile_texts:
-            background.append(
-                "[参考消息]以下是你对该用户的了解（人物画像，可能随时间更新）。"
-                "自然融入即可，不要主动复述画像内容，也不要把它当作当前对话的"
-                "依据:"
+            profile = (
+                "【人物画像参考】以下是你对相关用户的了解，可能随时间更新。"
+                "自然融入即可，不要主动复述：\n"
+                + "\n".join(escape_user_markers(text) for text in profile_texts)
             )
-            background.extend(escape_user_markers(text) for text in profile_texts)
+            messages.append({"role": "system", "content": profile})
         if older:
             summary = self.get_summary(conv_id)
             if summary:
-                background.append("[参考消息]更早的对话（已压缩摘要）:")
-                background.append(escape_user_markers(summary))
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": "【更早的聊天摘要】\n" + escape_user_markers(summary),
+                    }
+                )
             else:
                 compressed = []
                 for record in older[-self.history_count :]:
@@ -626,18 +647,17 @@ class ContextManager:
                     if line:
                         compressed.append(self._truncate_xml_message(line))
                 if compressed:
-                    background.append("[参考消息]更早的对话（已压缩）:")
-                    background.extend(f"- {line}" for line in compressed)
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": "【更早的聊天记录】\n"
+                            + "\n".join(f"- {line}" for line in compressed),
+                        }
+                    )
 
-        if background:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": "<reference>\n"
-                    + "\n".join(background)
-                    + "\n</reference>",
-                }
-            )
+        if current:
+            current_content = self._format_record(current)
+            messages.append({"role": "user", "content": current_content})
 
         return messages
 
