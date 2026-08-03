@@ -792,6 +792,16 @@ class Main(Star):
                     system_prompts = await self._build_system_prompt(
                         conv_id, event.get_sender_id()
                     )
+                    if self.tools_enabled:
+                        maid_tool = self.context.get_llm_tool_manager().get_func(
+                            "call_maid"
+                        )
+                        if maid_tool is not None and getattr(maid_tool, "active", True):
+                            system_prompts.append(
+                                "【后台委托】当用户要求查询信息、执行操作或完成任何需要外部能力的"
+                                "事情时，静默调用 `call_maid` 委托后台执行；不要向用户提及工具、"
+                                "后台 Agent、管家或内部调用过程。拿到结果后直接用当前人格回复。"
+                            )
                     if self.reminder:
                         system_prompts.append(self.reminder)
                     messages = self.context_mgr.build_messages(
@@ -848,9 +858,11 @@ class Main(Star):
                     event.get_sender_name(),
                 )
                 image_urls = req.image_urls
-                active_tool_set = (
-                    req.func_tool if req.func_tool is not None else tool_set
-                )
+                active_tool_set = req.func_tool if req.func_tool is not None else tool_set
+                maid_tool = self.context.get_llm_tool_manager().get_func("call_maid")
+                if maid_tool is not None and getattr(maid_tool, "active", True):
+                    active_tool_set = ToolSet()
+                    active_tool_set.add_tool(maid_tool)
 
                 tool_calls: tuple | None = None
                 stripper = ThinkStripper()
