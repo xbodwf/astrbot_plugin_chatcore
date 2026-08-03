@@ -68,6 +68,11 @@ HISTORY_SUMMARY_PROMPT = (
 # 模型声明"需要工具"的标记行（AI 在回复开头独占一行输出）。
 _TOOLS_REQUEST_MARK = "[[tools]]"
 _MESSAGE_TAG_RE = re.compile(r"</?message\b[^>]*>", re.IGNORECASE)
+_TEXT_TOOL_USE_RE = re.compile(
+    r'<tool_use>\s*\{"tool_name"\s*:\s*"([^"\n]+)"\s*,\s*'
+    r'"parameters"\s*:\s*(\{.*?\})\s*\}\s*</tool_use>',
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _clean_model_segment(text: str) -> str:
@@ -890,9 +895,27 @@ class Main(Star):
                     nonlocal t_first_send, reply_decision_task, tools_requested
                     nonlocal reply_decision_started
                     nonlocal reply_decision
+                    nonlocal tool_calls
                     segment = _clean_model_segment(segment)
                     if not segment:
                         return
+                    tool_match = _TEXT_TOOL_USE_RE.search(segment)
+                    if tool_match and tool_set:
+                        try:
+                            tool_name = tool_match.group(1).strip()
+                            tool_args = json.loads(tool_match.group(2))
+                            if not isinstance(tool_args, dict):
+                                raise ValueError("parameters must be an object")
+                            tool_calls = (
+                                [tool_name],
+                                [tool_args],
+                                [f"text-tool-{time.time_ns()}"],
+                            )
+                            tools_requested = True
+                            return
+                        except (json.JSONDecodeError, ValueError) as exc:
+                            self.logger.warning(f"ChatCore: invalid text tool call: {exc}")
+                            return
                     if reply_decision_task and reply_decision_task.done():
                         try:
                             reply_decision = reply_decision_task.result()
@@ -1146,7 +1169,8 @@ class Main(Star):
                 "不要把工具名称、JSON 参数或调用过程写成普通文本。工具调用完成后，"
                 "再用自然语言回复用户；不需要工具时直接聊天。旧版兼容标记 "
                 + _TOOLS_REQUEST_MARK
-                + " 如出现也必须独占一行，但通常不需要输出它。"
+                + " 如出现也必须独占一行，但通常不需要输出它。禁止输出 `<tool_use>`、"
+                "工具名称或 JSON 参数作为普通文本。"
             )
         if self.emoji_store:
             rules += "⑥ 想发表情包时写 `[[emoji:意图]]`（如 `[[emoji:嘲讽]]`）。"
