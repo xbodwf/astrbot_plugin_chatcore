@@ -33,7 +33,7 @@ from astrbot.core.platform.message_type import MessageType
 from astrbot.core.star.star_handler import EventType, star_handlers_registry
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
-from .actions import parse_actions
+from .actions import parse_actions, parse_reply_decision
 from .affinity import AffinityManager
 from .attention import AttentionManager
 from .context import ContextManager
@@ -187,6 +187,22 @@ class Main(Star):
             self.context,
             summary_cfg.get("provider_id", "") or self.chat_provider_id,
         )
+        decision_cfg = providers.get("reply_decision", {})
+        self.reply_decision_enabled = bool(decision_cfg.get("enabled", True))
+        self.reply_decision_timeout = max(
+            1.0, float(decision_cfg.get("timeout_seconds", 8))
+        )
+        self.reply_decision_prompt = str(decision_cfg.get("prompt", "")).strip() or (
+            "你是群聊回复装饰判断器。根据聊天记录和机器人刚生成的首段回复，"
+            "判断这条回复是否需要引用或@某位用户。只输出 JSON，不要输出解释："
+            '{"reply":"昵称或空字符串","at":"昵称或空字符串"}。'
+            "只有确实应当回复某人时才填写 reply；只有确实应当提醒某人时才填写 at。"
+        )
+        self.reply_decision_client = None
+        if self.reply_decision_enabled and decision_cfg.get("provider_id"):
+            self.reply_decision_client = LLMProvider(
+                self.context, decision_cfg["provider_id"]
+            )
 
         attn = config.get("attention", {})
         self.attention = AttentionManager(
@@ -457,18 +473,20 @@ class Main(Star):
                 self._collect_emoji(conv_id, event, images, text),
             )
 
+        task = self.active_tasks.get(conv_id)
+        if task:
+            # A running reply must observe every message that arrives while it
+            # is generating, even when the new message would miss attention's
+            # normal reply-probability check. The stream stops at the current
+            # segment boundary and rebuilds context with this message included.
+            task.enqueue(text, msg_id)
+            event.stop_event()
+            return
+
         takeover = chat_cfg.get("takeover", True)
         if not should_reply:
             if takeover:
                 event.stop_event()
-            return
-
-        task = self.active_tasks.get(conv_id)
-        if task:
-            # Smart debounce: queue the new message; the running stream will
-            # finish its current sentence and restart with the new context.
-            task.enqueue(text, msg_id)
-            event.stop_event()
             return
 
         task = GenerationTask(conv_id, msg_id)
@@ -687,6 +705,9 @@ class Main(Star):
             t_round_start = time.monotonic()
             t_first_token: float | None = None
             t_first_send: float | None = None
+            reply_decision_task: asyncio.Task | None = None
+            reply_decision: dict[str, str] = {}
+            reply_decision_started = False
             while True:
                 if not tool_round:
                     t_ctx_start = time.monotonic()
@@ -791,14 +812,29 @@ class Main(Star):
                 image_urls = []
 
                 async def send_fn(segment: str) -> None:
-                    nonlocal tools_requested, t_first_send
+                    nonlocal tools_requested, t_first_send, reply_decision_task
+                    nonlocal reply_decision_started
+                    nonlocal reply_decision
+                    if reply_decision_task and reply_decision_task.done():
+                        try:
+                            reply_decision = reply_decision_task.result()
+                        except Exception as exc:
+                            self.logger.warning(
+                                f"ChatCore reply decision failed: {exc}"
+                            )
+                        reply_decision_task = None
                     if t_first_send is None:
                         t_first_send = time.monotonic()
                     # 无工具轮中模型声明需要工具: 丢弃该段，下一轮带工具重试。
                     if not tools_armed and _TOOLS_REQUEST_MARK in segment:
                         tools_requested = True
                         return
-                    chain = await self._decorate_segment(event, segment)
+                    if reply_decision:
+                        chain = await self._decorate_segment(
+                            event, segment, default_actions=reply_decision
+                        )
+                    else:
+                        chain = await self._decorate_segment(event, segment)
                     if not chain:
                         return
                     if not task.suppress_record:
@@ -810,6 +846,13 @@ class Main(Star):
                         conv_id,
                         MessageChain(chain=chain),
                     )
+                    if not reply_decision_started and getattr(
+                        self, "reply_decision_client", None
+                    ):
+                        reply_decision_started = True
+                        reply_decision_task = asyncio.create_task(
+                            self._resolve_reply_decision(event, conv_id, segment)
+                        )
 
                 pending = await stream_respond(
                     stream_gen(),
@@ -911,7 +954,19 @@ class Main(Star):
                 if trailing:
                     # Deliver the finished current sentence; on recall it is
                     # sent but not recorded so it stops polluting the context.
-                    chain = await self._decorate_segment(event, trailing)
+                    if reply_decision_task and reply_decision_task.done():
+                        try:
+                            reply_decision = reply_decision_task.result()
+                        except Exception as exc:
+                            self.logger.warning(
+                                f"ChatCore reply decision failed: {exc}"
+                            )
+                    if reply_decision:
+                        chain = await self._decorate_segment(
+                            event, trailing, default_actions=reply_decision
+                        )
+                    else:
+                        chain = await self._decorate_segment(event, trailing)
                     if chain:
                         if not cancelled:
                             self.context_mgr.record(
@@ -1439,7 +1494,57 @@ class Main(Star):
             return ""
         return str((persona or {}).get("prompt", "")).strip()
 
-    def _segment_to_chain(self, conv_id: str, segment: str) -> list:
+    async def _resolve_reply_decision(
+        self,
+        event: AstrMessageEvent,
+        conv_id: str,
+        first_segment: str,
+    ) -> dict[str, str]:
+        """Ask the optional delayed model for automatic reply/@ defaults.
+
+        Args:
+            event: The triggering message event.
+            conv_id: Conversation identifier.
+            first_segment: The first generated segment.
+
+        Returns:
+            Parsed automatic action targets, or an empty dict on failure.
+        """
+        reply_decision_client = getattr(self, "reply_decision_client", None)
+        if not reply_decision_client:
+            return {}
+        transcript = self.context_mgr.summary_text(conv_id, max_chars=6000)
+        prompt = (
+            f"{self.reply_decision_prompt}\n\n"
+            "聊天记录（包含生成期间已经到达的新消息）：\n"
+            f"{transcript}\n\n"
+            f"机器人刚生成的首段：\n{first_segment}"
+        )
+        try:
+            response = await asyncio.wait_for(
+                reply_decision_client.chat(
+                    [
+                        {"role": "system", "content": self.reply_decision_prompt},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.0,
+                ),
+                timeout=self.reply_decision_timeout,
+            )
+            decision = parse_reply_decision(response)
+            if decision:
+                self.logger.info(f"ChatCore reply decision | {conv_id} | {decision}")
+            return decision
+        except Exception as exc:
+            self.logger.warning(f"ChatCore reply decision unavailable: {exc}")
+            return {}
+
+    def _segment_to_chain(
+        self,
+        conv_id: str,
+        segment: str,
+        default_actions: dict[str, str] | None = None,
+    ) -> list:
         """Convert a segment to a message chain, resolving action markers.
 
         Args:
@@ -1452,7 +1557,25 @@ class Main(Star):
         if not self.markers_enabled:
             return [Plain(segment)]
         chain: list = []
-        for kind, value in parse_actions(segment):
+        tokens = parse_actions(segment)
+        explicit_kinds = {kind for kind, _ in tokens if kind in ("at", "reply")}
+        for kind, value in (
+            (
+                [("reply", default_actions["reply"])]
+                if default_actions
+                and default_actions.get("reply")
+                and "reply" not in explicit_kinds
+                else []
+            )
+            + (
+                [("at", default_actions["at"])]
+                if default_actions
+                and default_actions.get("at")
+                and "at" not in explicit_kinds
+                else []
+            )
+            + tokens
+        ):
             if kind == "text":
                 if value:
                     chain.append(Plain(value))
@@ -1473,7 +1596,12 @@ class Main(Star):
                 break
         return chain
 
-    async def _segment_with_emoji(self, event: AstrMessageEvent, segment: str) -> list:
+    async def _segment_with_emoji(
+        self,
+        event: AstrMessageEvent,
+        segment: str,
+        default_actions: dict[str, str] | None = None,
+    ) -> list:
         """Build a segment's message chain, resolving emoji markers.
 
         ``[[emoji:意图或编号]]`` markers are removed from the text; each is
@@ -1495,7 +1623,7 @@ class Main(Star):
             return ""
 
         clean = re.sub(r"\[\[emoji:([^\]]+)\]\]", _extract, segment)
-        chain = self._segment_to_chain(event.unified_msg_origin, clean)
+        chain = self._segment_to_chain(event.unified_msg_origin, clean, default_actions)
         if emoji_queries and self.emoji_store:
             for query in emoji_queries:
                 emoji_id = await self._resolve_emoji_query(
@@ -1512,7 +1640,12 @@ class Main(Star):
                 self.logger.info(f"ChatCore send emoji | {emoji_id} | query={query}")
         return chain
 
-    async def _decorate_segment(self, event: AstrMessageEvent, segment: str) -> list:
+    async def _decorate_segment(
+        self,
+        event: AstrMessageEvent,
+        segment: str,
+        default_actions: dict[str, str] | None = None,
+    ) -> list:
         """Replay AstrBot's pre-send decoration hooks on one streamed segment.
 
         ChatCore bypasses the vanilla pipeline, so the
@@ -1532,7 +1665,7 @@ class Main(Star):
         Returns:
             The final message chain to send, or an empty list when suppressed.
         """
-        chain = await self._segment_with_emoji(event, segment)
+        chain = await self._segment_with_emoji(event, segment, default_actions)
         result = MessageEventResult(chain=chain)
         result.set_result_content_type(ResultContentType.STREAMING_FINISH)
         event.set_result(result)

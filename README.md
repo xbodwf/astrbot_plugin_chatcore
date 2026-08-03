@@ -93,6 +93,8 @@
 | `chat.multimodal` | `false` | 聊天模型是否原生支持识图；开启后图片直接传给聊天模型 |
 | `vision.provider_id` | 空 | 识图模型（需支持视觉输入），留空复用聊天模型 |
 | `summary.provider_id` | 空 | 上下文压缩摘要专用模型，留空复用聊天模型 |
+| `reply_decision.provider_id` | 空 | 首段生成后异步判断自动 reply/@ 的模型，留空关闭 |
+| `reply_decision.timeout_seconds` | `8` | 延迟判断最长等待时间，不阻塞首段发送 |
 | `embedding.provider_id` | 空 | Embedding 提供商 ID，用于全局记忆向量检索 |
 
 ### memory — 全局记忆与自我学习

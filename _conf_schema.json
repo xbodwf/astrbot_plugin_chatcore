@@ -341,6 +341,37 @@
           }
         }
       },
+      "reply_decision": {
+        "description": "延迟回复装饰判断模型",
+        "type": "object",
+        "items": {
+          "enabled": {
+            "description": "启用延迟判断",
+            "type": "bool",
+            "default": true,
+            "hint": "首段生成后异步判断是否自动添加 reply/@；未配置 provider_id 时不生效"
+          },
+          "provider_id": {
+            "description": "延迟判断模型提供商",
+            "type": "string",
+            "default": "",
+            "_special": "select_provider",
+            "hint": "留空则不进行自动 reply/@ 判断"
+          },
+          "timeout_seconds": {
+            "description": "判断超时(秒)",
+            "type": "float",
+            "default": 8,
+            "hint": "超过该时间则放弃自动装饰，不影响正常回复"
+          },
+          "prompt": {
+            "description": "判断模型提示词",
+            "type": "text",
+            "default": "",
+            "hint": "要求模型只返回 JSON：{\"reply\":\"昵称或空字符串\",\"at\":\"昵称或空字符串\"}"
+          }
+        }
+      },
       "embedding": {
         "description": "嵌入模型",
         "type": "object",

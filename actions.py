@@ -10,11 +10,38 @@ testable in isolation.
 
 from __future__ import annotations
 
+import json
 import re
 
 _MARKER_RE = re.compile(r"\[\[(at|reply):([^\]]+)\]\]|\[@([^:\]]+):[^\]]*\]")
 
 Token = tuple[str, str]
+
+
+def parse_reply_decision(text: str) -> dict[str, str]:
+    """Parse the small JSON response returned by the reply decision model.
+
+    Args:
+        text: Model output containing a JSON object.
+
+    Returns:
+        A dict containing optional ``reply`` and ``at`` display names.
+    """
+    match = re.search(r"\{.*\}", text or "", re.DOTALL)
+    if not match:
+        return {}
+    try:
+        data = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    result: dict[str, str] = {}
+    for key in ("reply", "at"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            result[key] = value.strip()
+    return result
 
 
 def parse_actions(text: str) -> list[Token]:
