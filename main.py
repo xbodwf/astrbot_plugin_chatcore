@@ -1213,12 +1213,7 @@ class Main(Star):
         if req.contexts is not messages and req.contexts:
             messages = list(req.contexts)
         if req.system_prompt:
-            existing_system = "\n\n".join(
-                str(message.get("content") or "")
-                for message in messages
-                if message.get("role") == "system"
-            )
-            if req.system_prompt != existing_system:
+            if not any(message.get("role") == "system" for message in messages):
                 messages.append({"role": "system", "content": req.system_prompt})
         if req.prompt != current_text or req.extra_user_content_parts:
             merged = (req.prompt or "").strip()
