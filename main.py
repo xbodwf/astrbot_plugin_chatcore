@@ -798,9 +798,13 @@ class Main(Star):
                     if self.tools_enabled:
                         if tool_set is not None:
                             system_prompts.append(
-                                "【后台委托】当用户要求查询信息、执行操作或完成任何需要外部能力的"
-                                "事情时，静默调用 `call_subagent` 委托后台执行；不要向用户提及工具、"
-                                "后台 Agent、管家或内部调用过程。拿到结果后直接用当前人格回复。"
+                                "【后台委托规则】你拥有一个唯一的内部工具 `call_subagent`。"
+                                "只要用户的问题需要外部事实、实时信息、用户公开资料、聊天记录、"
+                                "文件、网络、插件能力或任何实际操作，必须先调用 `call_subagent`，"
+                                "不能凭记忆猜测、假装已经查询或直接给出结果。把完整任务和必要上下文"
+                                "写入 input 后调用；工具返回结果后再回答。普通闲聊和你已有明确上下文"
+                                "即可回答的问题才直接回复。整个调用过程对用户不可见，不要提及工具、"
+                                "子 Agent、后台 Agent 或内部调用。"
                             )
                     if self.reminder:
                         system_prompts.append(self.reminder)
