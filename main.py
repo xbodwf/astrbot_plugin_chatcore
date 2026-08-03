@@ -832,6 +832,9 @@ class Main(Star):
                     system_prompt="\n\n".join(system_prompts),
                     extra_user_content_parts=[],
                 )
+                # Keep the request available for plugins that continue work
+                # from the normal after-message-sent hook (maid_agent).
+                event.set_extra("provider_request", req)
                 prev_result = event.get_result()
                 was_stopped = event.is_stopped()
                 try:
@@ -1122,6 +1125,15 @@ class Main(Star):
                 )
             if self.emotion_mgr and first_text:
                 self.emotion_mgr.update_after_reply(conv_id, first_text)
+            try:
+                await asyncio.wait_for(
+                    call_event_hook(event, EventType.OnAfterMessageSentEvent),
+                    timeout=5,
+                )
+            except asyncio.TimeoutError:
+                self.logger.warning("ChatCore: OnAfterMessageSentEvent hook timed out")
+            except Exception as exc:
+                self.logger.warning(f"ChatCore: after-message hook failed: {exc}")
         except asyncio.CancelledError:
             # The generation was interrupted mid-reply (plugin reload, cancel).
             # Mark the conversation so the next turn can offer to continue.
