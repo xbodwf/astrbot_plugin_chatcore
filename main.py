@@ -852,6 +852,7 @@ class Main(Star):
                         messages,
                         images=image_urls,
                         func_tool=(tool_set if (tool_round or tools_armed) else None),
+                        log_name="chat",
                     ):
                         if resp.is_chunk:
                             text = self.chat_client._to_text(resp)
@@ -1596,6 +1597,7 @@ class Main(Star):
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.0,
+                    log_name="reply_decision",
                 ),
                 timeout=self.reply_decision_timeout,
             )
@@ -1782,7 +1784,7 @@ class Main(Star):
             if not url:
                 continue
             try:
-                descriptions.append(await model.describe_image(url))
+                descriptions.append(await model.describe_image(url, log_name="vision"))
             except Exception as e:
                 self.logger.warning(f"Image description failed: {e}")
         return descriptions
@@ -2088,6 +2090,7 @@ class Main(Star):
                     },
                 ],
                 temperature=0.0,
+                log_name="emoji_selection",
             )
         except Exception as e:
             self.logger.warning(f"Emoji pick failed: {e}")
@@ -2133,6 +2136,7 @@ class Main(Star):
             summary = await self.summary_client.chat(
                 [{"role": "user", "content": HISTORY_SUMMARY_PROMPT + payload}],
                 temperature=0.3,
+                log_name="summary",
             )
             summary = summary.strip()
             if summary:
@@ -2369,6 +2373,7 @@ class Main(Star):
                         },
                     ],
                     temperature=0.0,
+                    log_name="implicit",
                 )
             except Exception as e:
                 self.logger.warning(f"Implicit analysis call failed: {e}")

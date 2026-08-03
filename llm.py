@@ -13,6 +13,8 @@ from astrbot.api.star import Context
 from astrbot.core.provider.entities import LLMResponse
 from astrbot.core.provider.provider import EmbeddingProvider
 
+from .request_log import write_latest
+
 _VISION_PROMPT = "请用一两句话简洁描述这张图片的内容。"
 
 _THINK_OPEN = "<think>"
@@ -159,6 +161,7 @@ class LLMProvider:
         temperature: float = 0.8,
         images: list[str] | None = None,
         func_tool=None,
+        log_name: str = "chat",
     ) -> str:
         """Get a full (non-streaming) chat completion text.
 
@@ -172,6 +175,16 @@ class LLMProvider:
             The assistant's reply text.
         """
         provider = await self._get()
+        write_latest(
+            log_name,
+            {
+                "provider_id": self.provider_id,
+                "messages": messages,
+                "temperature": temperature,
+                "images": images or [],
+                "func_tool": repr(func_tool) if func_tool is not None else None,
+            },
+        )
         resp = await provider.text_chat(
             contexts=messages,
             image_urls=images or None,
@@ -224,6 +237,7 @@ class LLMProvider:
         temperature: float = 0.8,
         images: list[str] | None = None,
         func_tool=None,
+        log_name: str = "chat",
     ) -> AsyncGenerator[LLMResponse, None]:
         """Stream raw LLM responses (chunks and the final completion).
 
@@ -241,6 +255,16 @@ class LLMProvider:
             Every LLMResponse, chunks included.
         """
         provider = await self._get()
+        write_latest(
+            log_name,
+            {
+                "provider_id": self.provider_id,
+                "messages": messages,
+                "temperature": temperature,
+                "images": images or [],
+                "func_tool": repr(func_tool) if func_tool is not None else None,
+            },
+        )
         async for resp in provider.text_chat_stream(
             contexts=messages,
             image_urls=images or None,
@@ -249,7 +273,7 @@ class LLMProvider:
         ):
             yield resp
 
-    async def describe_image(self, image_url: str) -> str:
+    async def describe_image(self, image_url: str, *, log_name: str = "vision") -> str:
         """Describe a single image with the vision provider.
 
         Args:
@@ -259,7 +283,12 @@ class LLMProvider:
             A short text description of the image.
         """
         messages = [{"role": "user", "content": _VISION_PROMPT}]
-        return await self.chat(messages, temperature=0.0, images=[image_url])
+        return await self.chat(
+            messages,
+            temperature=0.0,
+            images=[image_url],
+            log_name=log_name,
+        )
 
 
 class EmbeddingAdapter:

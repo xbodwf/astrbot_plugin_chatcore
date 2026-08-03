@@ -190,6 +190,7 @@ class ExpressionStore:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.3,
+                log_name="expression",
             )
         except Exception:
             return False

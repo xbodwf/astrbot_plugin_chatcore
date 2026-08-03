@@ -463,6 +463,7 @@ async def classify_emoji(
                 {"role": "user", "content": prompt},
             ],
             temperature=0.0,
+            log_name="emoji_analysis",
         )
     except Exception:
         return "", []

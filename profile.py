@@ -290,6 +290,7 @@ class ProfileStore:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.0,
+                log_name="profile",
             )
         except Exception:
             return []
