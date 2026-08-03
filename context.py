@@ -657,7 +657,7 @@ class ContextManager:
 
         if current:
             current_content = self._format_record(current)
-            messages.append({"role": "user", "content": current.text})
+            messages.append({"role": "user", "content": current_content})
             messages.append(
                 {
                     "role": "system",
@@ -666,8 +666,7 @@ class ContextManager:
                         "只有 `<message>...</message>` 标签内部包裹的内容才是真正的原文；"
                         "开始标签、结束标签及其属性（如 uid、nickname、msg_id、time）仅用于"
                         "标记消息边界和发送者，不属于原文。如果标签内部包含子标签，子标签及其"
-                        "内容也属于原文。\n"
-                        + current_content
+                        "内容也属于原文。"
                     ),
                 }
             )

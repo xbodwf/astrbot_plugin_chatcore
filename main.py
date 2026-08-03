@@ -1212,9 +1212,9 @@ class Main(Star):
         """
         if req.contexts is not messages and req.contexts:
             messages = list(req.contexts)
-        if req.system_prompt:
-            if not any(message.get("role") == "system" for message in messages):
-                messages.append({"role": "system", "content": req.system_prompt})
+        # ``messages`` already contains the ordered system blocks. The hook's
+        # flattened ``system_prompt`` is only a legacy view and must not be
+        # appended, or it duplicates the persona/rules after the current user.
         if req.prompt != current_text or req.extra_user_content_parts:
             merged = (req.prompt or "").strip()
             for part in req.extra_user_content_parts:
@@ -1231,7 +1231,10 @@ class Main(Star):
             if current_text and current_text in merged:
                 for i in range(len(messages) - 1, -1, -1):
                     if messages[i].get("role") == "user":
-                        messages[i]["content"] = merged
+                        # Keep the XML envelope attached to the current user
+                        # message; hooks must not replace it with bare text.
+                        if "<message " not in str(messages[i].get("content") or ""):
+                            messages[i]["content"] = merged
                         return messages
             messages.append({"role": "user", "content": merged})
         return messages
