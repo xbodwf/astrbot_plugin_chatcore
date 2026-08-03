@@ -861,6 +861,23 @@ class Main(Star):
                 )
                 image_urls = req.image_urls
                 active_tool_set = tool_set
+                if active_tool_set:
+                    write_latest(
+                        "toolcall",
+                        {
+                            "provider_id": self.chat_client.provider_id,
+                            "messages": messages,
+                            "tool_schema": [
+                                {
+                                    "name": tool.name,
+                                    "description": tool.description,
+                                    "parameters": tool.parameters,
+                                }
+                                for tool in active_tool_set.tools
+                            ],
+                            "subagent": True,
+                        },
+                    )
 
                 tool_calls: tuple | None = None
                 stripper = ThinkStripper()
