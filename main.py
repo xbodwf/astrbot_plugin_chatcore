@@ -219,9 +219,9 @@ class Main(Star):
         self._tool_set: ToolSet | None = None
 
         vision_cfg = providers.get("vision", {})
-        self.vision_client = LLMProvider(
-            self.context,
-            vision_cfg.get("provider_id", "") or self.chat_provider_id,
+        vision_provider_id = str(vision_cfg.get("provider_id", "")).strip()
+        self.vision_client = (
+            LLMProvider(self.context, vision_provider_id) if vision_provider_id else None
         )
 
         summary_cfg = providers.get("summary", {})
@@ -1783,9 +1783,9 @@ class Main(Star):
     async def _describe_images(self, images: list[Image]) -> list[str]:
         """Describe attached images.
 
-        Uses the multimodal chat model itself when available (it reads the
-        image and returns a description marker), otherwise falls back to the
-        dedicated vision model.
+        Uses only the explicitly configured vision provider. The chat model may
+        read an image in the current request, but it must not be used to create
+        persistent descriptions for later requests.
 
         Args:
             images: Image components of the triggering message.
@@ -1795,7 +1795,7 @@ class Main(Star):
         """
         if not images:
             return []
-        model = self.chat_client if self.chat_multimodal else self.vision_client
+        model = self.vision_client
         if not model:
             return []
         descriptions: list[str] = []
