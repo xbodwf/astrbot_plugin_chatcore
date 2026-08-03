@@ -7,6 +7,9 @@ provider id through the provider manager at call time.
 """
 
 from collections.abc import AsyncGenerator
+import base64
+import mimetypes
+from pathlib import Path
 
 from astrbot.api.provider import Provider
 from astrbot.api.star import Context
@@ -282,11 +285,19 @@ class LLMProvider:
         Returns:
             A short text description of the image.
         """
+        image_input = image_url
+        image_path = Path(image_url)
+        if image_path.is_file():
+            mime_type = mimetypes.guess_type(image_path.name)[0] or "image/jpeg"
+            image_input = (
+                f"data:{mime_type};base64,"
+                + base64.b64encode(image_path.read_bytes()).decode("ascii")
+            )
         messages = [{"role": "user", "content": _VISION_PROMPT}]
         return await self.chat(
             messages,
             temperature=0.0,
-            images=[image_url],
+            images=[image_input],
             log_name=log_name,
         )
 

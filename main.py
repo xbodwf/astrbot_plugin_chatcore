@@ -223,6 +223,9 @@ class Main(Star):
         self.vision_client = (
             LLMProvider(self.context, vision_provider_id) if vision_provider_id else None
         )
+        if self.vision_client is None and self.chat_multimodal:
+            # Reuse the chat model for a one-off description before persistence.
+            self.vision_client = self.chat_client
 
         summary_cfg = providers.get("summary", {})
         self.summary_client = LLMProvider(
