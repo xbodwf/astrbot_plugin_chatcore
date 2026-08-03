@@ -889,6 +889,25 @@ class Main(Star):
                                 resp.tools_call_args,
                                 resp.tools_call_ids,
                             )
+                            write_latest(
+                                "toolcall",
+                                {
+                                    "provider_id": self.chat_client.provider_id,
+                                    "messages": messages,
+                                    "tool_calls": [
+                                        {
+                                            "name": name,
+                                            "arguments": args,
+                                            "id": call_id,
+                                        }
+                                        for name, args, call_id in zip(
+                                            resp.tools_call_name,
+                                            resp.tools_call_args,
+                                            resp.tools_call_ids,
+                                        )
+                                    ],
+                                },
+                            )
 
                 image_urls = []
 
