@@ -594,26 +594,6 @@ class ContextManager:
         recent = records[-self.recent_count :]
         older = records[: -self.recent_count]
 
-        conversation: list[str] = []
-        has_self_marker = False
-        for record in recent:
-            content = self._format_record(record)
-            if record.role == "assistant" and not has_self_marker:
-                content = (
-                    '<!-- <message from="yourself"/> 表明这条消息由你发送。 -->\n'
-                    + content
-                )
-                has_self_marker = True
-            conversation.append(content)
-
-        if conversation:
-            messages.append(
-                {
-                    "role": "system",
-                    "content": "【近期聊天记录】\n" + "\n".join(conversation),
-                }
-            )
-
         for block in history_texts or []:
             if block:
                 messages.append({"role": "system", "content": block})
@@ -655,9 +635,30 @@ class ContextManager:
                         }
                     )
 
+        conversation: list[str] = []
+        has_self_marker = False
+        for record in recent:
+            content = self._format_record(record)
+            if record.role == "assistant" and not has_self_marker:
+                content = (
+                    '<!-- <message from="yourself"/> 表明这条消息由你发送。 -->\n'
+                    + content
+                )
+                has_self_marker = True
+            conversation.append(content)
+
+        if conversation:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "【近期聊天记录】\n" + "\n".join(conversation),
+                }
+            )
+
         if current:
             current_content = self._format_record(current)
-            messages.append({"role": "user", "content": current_content})
+            messages.append({"role": "user", "content": current.text})
+            messages.append({"role": "system", "content": current_content})
 
         return messages
 
