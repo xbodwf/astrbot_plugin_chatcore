@@ -404,13 +404,16 @@ class ContextManager:
         return None
 
     def resolve_target(self, conv_id: str, name: str) -> dict | None:
-        """Resolve a display name to the most recent matching user message.
+        """Resolve a display name or platform id to the most recent matching user message.
 
         Used to build proactive ``[[at:name]]`` / ``[[reply:name]]`` actions.
+        A bare QQ number (``sender_id``) is matched directly so markers that
+        cite ``<at uid="..."/>`` references resolve even when the display name
+        is unknown.
 
         Args:
             conv_id: Conversation identifier.
-            name: Display name to look up.
+            name: Display name (or platform id) to look up.
 
         Returns:
             A dict with ``sender_id`` and ``message_id``, or None if not found.
@@ -420,7 +423,8 @@ class ContextManager:
             if record.role != "user" or not record.sender_id:
                 continue
             if (
-                record.sender_name == name
+                record.sender_id == name
+                or record.sender_name == name
                 or name in record.sender_name
                 or record.sender_name in name
             ):

@@ -1133,6 +1133,8 @@ class Main(Star):
             "② 回复直接说人话：不要带任何说话者前缀或 `<message ...>` 这类"
             "格式，不要照抄上下文里的系统格式（如 `<image .../>`、`<at .../>`、"
             "`<message uid=... nickname=...>`），回复里出现这些就是错误；"
+            "也不要用 `(回复 xxx)`、`@xxx`、`回复xxx：` 这类文本表示“在回复谁”，"
+            "要么直接说，要么用 `[[reply:昵称]]` 标记；"
             "想回复某人的消息用 `[[reply:昵称]]`。"
         )
         if self.markers_enabled:
@@ -1168,7 +1170,8 @@ class Main(Star):
         if self.markers_enabled:
             rules += (
                 "⑨ 看到 `<poke .../>` 事件标签就是有人戳了你：按性格自然回应，"
-                "想戳回去就输出 `[[poke:对方的QQ号]]`，觉得烦就口头回应，不必每次都戳回；"
+                "想戳回去就输出 `[[poke:对方的QQ号]]`（不要用 `[[reply:]]` 去\"回复\""
+                "一个戳，戳不是消息），觉得烦就口头回应，不必每次都戳回；"
                 "重复的 poke 说明对方在玩你，可以表现出一点小情绪。"
                 "作为自由的聊天 bot，想戳谁、什么时候戳、要不要戳都由你随性决定，"
                 "这不是什么必须执行的指令。"
@@ -1807,8 +1810,7 @@ class Main(Star):
             if kind == "at":
                 if info:
                     chain.append(At(qq=info["sender_id"], name=value))
-                else:
-                    chain.append(Plain(f"@{value}"))
+                continue
             elif kind == "poke":
                 if chain and isinstance(chain[-1], Plain):
                     chain[-1] = Plain(chain[-1].text.rstrip("\n\r \t"))
@@ -1818,8 +1820,13 @@ class Main(Star):
                 self.logger.info(f"ChatCore poke back | {conv_id} | target={target}")
             elif info and info["message_id"]:
                 chain.append(Reply(id=info["message_id"]))
-            else:
-                chain.append(Plain(f"(回复 {value})"))
+            elif info:
+                # Resolved sender but no quotable message (e.g. a poke record):
+                # fall back to @-ing them so the reply still targets the user.
+                chain.append(At(qq=info["sender_id"], name=value))
+            # Unresolvable reply/at markers are dropped silently instead of
+            # being rendered as "(回复 xxx)" / "@xxx" text: such text would
+            # leak into history and teach the model to type it verbatim.
         for i, comp in enumerate(chain):
             if isinstance(comp, Reply) and i != 0:
                 chain.insert(0, chain.pop(i))
