@@ -2004,6 +2004,10 @@ class Main(Star):
             elif isinstance(comp, Image):
                 parts.append("<image/>")
         return parts
+
+    def _extract_quote_chain(
+        self, conv_id: str, components: list, max_depth: int = 15
+    ) -> str:
         """Extract quoted-message content so the AI can read what was referenced.
 
         The adapter already resolves the directly quoted message into the
