@@ -71,6 +71,8 @@ HISTORY_SUMMARY_PROMPT = (
 # 模型声明"需要工具"的标记行（AI 在回复开头独占一行输出）。
 _TOOLS_REQUEST_MARK = "[[tools]]"
 
+_EMOJI_SEARCH_RE = re.compile(r"\[\[search_emoji:([^\]]+)\]\]")
+
 
 def _tool_intent_hint(text: str) -> bool:
     """Detect high-confidence requests that need an external tool.
@@ -301,15 +303,18 @@ class Main(Star):
         self.memory_top_k = memory_cfg.get("max_recall", 5)
         self.memory = None
         emb_cfg = providers.get("embedding", {})
-        if memory_cfg.get("enabled", True) and emb_cfg.get("provider_id"):
+        self._embed_fn = None
+        if emb_cfg.get("provider_id"):
             embed_adapter = EmbeddingAdapter(self.context, emb_cfg["provider_id"])
+            self._embed_fn = embed_adapter.embed
+        if memory_cfg.get("enabled", True) and self._embed_fn:
             path = (
                 Path(get_astrbot_plugin_data_path())
                 / "astrbot_plugin_chatcore"
                 / "memory.json"
             )
             self.memory = MemoryStore(
-                embed_adapter.embed,
+                self._embed_fn,
                 path,
                 max_entries=max(1, int(memory_cfg.get("max_entries", 10000))),
                 min_score=float(memory_cfg.get("min_score", 0.4)),
@@ -377,6 +382,7 @@ class Main(Star):
                 emoji_root / "images",
                 emoji_root / "index.json",
                 max_entries=int(emoji_cfg.get("max_entries", 500)),
+                embed_fn=self._embed_fn,
             )
             if emoji_cfg.get("vision_provider_id"):
                 self.emoji_vision_client = LLMProvider(
@@ -861,6 +867,7 @@ class Main(Star):
 
                 tool_calls: tuple | None = None
                 stripper = ThinkStripper()
+                emoji_search_query: str = ""
 
                 async def stream_gen():
                     nonlocal tool_calls, t_first_token
@@ -891,6 +898,7 @@ class Main(Star):
                     nonlocal t_first_send, reply_decision_task, tools_requested
                     nonlocal reply_decision_started
                     nonlocal reply_decision
+                    nonlocal emoji_search_query
                     if reply_decision_task and reply_decision_task.done():
                         try:
                             reply_decision = reply_decision_task.result()
@@ -906,6 +914,30 @@ class Main(Star):
                         tools_requested = True
                         if not segment:
                             return
+                    search = _EMOJI_SEARCH_RE.search(segment)
+                    if search and self.emoji_store:
+                        # The model asked to look up an emoji by intent:
+                        # strip the marker, remember the query, and interrupt
+                        # the stream so the search results (with ids) can be
+                        # fed back for the model to pick from.
+                        emoji_search_query = search.group(1).strip()
+                        segment = _EMOJI_SEARCH_RE.sub("", segment).strip()
+                        if segment:
+                            self.context_mgr.record(
+                                conv_id, "assistant", "bot", segment
+                            )
+                            self.logger.info(
+                                f"ChatCore send | {conv_id} | bot: {segment}"
+                            )
+                            self._last_reply[conv_id] = (segment, time.time())
+                            chain = await self._decorate_segment(event, segment)
+                            if chain:
+                                await self.context.send_message(
+                                    conv_id,
+                                    MessageChain(chain=chain),
+                                )
+                        task.request_cancel()
+                        return
                     if reply_decision:
                         chain = await self._decorate_segment(
                             event, segment, default_actions=reply_decision
@@ -1060,6 +1092,31 @@ class Main(Star):
                             MessageChain(chain=chain),
                         )
                 if cancelled:
+                    if emoji_search_query:
+                        # The model requested an emoji lookup: search the
+                        # store and feed the candidates (with ids) back into
+                        # the messages so the model can pick one, then resume
+                        # generation. Any debounced new message rides along.
+                        emoji_search_query, query = "", emoji_search_query
+                        candidates = await self.emoji_store.search(query, top_k=3)
+                        if candidates:
+                            current_text = next_text or current_text
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        f"【表情包搜索结果】针对「{query}」找到以下候选，"
+                                        "请从中选择最合适的一个，在回复中单独一段输出"
+                                        " `[[emoji:编号]]`（编号即 emoji_id）；都不合适就"
+                                        "直接忽略，不用表情包。\n"
+                                        + self.emoji_store.render_candidates(candidates)
+                                    ),
+                                }
+                            )
+                            tool_round = True
+                            tool_rounds += 1
+                            task.suppress_record = False
+                            continue
                     # The triggering message was recalled: stop after the
                     # current segment instead of restarting.
                     break
@@ -2338,7 +2395,7 @@ class Main(Star):
             context_window,
         )
         if category or tags:
-            self.emoji_store.set_meta(emoji_id, category, tags)
+            await self.emoji_store.set_meta(emoji_id, category, tags)
 
     async def _resolve_emoji_query(self, conv_id: str, query: str) -> str | None:
         """Resolve an emoji intent or id to a concrete emoji id.
@@ -2360,7 +2417,7 @@ class Main(Star):
         query = query.strip()
         if self.emoji_store.get(query):
             return query
-        records = self.emoji_store.search(query, top_k=3)
+        records = await self.emoji_store.search(query, top_k=3)
         if not records:
             return None
         if len(records) == 1:

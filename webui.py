@@ -211,7 +211,7 @@ class ChatCoreWebUI:
         tags = payload.get("tags", [])
         if not isinstance(tags, list):
             tags = []
-        store.set_meta(str(emoji_id), category, [str(t) for t in tags])
+        await store.set_meta(str(emoji_id), category, [str(t) for t in tags])
         return json_response({"updated": emoji_id})
 
     async def import_emoji(self) -> dict:
@@ -260,7 +260,7 @@ class ChatCoreWebUI:
                     "",
                 )
                 if category or tags:
-                    store.set_meta(emoji_id, category, tags)
+                    await store.set_meta(emoji_id, category, tags)
         except Exception as e:
             return error_response(f"import failed: {e}", status_code=500)
         finally:

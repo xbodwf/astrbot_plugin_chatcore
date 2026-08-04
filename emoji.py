@@ -32,12 +32,16 @@ class EmojiStore:
 
     The image files live under ``data_dir`` and the metadata index under
     ``index_path``. Each record carries the full source context so the AI can
-    read what an emoji originally meant before using it.
+    read what an emoji originally meant before using it. When an embedding
+    function is supplied, records are also embedded (category + tags + source
+    text/context) and searches rank by cosine similarity, falling back to
+    keyword matching for records without embeddings.
 
     Args:
         data_dir: Directory holding the emoji image files.
         index_path: Path of the JSON metadata index.
         max_entries: Maximum number of stored emoji (oldest evicted).
+        embed_fn: Async callable embedding text into a vector, or None.
     """
 
     def __init__(
@@ -45,10 +49,12 @@ class EmojiStore:
         data_dir: str | Path,
         index_path: str | Path,
         max_entries: int = 500,
+        embed_fn=None,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.index_path = Path(index_path)
         self.max_entries = max_entries
+        self.embed_fn = embed_fn
         self._records: dict[str, dict] = {}
         self._load()
 
@@ -239,8 +245,12 @@ class EmojiStore:
         self._save()
         return emoji_id
 
-    def set_meta(self, emoji_id: str, category: str, tags: list[str]) -> None:
+    async def set_meta(self, emoji_id: str, category: str, tags: list[str]) -> None:
         """Set an emoji's category and tags after classification.
+
+        When an embedding function is configured the record's semantic
+        signature is (re)embedded from its category/tags/source text, so later
+        searches rank by meaning rather than raw keywords.
 
         Args:
             emoji_id: The emoji id.
@@ -259,10 +269,37 @@ class EmojiStore:
                 if t not in seen:
                     seen.append(t)
             record["tags"] = seen[:12]
+        if self.embed_fn:
+            try:
+                record["embedding"] = await self.embed_fn(self._embed_text(record))
+            except Exception:
+                record.pop("embedding", None)
         self._save()
 
-    def search(self, query: str, top_k: int = 3) -> list[dict]:
+    def _embed_text(self, record: dict) -> str:
+        """Build the semantic signature text of a record for embedding.
+
+        Args:
+            record: The emoji record.
+
+        Returns:
+            A concatenated text of category, tags and source context.
+        """
+        return " ".join(
+            [
+                record.get("category", ""),
+                " ".join(record.get("tags", [])),
+                record.get("source_text", ""),
+                record.get("source_context", ""),
+            ]
+        ).strip()
+
+    async def search(self, query: str, top_k: int = 3) -> list[dict]:
         """Search emoji by intent across category, tags and source text.
+
+        When record embeddings are available the query is embedded and ranked
+        by cosine similarity; otherwise a keyword token-match fallback is
+        used. Records with embeddings always outrank keyword-only matches.
 
         Args:
             query: The AI's intent text.
@@ -273,15 +310,38 @@ class EmojiStore:
         """
         if not self._records:
             return []
-        q = (query or "").strip().lower()
+        q = (query or "").strip()
         if not q:
             return sorted(
                 self._records.values(),
                 key=lambda r: r.get("usage_count", 0),
                 reverse=True,
             )[:top_k]
+        records = list(self._records.values())
+        embedded = [r for r in records if r.get("embedding")]
+        if embedded and self.embed_fn:
+            try:
+                q_vec = await self.embed_fn(q)
+                scored = []
+                for record in embedded:
+                    score = self._cosine(q_vec, record["embedding"])
+                    if score > 0:
+                        scored.append((score, record))
+                scored.sort(key=lambda item: item[0], reverse=True)
+                top = [record for _, record in scored[:top_k]]
+                if len(top) < top_k:
+                    for record in records:
+                        if record in top:
+                            continue
+                        top.append(record)
+                        if len(top) >= top_k:
+                            break
+                return top
+            except Exception:
+                pass
+        ql = q.lower()
         scored = []
-        for record in self._records.values():
+        for record in records:
             haystack = " ".join(
                 [
                     record.get("category", ""),
@@ -290,11 +350,31 @@ class EmojiStore:
                     record.get("source_context", ""),
                 ]
             ).lower()
-            score = sum(1 for token in q.split() if token in haystack)
+            score = sum(1 for token in ql.split() if token in haystack)
             if score:
                 scored.append((score, record))
         scored.sort(key=lambda item: item[0], reverse=True)
         return [record for _, record in scored[:top_k]]
+
+    @staticmethod
+    def _cosine(a: list[float], b: list[float]) -> float:
+        """Cosine similarity between two vectors.
+
+        Args:
+            a: First vector.
+            b: Second vector.
+
+        Returns:
+            Similarity in ``[0, 1]`` (0 on dimension mismatch).
+        """
+        if not a or not b or len(a) != len(b):
+            return 0.0
+        dot = sum(x * y for x, y in zip(a, b))
+        norm_a = sum(x * x for x in a) ** 0.5
+        norm_b = sum(y * y for y in b) ** 0.5
+        if not norm_a or not norm_b:
+            return 0.0
+        return dot / (norm_a * norm_b)
 
     def get(self, emoji_id: str) -> dict | None:
         """Get a single record.
