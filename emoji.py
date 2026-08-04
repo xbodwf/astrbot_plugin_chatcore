@@ -9,6 +9,7 @@ that source context. When the AI wants to send an emoji it searches by intent,
 reads each candidate's original context, and only then picks one.
 """
 
+import asyncio
 import json
 import os
 import shutil
@@ -271,7 +272,10 @@ class EmojiStore:
             record["tags"] = seen[:12]
         if self.embed_fn:
             try:
-                record["embedding"] = await self.embed_fn(self._embed_text(record))
+                vector = self.embed_fn(self._embed_text(record))
+                if asyncio.iscoroutine(vector):
+                    vector = await vector
+                record["embedding"] = vector
             except Exception:
                 record.pop("embedding", None)
         self._save()
@@ -294,6 +298,36 @@ class EmojiStore:
             ]
         ).strip()
 
+    async def _backfill_embeddings(self) -> None:
+        """Embed records that predate the vector index (lazy migration).
+
+        Old records saved before the embedding feature exist without an
+        ``embedding`` field. Computing them on first search migrates the whole
+        library in place; after that the index is saved once.
+
+        Returns:
+            None.
+        """
+        missing = [
+            record
+            for record in self._records.values()
+            if not record.get("embedding")
+        ]
+        if not missing:
+            return
+        changed = False
+        for record in missing:
+            try:
+                vector = self.embed_fn(self._embed_text(record))
+                if asyncio.iscoroutine(vector):
+                    vector = await vector
+                record["embedding"] = vector
+                changed = True
+            except Exception:
+                record.pop("embedding", None)
+        if changed:
+            self._save()
+
     async def search(self, query: str, top_k: int = 3) -> list[dict]:
         """Search emoji by intent across category, tags and source text.
 
@@ -310,6 +344,8 @@ class EmojiStore:
         """
         if not self._records:
             return []
+        if self.embed_fn:
+            await self._backfill_embeddings()
         q = (query or "").strip()
         if not q:
             return sorted(
@@ -321,7 +357,10 @@ class EmojiStore:
         embedded = [r for r in records if r.get("embedding")]
         if embedded and self.embed_fn:
             try:
-                q_vec = await self.embed_fn(q)
+                vector = self.embed_fn(q)
+                if asyncio.iscoroutine(vector):
+                    vector = await vector
+                q_vec = vector
                 scored = []
                 for record in embedded:
                     score = self._cosine(q_vec, record["embedding"])
