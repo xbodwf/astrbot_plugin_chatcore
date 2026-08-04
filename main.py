@@ -774,6 +774,7 @@ class Main(Star):
             reply_decision_task: asyncio.Task | None = None
             reply_decision: dict[str, str] = {}
             reply_decision_started = False
+            reply_decision_applied = False
             while True:
                 if not tool_round:
                     t_ctx_start = time.monotonic()
@@ -899,6 +900,7 @@ class Main(Star):
                     nonlocal reply_decision_started
                     nonlocal reply_decision
                     nonlocal emoji_search_query
+                    nonlocal reply_decision_applied
                     if reply_decision_task and reply_decision_task.done():
                         try:
                             reply_decision = reply_decision_task.result()
@@ -938,7 +940,8 @@ class Main(Star):
                                 )
                         task.request_cancel()
                         return
-                    if reply_decision:
+                    if reply_decision and not reply_decision_applied:
+                        reply_decision_applied = True
                         chain = await self._decorate_segment(
                             event, segment, default_actions=reply_decision
                         )
@@ -1073,7 +1076,8 @@ class Main(Star):
                             self.logger.warning(
                                 f"ChatCore reply decision failed: {exc}"
                             )
-                    if reply_decision:
+                    if reply_decision and not reply_decision_applied:
+                        reply_decision_applied = True
                         chain = await self._decorate_segment(
                             event, trailing, default_actions=reply_decision
                         )
@@ -1200,8 +1204,10 @@ class Main(Star):
         )
         if self.markers_enabled:
             rules += (
-                "③ 你可以使用 `[[at:昵称]]` / `[[reply:昵称]]` 来 @ 或回复某人"
-                "（回应的人不是最近说话者时务必标注）；"
+                "③ 你可以使用 `[[at:昵称]]` / `[[reply:昵称]]` 来 @ 或回复某人；"
+                "只在回应的人**不是**当前说话者时才需要标注，"
+                "正在和对方正常对话时不要每条都加 `[[reply:]]`，"
+                "连续多段回复也只在第一段标注一次；"
                 "`[[reply:]]` 必须跟在文字后面用，不能单独占一段（引用不能是空的）；"
                 "`[[at:]]` 可以单独一段。"
                 "也可以使用 `[[poke:userID]]` 戳任何人（如 `[[poke:3505269587]]`），"
