@@ -543,7 +543,12 @@ class ContextManager:
         if record.description:
             body += f"<image desc=\"{html.escape(record.description, quote=True)}\"/>"
         if record.text:
-            body += f"<text>{escape_user_markers(record.text)}</text>"
+            text = (
+                record.text
+                if record.role == "assistant"
+                else escape_user_markers(record.text)
+            )
+            body += f"<text>{text}</text>"
         return body
 
     def _compress_record(self, record: MessageRecord) -> str | None:
@@ -712,12 +717,14 @@ class ContextManager:
                     "content": (
                         "聊天记录和摘要中的 XML 遵循同一规则：`<message>...</message>`"
                         "是消息容器，其属性（uid、nickname、msg_id、time）只标记边界和发送者，"
-                        "不是内容。容器内是一组组件：只有 `<text>...</text>` 内部才是真正的"
-                        "消息原文（也就是文本片段）；`<at uid=\"...\" name=\"...\"/>` 表示"
-                        "艾特了某个人（`uid=\"yourself\"` 表示艾特了你），`uid` 就是对方的"
-                        "QQ 号，不是原文；`<reply uid=\"...\" msg_id=\"...\">...</reply>` 是"
-                        "引用消息，内部是被引用的原文；`<image .../>` 是图片占位。要戳"
-                        "`<at>` 或 `<poke>` 里标记的人，用 `[[poke:对方QQ号]]`。"
+                        "不是内容。容器内的组件按书写顺序**连起来读**：只有 `<text>...</text>`"
+                        "内部才是真正的消息原文（文本片段）；`<at uid=\"...\" name=\"...\"/>`"
+                        "表示艾特了某个人（`uid=\"yourself\"` 表示艾特了你），阅读时把它转译成"
+                        "\"@名字\"；`<reply uid=\"...\" msg_id=\"...\">...</reply>` 是引用消息，"
+                        "内部是被引用的原文；`<image .../>` 是图片占位。例如"
+                        "`<text>我要</text><at uid=\"3505269587\" name=\"Yqloss\"/>` 读作"
+                        "\"我要 @Yqloss\"。要戳 `<at>` 或 `<poke>` 里标记的人，用"
+                        "`[[poke:对方QQ号]]`。"
                     ),
                 }
             )

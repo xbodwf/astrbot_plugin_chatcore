@@ -157,15 +157,18 @@ def render_history_block(
     if not messages:
         return ""
     recent = messages[-max_messages:]
-    lines = [
-        (
-            f'<message uid="unknown" nickname="用户">{escape_user_markers(clean_placeholder_text(m["content"]))}</message>'
-            if m["role"] == "user"
-            else '<!-- <message from="yourself"/> 表明这条消息由你发送。 -->\n'
-            f'<message from="yourself">{escape_user_markers(clean_placeholder_text(m["content"]))}</message>'
-        )
-        for m in recent
-    ]
+    lines = []
+    for m in recent:
+        content = clean_placeholder_text(m["content"])
+        if m["role"] == "user":
+            lines.append(
+                f'<message uid="unknown" nickname="用户">{escape_user_markers(content)}</message>'
+            )
+        else:
+            lines.append(
+                '<!-- <message from="yourself"/> 表明这条消息由你发送。 -->\n'
+                f"<message from=\"yourself\">{content}</message>"
+            )
     block = "\n".join(lines)
     if len(block) > max_chars:
         block = block[-max_chars:]
