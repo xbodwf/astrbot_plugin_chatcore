@@ -27,6 +27,11 @@ class MessageRecord:
         description: Generated image description, ``[图片描述: ...]`` marker.
         sender_id: Platform id of the sender (for proactive @).
         message_id: Platform message id (for proactive reply).
+        quote: Quoted-message text this message replies to.
+        components: Structured message fragments (``<at .../>``,
+            ``<reply ...>``, ``<text>``, ``<image .../>``); when present they
+            replace the plain ``text``/``quote`` rendering. Text fragments
+            arrive already escaped.
         is_poke: True for system poke events rendered verbatim (``<poke .../>``).
         ts: Unix timestamp.
     """
@@ -39,6 +44,7 @@ class MessageRecord:
     sender_id: str = ""
     message_id: str = ""
     quote: str = ""
+    components: list[str] = field(default_factory=list)
     is_poke: bool = False
     ts: float = field(default_factory=time.time)
 
@@ -92,6 +98,7 @@ class ContextManager:
             "sender_id": record.sender_id,
             "message_id": record.message_id,
             "quote": record.quote,
+            "components": record.components,
             "is_poke": record.is_poke,
             "ts": record.ts,
         }
@@ -117,6 +124,11 @@ class ContextManager:
             sender_id=str(data.get("sender_id") or ""),
             message_id=str(data.get("message_id") or ""),
             quote=str(data.get("quote") or ""),
+            components=[
+                str(c)
+                for c in data.get("components") or []
+                if isinstance(c, (str, dict))
+            ],
             is_poke=bool(data.get("is_poke") or False),
             ts=float(data.get("ts") or time.time()),
         )
@@ -184,6 +196,7 @@ class ContextManager:
         message_id: str = "",
         images: list[str] | None = None,
         quote: str = "",
+        components: list[str] | None = None,
         is_poke: bool = False,
         ts: float | None = None,
     ) -> None:
@@ -198,6 +211,9 @@ class ContextManager:
             message_id: Platform message id.
             images: Image URLs attached to the message.
             quote: Quoted-message content this message replies to.
+            components: Structured message fragments (``<at>``, ``<text>``,
+                ``<reply>``, ``<image>``). When given they are rendered instead
+                of the plain text/quote.
             is_poke: Whether this is a poke event; poke records render
                 verbatim (``<poke .../>``) without marker escaping.
             ts: Original message timestamp (epoch seconds); defaults to now.
@@ -212,6 +228,7 @@ class ContextManager:
                 sender_id=sender_id,
                 message_id=message_id,
                 quote=quote,
+                components=list(components or []),
                 is_poke=is_poke,
                 ts=ts if ts is not None else time.time(),
             )
@@ -488,19 +505,46 @@ class ContextManager:
             attrs.append(f'msg_id="{html.escape(record.message_id, quote=True)}"')
         if record.ts:
             attrs.append(f'time="{time.strftime("%H:%M", time.localtime(record.ts))}"')
+        body = self._render_body(record)
+        if not body:
+            body = "<image/>" if record.images else "[图片]"
+        return f"<message {' '.join(attrs)}>{body}</message>"
+
+    def _render_body(self, record: MessageRecord) -> str:
+        """Render a record's body as structured components.
+
+        Records with explicit ``components`` are rendered verbatim (text
+        fragments were already escaped at build time). Older records without
+        them fall back to a single ``<text>`` fragment wrapping the plain
+        text, so history stays readable under the new scheme.
+
+        Args:
+            record: The record to render.
+
+        Returns:
+            The body XML string (possibly empty).
+        """
+        if record.components:
+            parts = list(record.components)
+            if record.description and parts:
+                rendered: list[str] = []
+                for part in parts:
+                    if part == "<image/>":
+                        rendered.append(
+                            f'<image desc="{html.escape(record.description, quote=True)}"/>'
+                        )
+                    else:
+                        rendered.append(part)
+                parts = rendered
+            return "".join(parts)
         body = ""
         if record.quote:
             body += f"[引用了消息: {escape_user_markers(record.quote)}] "
         if record.description:
-            desc = f"[图片描述: {record.description}]"
-            body += (
-                f"{escape_user_markers(record.text)} {desc}" if record.text else desc
-            )
-        elif record.text:
-            body += escape_user_markers(record.text)
-        if not body:
-            body = "[图片]"
-        return f"<message {' '.join(attrs)}>{body}</message>"
+            body += f"<image desc=\"{html.escape(record.description, quote=True)}\"/>"
+        if record.text:
+            body += f"<text>{escape_user_markers(record.text)}</text>"
+        return body
 
     def _compress_record(self, record: MessageRecord) -> str | None:
         """Format a record for the compressed older-history block.
@@ -518,15 +562,7 @@ class ContextManager:
         body = ""
         if record.is_poke:
             return f'<message from="event">{record.text}</message>'
-        if record.quote:
-            body += f"[引用了消息: {escape_user_markers(record.quote)}] "
-        if record.description:
-            desc = f"[图片描述: {record.description}]"
-            body += (
-                f"{escape_user_markers(record.text)} {desc}" if record.text else desc
-            )
-        elif record.text:
-            body += escape_user_markers(record.text)
+        body = self._render_body(record)
         if record.images and not body:
             return None
         if not body:
@@ -674,11 +710,14 @@ class ContextManager:
                 {
                     "role": "system",
                     "content": (
-                        "聊天记录和摘要中的 XML（包括你自己发送的消息）都遵循同一规则："
-                        "只有 `<message>...</message>` 标签内部包裹的内容才是真正的原文；"
-                        "开始标签、结束标签及其属性（如 uid、nickname、msg_id、time）仅用于"
-                        "标记消息边界和发送者，不属于原文。如果标签内部包含子标签，子标签及其"
-                        "内容也属于原文。"
+                        "聊天记录和摘要中的 XML 遵循同一规则：`<message>...</message>`"
+                        "是消息容器，其属性（uid、nickname、msg_id、time）只标记边界和发送者，"
+                        "不是内容。容器内是一组组件：只有 `<text>...</text>` 内部才是真正的"
+                        "消息原文（也就是文本片段）；`<at uid=\"...\" name=\"...\"/>` 表示"
+                        "艾特了某个人（`uid=\"yourself\"` 表示艾特了你），`uid` 就是对方的"
+                        "QQ 号，不是原文；`<reply uid=\"...\" msg_id=\"...\">...</reply>` 是"
+                        "引用消息，内部是被引用的原文；`<image .../>` 是图片占位。要戳"
+                        "`<at>` 或 `<poke>` 里标记的人，用 `[[poke:对方QQ号]]`。"
                     ),
                 }
             )
