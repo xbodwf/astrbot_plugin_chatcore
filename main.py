@@ -1835,6 +1835,11 @@ class Main(Star):
             if isinstance(comp, Reply) and i != 0:
                 chain.insert(0, chain.pop(i))
                 break
+        if not any(isinstance(comp, Plain) for comp in chain):
+            # A Reply must ride along with text; a bare reply segment (the AI
+            # putting [[reply:xxx]] on its own line) would send an empty quote.
+            # At/Poke alone are fine, so only drop the Reply components.
+            chain = [comp for comp in chain if not isinstance(comp, Reply)]
         return chain
 
     def _split_poke_chain(self, chain: list) -> tuple[list, list]:
