@@ -919,10 +919,14 @@ class Main(Star):
                         self._schedule_summary(conv_id)
                     self.logger.info(f"ChatCore send | {conv_id} | bot: {segment}")
                     self._last_reply[conv_id] = (segment, time.time())
-                    await self.context.send_message(
-                        conv_id,
-                        MessageChain(chain=chain),
-                    )
+                    poke_chain, chain = self._split_poke_chain(chain)
+                    if chain:
+                        await self.context.send_message(
+                            conv_id,
+                            MessageChain(chain=chain),
+                        )
+                    if poke_chain:
+                        await self._send_poke_actions(event, poke_chain)
                     if not reply_decision_started and getattr(
                         self, "reply_decision_client", None
                     ):
@@ -1832,6 +1836,56 @@ class Main(Star):
                 chain.insert(0, chain.pop(i))
                 break
         return chain
+
+    def _split_poke_chain(self, chain: list) -> tuple[list, list]:
+        """Separate Poke components from the sendable message chain.
+
+        Pokes are sent as dedicated OneBot actions (``group_poke`` /
+        ``friend_poke``) rather than message segments, so they must not ride
+        along in ``send_group_msg``.
+
+        Args:
+            chain: The decorated message chain.
+
+        Returns:
+            ``(poke_components, remaining_chain)``.
+        """
+        pokes = [comp for comp in chain if isinstance(comp, Poke)]
+        rest = [comp for comp in chain if not isinstance(comp, Poke)]
+        return pokes, rest
+
+    async def _send_poke_actions(
+        self, event: AstrMessageEvent, pokes: list
+    ) -> None:
+        """Send poke components as dedicated OneBot actions.
+
+        OneBot V11 (NapCat) exposes pokes as ``group_poke`` / ``friend_poke``
+        actions instead of message segments. Each poke targets the id captured
+        in ``_segment_to_chain``.
+
+        Args:
+            event: The message event driving this conversation.
+            pokes: Poke components to fire.
+        """
+        bot = getattr(event, "bot", None)
+        if bot is None or not pokes:
+            return
+        group_id = event.get_group_id()
+        for poke in pokes:
+            target = poke.target_id()
+            if not target:
+                continue
+            try:
+                if group_id:
+                    await bot.call_action(
+                        "group_poke",
+                        group_id=int(group_id),
+                        user_id=int(target),
+                    )
+                else:
+                    await bot.call_action("friend_poke", user_id=int(target))
+            except Exception as e:
+                self.logger.warning(f"ChatCore poke action failed: {e}")
 
     async def _segment_with_emoji(
         self,
