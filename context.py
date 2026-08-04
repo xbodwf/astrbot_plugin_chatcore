@@ -27,6 +27,7 @@ class MessageRecord:
         description: Generated image description, ``[图片描述: ...]`` marker.
         sender_id: Platform id of the sender (for proactive @).
         message_id: Platform message id (for proactive reply).
+        is_poke: True for system poke events rendered verbatim (``<poke .../>``).
         ts: Unix timestamp.
     """
 
@@ -38,6 +39,7 @@ class MessageRecord:
     sender_id: str = ""
     message_id: str = ""
     quote: str = ""
+    is_poke: bool = False
     ts: float = field(default_factory=time.time)
 
 
@@ -90,6 +92,7 @@ class ContextManager:
             "sender_id": record.sender_id,
             "message_id": record.message_id,
             "quote": record.quote,
+            "is_poke": record.is_poke,
             "ts": record.ts,
         }
 
@@ -114,6 +117,7 @@ class ContextManager:
             sender_id=str(data.get("sender_id") or ""),
             message_id=str(data.get("message_id") or ""),
             quote=str(data.get("quote") or ""),
+            is_poke=bool(data.get("is_poke") or False),
             ts=float(data.get("ts") or time.time()),
         )
 
@@ -180,6 +184,7 @@ class ContextManager:
         message_id: str = "",
         images: list[str] | None = None,
         quote: str = "",
+        is_poke: bool = False,
         ts: float | None = None,
     ) -> None:
         """Append a message to a conversation, trimming the oldest.
@@ -193,6 +198,8 @@ class ContextManager:
             message_id: Platform message id.
             images: Image URLs attached to the message.
             quote: Quoted-message content this message replies to.
+            is_poke: Whether this is a poke event; poke records render
+                verbatim (``<poke .../>``) without marker escaping.
             ts: Original message timestamp (epoch seconds); defaults to now.
         """
         history = self._history(conv_id)
@@ -205,6 +212,7 @@ class ContextManager:
                 sender_id=sender_id,
                 message_id=message_id,
                 quote=quote,
+                is_poke=is_poke,
                 ts=ts if ts is not None else time.time(),
             )
         )
@@ -467,6 +475,8 @@ class ContextManager:
         return name
 
     def _format_record(self, record: MessageRecord) -> str:
+        if record.is_poke:
+            return f'<message from="event">{record.text}</message>'
         if record.role == "assistant":
             attrs = ['from="yourself"']
         else:
@@ -506,6 +516,8 @@ class ContextManager:
             The compressed line, or None to skip this record.
         """
         body = ""
+        if record.is_poke:
+            return f'<message from="event">{record.text}</message>'
         if record.quote:
             body += f"[引用了消息: {escape_user_markers(record.quote)}] "
         if record.description:

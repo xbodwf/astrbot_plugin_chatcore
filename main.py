@@ -17,7 +17,7 @@ from typing import Any
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import At, File, Image, Plain, Reply
+from astrbot.api.message_components import At, File, Image, Plain, Poke, Reply
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.agent.run_context import ContextWrapper
@@ -585,7 +585,7 @@ class Main(Star):
             return
         sender_id = str(raw.get("user_id") or "")
         sender_name = event.get_sender_name() or (sender_id or "有人")
-        poke_text = f"（{sender_name} 戳了戳你）"
+        poke_text = f'<poke source="{sender_id}" srcUName="{sender_name}" to="yourself"/>'
         self.context_mgr.record(
             conv_id,
             "user",
@@ -593,6 +593,7 @@ class Main(Star):
             poke_text,
             sender_id=sender_id,
             message_id="",
+            is_poke=True,
         )
         if self.affinity_mgr and sender_id:
             self.affinity_mgr.interact(sender_id, 2.0)
@@ -779,7 +780,7 @@ class Main(Star):
                             "除非对方明确追问，不要重复类似的话；回应新消息要说新内容。"
                         ]
                     system_prompt = await self._build_system_prompt(
-                        conv_id, event.get_sender_id()
+                        conv_id, event.get_sender_id(), event
                     )
                     if self.tools_enabled and tool_set:
                         tool_index = ", ".join(
@@ -1081,16 +1082,26 @@ class Main(Star):
         finally:
             self.active_tasks.pop(conv_id, None)
 
-    async def _build_system_prompt(self, conv_id: str, sender_id: str = "") -> str:
+    async def _build_system_prompt(
+        self,
+        conv_id: str,
+        sender_id: str = "",
+        event: AstrMessageEvent | None = None,
+    ) -> str:
         """Build the system prompt for a conversation.
 
         The persona (人格) is taken from AstrBot's own persona manager, so it
         follows the persona the user selected in AstrBot settings. The
-        segmentation and action-marker rules are appended on top.
+        segmentation and action-marker rules are appended on top. When a
+        OneBot event is available the current speaker's public profile is
+        injected alongside the affinity note, so the model does not need to
+        look the speaker up with a tool.
 
         Args:
             conv_id: Conversation identifier (unified_msg_origin).
             sender_id: Sender's platform id, used for the affinity note.
+            event: The triggering event, used to fetch the speaker's public
+                profile on OneBot adapters.
 
         Returns:
             The full system prompt.
@@ -1123,6 +1134,9 @@ class Main(Star):
             rules += (
                 "③ 想 @ 或回复某人时写 `[[at:昵称]]` / `[[reply:昵称]]`"
                 "（回应的人不是最近说话者时务必标注）；"
+                "想戳某人时写 `[[poke:对方QQ号]]`，想戳自己用 `[[poke:yourself]]`，"
+                "但有 98% 的情况下不要戳自己，这很奇怪；poke 标记必须单独占一行"
+                "或单独一个分段，一段内只能有一个 poke；"
                 "想原样输出这类标记时前面加 `" + self.segment_escape + "`。"
             )
         if self.tools_enabled:
@@ -1146,6 +1160,12 @@ class Main(Star):
             "别写得像作文；按你的性格自然流露语气和口癖，偶尔带点小吐槽。"
             "宁可短，不要长。"
         )
+        if self.markers_enabled:
+            rules += (
+                "⑨ 看到 `<poke .../>` 事件标签就是有人戳了你：按性格自然回应，"
+                "想戳回去就输出 `[[poke:对方的QQ号]]`，觉得烦就口头回应，不必每次都戳回；"
+                "重复的 poke 说明对方在玩你，可以表现出一点小情绪。"
+            )
         style = (
             self.expression_store.render(
                 conv_id,
@@ -1169,7 +1189,88 @@ class Main(Star):
             rules += self.emotion_mgr.inject_text(conv_id)
         if self.affinity_mgr and sender_id:
             rules += self.affinity_mgr.inject_text(sender_id)
+        if sender_id and event is not None:
+            info_text = await self._fetch_public_info(event, sender_id)
+            if info_text:
+                rules += (
+                    "\n\n【对方公开信息】以下是当前对话对象已提供的公开资料，"
+                    "不需要再调用任何工具去查他/她：\n" + info_text
+                )
         return persona + rules
+
+    async def _fetch_public_info(
+        self, event: AstrMessageEvent, user_id: str
+    ) -> str:
+        """Fetch a user's public profile and render it as a compact block.
+
+        Uses the OneBot adapter's ``get_stranger_info`` when available; any
+        failure returns an empty string so the model just proceeds without it.
+
+        Args:
+            event: The triggering message event.
+            user_id: Target platform user id.
+
+        Returns:
+            A short text block, or "" when unavailable.
+        """
+        bot = getattr(event, "bot", None)
+        if bot is None or not user_id:
+            return ""
+        try:
+            info = await bot.get_stranger_info(user_id=int(user_id))
+        except Exception as e:
+            self.logger.debug(f"ChatCore public info unavailable: {e}")
+            return ""
+        if not isinstance(info, dict):
+            return ""
+        parts: list[str] = []
+        label_map = {
+            "nickname": "昵称",
+            "sex": "性别",
+            "age": "年龄",
+            "level": "等级",
+            "login_days": "登录天数",
+        }
+        for key, label in label_map.items():
+            value = info.get(key)
+            if value is None or value == "" or value == 0:
+                continue
+            parts.append(f"{label}: {value}")
+        return "、".join(parts) if parts else ""
+
+    async def _public_info_tool_handler(
+        self, event: AstrMessageEvent, target_id: str
+    ) -> dict:
+        """Handler for the ``get_user_public_info`` observation tool.
+
+        Args:
+            event: The message event driving the tool call.
+            target_id: The target user's QQ number.
+
+        Returns:
+            A dict of public profile fields (nickname, sex, age, ...).
+        """
+        if not target_id:
+            return {"error": "没有提供目标 QQ 号"}
+        bot = getattr(event, "bot", None)
+        if bot is None:
+            return {"error": "当前平台不支持查询用户公开信息"}
+        try:
+            info = await bot.get_stranger_info(user_id=int(target_id))
+        except Exception as e:
+            self.logger.warning(f"ChatCore public info tool failed: {e}")
+            return {"error": f"获取用户公开信息失败: {e}"}
+        if not isinstance(info, dict):
+            return {"error": "获取用户公开信息失败"}
+        return {
+            "nickname": info.get("nickname", "未知"),
+            "sex": info.get("sex", "未知"),
+            "age": info.get("age", 0),
+            "level": info.get("level", 0),
+            "login_days": info.get("login_days", 0),
+            "status": "success",
+            "notice": "仅昵称和性别可作为可靠参考，其他字段可能为默认值或不可用。",
+        }
 
     def _merge_llm_request(
         self,
@@ -1232,8 +1333,9 @@ class Main(Star):
         """Build the ToolSet from AstrBot's registered tools, once.
 
         Includes all plugin-registered tools (``llm_tools.func_list``) plus
-        AstrBot's built-in future-task tool. None when tools are disabled or
-        nothing is registered.
+        AstrBot's built-in future-task tool and ChatCore's own
+        ``get_user_public_info`` observation tool. None when tools are
+        disabled or nothing is registered.
 
         Returns:
             The ToolSet, or None when there are no tools.
@@ -1252,6 +1354,27 @@ class Main(Star):
                 ts.add_tool(tool)
             ts.add_tool(
                 self.context.get_llm_tool_manager().get_builtin_tool(FutureTaskTool)
+            )
+            ts.add_tool(
+                FunctionTool(
+                    name="get_user_public_info",
+                    description=(
+                        "获取指定 QQ 用户的公开信息（昵称、性别、年龄、等级等）。"
+                        "当你不知道对话对象是谁、想了解某个成员，或对方聊到别人时需要"
+                        "参考背景信息时调用；传入目标 QQ 号即可。仅昵称和性别是可靠字段。"
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "target_id": {
+                                "type": "string",
+                                "description": "目标用户的 QQ 号。",
+                            }
+                        },
+                        "required": ["target_id"],
+                    },
+                    handler=self._public_info_tool_handler,
+                )
             )
             ts.add_tool(
                 FunctionTool(
@@ -1624,21 +1747,31 @@ class Main(Star):
         conv_id: str,
         segment: str,
         default_actions: dict[str, str] | None = None,
+        self_id: str = "",
     ) -> list:
         """Convert a segment to a message chain, resolving action markers.
+
+        ``[[poke:userId]]`` becomes a ``Poke`` component targeting that user;
+        ``[[poke:yourself]]`` targets the bot itself (``self_id``). A poke
+        marker is meant to stand alone on its own line/segment, so any
+        surrounding whitespace-only runs are dropped instead of leaving stray
+        blank lines in the text.
 
         Args:
             conv_id: Conversation identifier.
             segment: The generated segment text.
+            default_actions: Reply/at defaults for this segment.
+            self_id: The bot's own platform id, used for ``[[poke:yourself]]``.
 
         Returns:
-            A list of message components (Plain / At / Reply).
+            A list of message components (Plain / At / Reply / Poke).
         """
         if not self.markers_enabled:
             return [Plain(segment)]
         chain: list = []
         tokens = parse_actions(segment)
         explicit_kinds = {kind for kind, _ in tokens if kind in ("at", "reply")}
+        pending_poke = False
         for kind, value in (
             (
                 [("reply", default_actions["reply"])]
@@ -1657,6 +1790,9 @@ class Main(Star):
             + tokens
         ):
             if kind == "text":
+                if pending_poke:
+                    value = value.lstrip("\n\r \t")
+                    pending_poke = False
                 if value:
                     chain.append(Plain(value))
                 continue
@@ -1666,6 +1802,13 @@ class Main(Star):
                     chain.append(At(qq=info["sender_id"], name=value))
                 else:
                     chain.append(Plain(f"@{value}"))
+            elif kind == "poke":
+                if chain and isinstance(chain[-1], Plain):
+                    chain[-1] = Plain(chain[-1].text.rstrip("\n\r \t"))
+                target = self_id if value.strip().lower() == "yourself" else value.strip()
+                chain.append(Poke(id=target))
+                pending_poke = True
+                self.logger.info(f"ChatCore poke back | {conv_id} | target={target}")
             elif info and info["message_id"]:
                 chain.append(Reply(id=info["message_id"]))
             else:
@@ -1703,7 +1846,12 @@ class Main(Star):
             return ""
 
         clean = re.sub(r"\[\[emoji:([^\]]+)\]\]", _extract, segment)
-        chain = self._segment_to_chain(event.unified_msg_origin, clean, default_actions)
+        chain = self._segment_to_chain(
+            event.unified_msg_origin,
+            clean,
+            default_actions,
+            self_id=str(event.get_self_id() or ""),
+        )
         if emoji_queries and self.emoji_store:
             for query in emoji_queries:
                 emoji_id = await self._resolve_emoji_query(

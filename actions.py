@@ -4,6 +4,10 @@ The AI can reply to or @ specific people by emitting markers inside a segment,
 e.g. ``[[reply:小明]]这是对你的回复 [[at:小红]]一起来聊。`` Markers are
 resolved against the recent conversation by display name.
 
+``[[poke:userId]]`` is a poke marker: it must stand alone on its own line or
+segment (only one per segment) and is rendered as a real poke action, never as
+text.
+
 Keeping this module free of AstrBot imports makes the parsing logic unit
 testable in isolation.
 """
@@ -13,7 +17,9 @@ from __future__ import annotations
 import json
 import re
 
-_MARKER_RE = re.compile(r"\[\[(at|reply):([^\]]+)\]\]|\[@([^:\]]+):[^\]]*\]")
+_MARKER_RE = re.compile(
+    r"\[\[(at|reply|poke):([^\]]+)\]\]|\[@([^:\]]+):[^\]]*\]"
+)
 
 Token = tuple[str, str]
 
@@ -51,6 +57,9 @@ def parse_actions(text: str) -> list[Token]:
     ``[@昵称: ...]`` legacy shape is also treated as a reply so models that
     picked it up from context still trigger a real quote.
 
+    ``[[poke:userId]]`` marks a poke: the value is a raw platform user id (or
+    ``yourself`` for the bot itself), never a display name.
+
     A marker prefixed with ``\\`` is escaped and stays literal text (the
     backslash is dropped), so the AI can talk about the syntax itself, e.g.
     ``\\[[at:小明]]`` renders as the plain text ``[[at:小明]]``.
@@ -60,7 +69,7 @@ def parse_actions(text: str) -> list[Token]:
 
     Returns:
         A list of ``("text", content)`` / ``("at", name)`` /
-        ``("reply", name)`` tokens in order.
+        ``("reply", name)`` / ``("poke", userId)`` tokens in order.
     """
     tokens: list[Token] = []
     pos = 0
