@@ -7,16 +7,13 @@ provider id through the provider manager at call time.
 """
 
 from collections.abc import AsyncGenerator
-import base64
-import mimetypes
-from pathlib import Path
 
 from astrbot.api.provider import Provider
 from astrbot.api.star import Context
 from astrbot.core.provider.entities import LLMResponse
 from astrbot.core.provider.provider import EmbeddingProvider
 
-from .request_log import write_latest
+from .request_log import RequestLogger
 
 _VISION_PROMPT = "请用一两句话简洁描述这张图片的内容。"
 
@@ -117,9 +114,15 @@ class LLMProvider:
         provider_id: Provider id selected in the plugin config.
     """
 
-    def __init__(self, context: Context, provider_id: str) -> None:
+    def __init__(
+        self,
+        context: Context,
+        provider_id: str,
+        request_logger: RequestLogger | None = None,
+    ) -> None:
         self.context = context
         self.provider_id = provider_id
+        self.request_logger = request_logger
 
     async def _get(self) -> Provider:
         """Resolve the provider instance by id.
@@ -164,7 +167,7 @@ class LLMProvider:
         temperature: float = 0.8,
         images: list[str] | None = None,
         func_tool=None,
-        log_name: str = "chat",
+        log_name: str = "latest_chat",
     ) -> str:
         """Get a full (non-streaming) chat completion text.
 
@@ -178,16 +181,15 @@ class LLMProvider:
             The assistant's reply text.
         """
         provider = await self._get()
-        write_latest(
-            log_name,
-            {
-                "provider_id": self.provider_id,
-                "messages": messages,
-                "temperature": temperature,
-                "images": images or [],
-                "func_tool": repr(func_tool) if func_tool is not None else None,
-            },
-        )
+        if self.request_logger:
+            self.request_logger.write(
+                log_name,
+                provider_id=self.provider_id,
+                messages=messages,
+                temperature=temperature,
+                images=images,
+                func_tool=func_tool,
+            )
         resp = await provider.text_chat(
             contexts=messages,
             image_urls=images or None,
@@ -203,6 +205,7 @@ class LLMProvider:
         temperature: float = 0.8,
         images: list[str] | None = None,
         func_tool=None,
+        log_name: str = "latest_chat",
     ) -> AsyncGenerator[str, None]:
         """Stream a chat completion, yielding text deltas.
 
@@ -217,6 +220,15 @@ class LLMProvider:
             is skipped so deltas are not accumulated twice.
         """
         provider = await self._get()
+        if self.request_logger:
+            self.request_logger.write(
+                log_name,
+                provider_id=self.provider_id,
+                messages=messages,
+                temperature=temperature,
+                images=images,
+                func_tool=func_tool,
+            )
         stripper = ThinkStripper()
         async for resp in provider.text_chat_stream(
             contexts=messages,
@@ -240,7 +252,7 @@ class LLMProvider:
         temperature: float = 0.8,
         images: list[str] | None = None,
         func_tool=None,
-        log_name: str = "chat",
+        log_name: str = "latest_chat",
     ) -> AsyncGenerator[LLMResponse, None]:
         """Stream raw LLM responses (chunks and the final completion).
 
@@ -258,16 +270,15 @@ class LLMProvider:
             Every LLMResponse, chunks included.
         """
         provider = await self._get()
-        write_latest(
-            log_name,
-            {
-                "provider_id": self.provider_id,
-                "messages": messages,
-                "temperature": temperature,
-                "images": images or [],
-                "func_tool": repr(func_tool) if func_tool is not None else None,
-            },
-        )
+        if self.request_logger:
+            self.request_logger.write(
+                log_name,
+                provider_id=self.provider_id,
+                messages=messages,
+                temperature=temperature,
+                images=images,
+                func_tool=func_tool,
+            )
         async for resp in provider.text_chat_stream(
             contexts=messages,
             image_urls=images or None,
@@ -276,7 +287,9 @@ class LLMProvider:
         ):
             yield resp
 
-    async def describe_image(self, image_url: str, *, log_name: str = "vision") -> str:
+    async def describe_image(
+        self, image_url: str, log_name: str = "latest_vision"
+    ) -> str:
         """Describe a single image with the vision provider.
 
         Args:
@@ -285,19 +298,11 @@ class LLMProvider:
         Returns:
             A short text description of the image.
         """
-        image_input = image_url
-        image_path = Path(image_url)
-        if image_path.is_file():
-            mime_type = mimetypes.guess_type(image_path.name)[0] or "image/jpeg"
-            image_input = (
-                f"data:{mime_type};base64,"
-                + base64.b64encode(image_path.read_bytes()).decode("ascii")
-            )
         messages = [{"role": "user", "content": _VISION_PROMPT}]
         return await self.chat(
             messages,
             temperature=0.0,
-            images=[image_input],
+            images=[image_url],
             log_name=log_name,
         )
 

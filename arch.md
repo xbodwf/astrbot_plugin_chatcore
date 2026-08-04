@@ -139,6 +139,22 @@ AI 回复中途用户发新消息（无论这条消息是否命中普通回复�
 
 无 aiohttp、无独立 SSE 解析，全部交给 AstrBot 提供商实现。
 
+### 4.5.1 最新请求日志
+
+每次调用模型前，ChatCore 会在 AstrBot 插件数据目录（不是插件代码目录）的
+`astrbot_plugin_chatcore/logs/` 覆盖写入对应日志，保留该用途最新一次完整请求：
+
+- `latest_chat.log`
+- `latest_vision.log` / `latest_emoji_vision.log`
+- `latest_summary.log`
+- `latest_profile.log`
+- `latest_expression_analyzer.log`
+- `latest_emoji_analyzer.log` / `latest_emoji_picker.log`
+- `latest_reply_decision.log`
+- `latest_implicit_analyzer.log`
+
+日志使用 JSON，包含 provider、温度、图片、工具信息和完整 messages；每次覆盖而不追加，便于直接检查模型实际收到的上下文。
+
 ### 4.6 记忆与自我学习（memory）
 
 - **全局记忆**：跨群共享。群聊数据互通 → AI 学习各群的人设/话题/用户画像，更懂人。

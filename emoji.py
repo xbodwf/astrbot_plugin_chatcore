@@ -432,6 +432,7 @@ async def classify_emoji(
     llm_client: Any,
     image_path: str,
     source_context: str,
+    log_name: str = "latest_emoji_analyzer",
 ) -> tuple[str, list[str]]:
     """Classify an emoji from its image description plus source context.
 
@@ -445,7 +446,10 @@ async def classify_emoji(
         A ``(category, tags)`` tuple; empty category on any failure.
     """
     try:
-        desc = await vision_client.describe_image(image_path)
+        try:
+            desc = await vision_client.describe_image(image_path, "latest_emoji_vision")
+        except TypeError:
+            desc = await vision_client.describe_image(image_path)
     except Exception:
         desc = ""
     if not desc:
@@ -463,7 +467,7 @@ async def classify_emoji(
                 {"role": "user", "content": prompt},
             ],
             temperature=0.0,
-            log_name="emoji_analysis",
+            log_name=log_name,
         )
     except Exception:
         return "", []

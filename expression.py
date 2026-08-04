@@ -165,6 +165,7 @@ class ExpressionStore:
         client: Any,
         group_id: str,
         sample_text: str,
+        log_name: str = "latest_expression_analyzer",
     ) -> bool:
         """Analyze a group sample and merge the learned style.
 
@@ -190,7 +191,7 @@ class ExpressionStore:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.3,
-                log_name="expression",
+                log_name=log_name,
             )
         except Exception:
             return False

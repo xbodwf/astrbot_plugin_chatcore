@@ -260,6 +260,7 @@ class ProfileStore:
         name: str,
         text: str,
         existing_facts: list[str] | None = None,
+        log_name: str = "latest_profile",
     ) -> list[dict] | list[str]:
         """Extract stable facts about a speaker from one message.
 
@@ -290,7 +291,7 @@ class ProfileStore:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.0,
-                log_name="profile",
+                log_name=log_name,
             )
         except Exception:
             return []
