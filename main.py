@@ -18,7 +18,16 @@ from typing import Any
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import At, File, Image, Plain, Poke, Reply
+from astrbot.api.message_components import (
+    At,
+    File,
+    Image,
+    Node,
+    Nodes,
+    Plain,
+    Poke,
+    Reply,
+)
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.agent.run_context import ContextWrapper
@@ -52,6 +61,7 @@ from .memory import MemoryStore
 from .profile import ProfileStore
 from .request_log import RequestLogger
 from .segmentation import build_interval_calc, stream_respond
+from .tools import SandboxTools
 from .webui import ChatCoreWebUI
 
 DEFAULT_IMPLICIT_PROMPT = (
@@ -214,6 +224,18 @@ class Main(Star):
         self.tools_enabled = chat_main_cfg.get("tools_enabled", True)
         self.max_tool_rounds = max(1, int(chat_main_cfg.get("max_tool_rounds", 3)))
         self._tool_set: ToolSet | None = None
+        sandbox_cfg = config.get("sandbox", {})
+        self.sandbox_root = Path(
+            sandbox_cfg.get(
+                "root",
+                Path(get_astrbot_plugin_data_path()) / "astrbot_plugin_chatcore" / "sandbox",
+            )
+        )
+        self.sandbox = SandboxTools(
+            self.sandbox_root,
+            bash_timeout=float(sandbox_cfg.get("bash_timeout", 30)),
+            fetch_max_bytes=int(sandbox_cfg.get("fetch_max_bytes", 2 * 1024 * 1024)),
+        )
 
         vision_cfg = providers.get("vision", {})
         self.vision_client = LLMProvider(
@@ -1498,11 +1520,185 @@ class Main(Star):
                     handler=self._schedule_tool_handler,
                 )
             )
+            self._add_sandbox_tools(ts, FunctionTool)
             self._tool_set = ts if not ts.empty() else None
         except Exception as e:
             self.logger.warning(f"ChatCore: tool set build failed: {e}")
             self._tool_set = None
         return self._tool_set
+
+    def _add_sandbox_tools(self, ts: ToolSet, FunctionTool) -> None:
+        """Register ChatCore's sandboxed agent tools on the tool set.
+
+        Args:
+            ts: The ToolSet to populate.
+            FunctionTool: The FunctionTool class to instantiate.
+        """
+        sandbox = self.sandbox
+        specs = [
+            (
+                "read_files",
+                "读取沙箱内的文件内容。可访问插件数据目录（chroot）内的任意文件，"
+                "支持相对或绝对路径。读取源码、配置、日志时使用。",
+                {
+                    "path": {"type": "string", "description": "文件路径。"},
+                    "max_bytes": {
+                        "type": "integer",
+                        "description": "可选：最多读取字符数。",
+                    },
+                },
+                ["path"],
+                sandbox.read_files,
+            ),
+            (
+                "list_files",
+                "列出沙箱内目录的内容（文件名、类型、大小）。不传 path 时列出根目录。",
+                {
+                    "path": {"type": "string", "description": "目录路径，默认根目录。"},
+                },
+                [],
+                sandbox.list_files,
+            ),
+            (
+                "write_files",
+                "写入（覆盖）沙箱内的文件。创建新文件或整体替换旧文件内容。",
+                {
+                    "path": {"type": "string", "description": "目标文件路径。"},
+                    "content": {"type": "string", "description": "要写入的内容。"},
+                },
+                ["path", "content"],
+                sandbox.write_files,
+            ),
+            (
+                "edit_files",
+                "替换文件中精确出现一次的一段文本（类似搜索替换）。适合局部修改，"
+                "比整体重写更安全。",
+                {
+                    "path": {"type": "string", "description": "目标文件路径。"},
+                    "old": {
+                        "type": "string",
+                        "description": "要被替换的原文，必须恰好出现一次。",
+                    },
+                    "new": {"type": "string", "description": "替换后的文本。"},
+                },
+                ["path", "old", "new"],
+                sandbox.edit_files,
+            ),
+            (
+                "bash",
+                "在沙箱根目录执行终端命令（shell）。返回 stdout/stderr 与退出码。"
+                "可用于运行脚本、构建工具、查看环境等。",
+                {
+                    "command": {"type": "string", "description": "要执行的 shell 命令。"},
+                    "timeout": {
+                        "type": "number",
+                        "description": "可选：超时秒数，0 用默认值。",
+                    },
+                },
+                ["command"],
+                sandbox.bash,
+            ),
+            (
+                "screenshot_bash",
+                "执行终端命令并把输出渲染成一张 PNG 图片（终端截图），返回图片路径。"
+                "适合查看表格、日志、格式化输出。",
+                {
+                    "command": {"type": "string", "description": "要执行的命令。"},
+                    "timeout": {
+                        "type": "number",
+                        "description": "可选：超时秒数。",
+                    },
+                },
+                ["command"],
+                sandbox.screenshot_bash,
+            ),
+            (
+                "fetch",
+                "发起 HTTP 请求抓取网页/接口内容（curl 风格）。可指定方法、请求头、"
+                "请求体。用于查资料、调 API、读网页。",
+                {
+                    "url": {"type": "string", "description": "完整 URL。"},
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP 方法：GET/POST/PUT/PATCH/DELETE/HEAD。",
+                    },
+                    "headers": {
+                        "type": "object",
+                        "description": "可选：自定义请求头。",
+                    },
+                    "body": {"type": "string", "description": "可选：请求体。"},
+                    "timeout": {
+                        "type": "number",
+                        "description": "可选：超时秒数。",
+                    },
+                },
+                ["url"],
+                sandbox.fetch,
+            ),
+        ]
+        for name, desc, props, required, handler in specs:
+            ts.add_tool(
+                FunctionTool(
+                    name=name,
+                    description=desc,
+                    parameters={
+                        "type": "object",
+                        "properties": props,
+                        "required": required,
+                    },
+                    handler=handler,
+                )
+            )
+        ts.add_tool(
+            FunctionTool(
+                name="read_forward",
+                description=(
+                    "读取合并转发（聊天记录）消息的内容，解析成可读文本。"
+                    "当用户分享了一段转发记录、你想知道里面聊了什么时调用。"
+                    "可传 message_id 获取指定转发消息。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "message_id": {
+                            "type": "string",
+                            "description": "可选：要读取的转发消息 id。",
+                        }
+                    },
+                    "required": [],
+                },
+                handler=self._read_forward_handler,
+            )
+        )
+        ts.add_tool(
+            FunctionTool(
+                name="forward_chat",
+                description=(
+                    "把某段聊天记录打包成合并转发消息发送。"
+                    "source 为会话标识（当前会话用 current），count 指定条数，"
+                    "target 为发送目标会话（留空发回当前会话）。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": "会话标识，current 表示当前会话。",
+                        },
+                        "count": {
+                            "type": "integer",
+                            "description": "打包的消息条数，默认 20。",
+                        },
+                        "target": {
+                            "type": "string",
+                            "description": "发送目标会话，留空发回当前会话。",
+                        },
+                    },
+                    "required": ["source"],
+                },
+                handler=self._forward_chat_handler,
+            )
+        )
 
     async def _execute_tool(
         self,
@@ -1983,20 +2179,34 @@ class Main(Star):
             The message chain with emoji images appended.
         """
         emoji_queries: list[str] = []
+        image_paths: list[str] = []
 
         def _extract(match: re.Match) -> str:
             emoji_queries.append(match.group(1))
             return ""
 
+        def _extract_image(match: re.Match) -> str:
+            image_paths.append(match.group(1).strip())
+            return ""
+
         clean = re.sub(
             r"\[\[(?:emoji|search_emoji):([^\]]+)\]\]", _extract, segment
         )
+        clean = re.sub(r"\[\[image:([^\]]+)\]\]", _extract_image, clean)
         chain = self._segment_to_chain(
             event.unified_msg_origin,
             clean,
             default_actions,
             self_id=str(event.get_self_id() or ""),
         )
+        if image_paths:
+            for raw in image_paths:
+                img_path = self._resolve_image_path(raw)
+                if not img_path or not Path(img_path).is_file():
+                    self.logger.warning(f"ChatCore image marker: file missing {raw}")
+                    continue
+                chain.append(Image.fromFileSystem(str(img_path)))
+                self.logger.info(f"ChatCore send image | {raw}")
         if emoji_queries and self.emoji_store:
             for query in emoji_queries:
                 emoji_id = await self._resolve_emoji_query(
@@ -2012,6 +2222,132 @@ class Main(Star):
                 chain.append(Image.fromFileSystem(path))
                 self.logger.info(f"ChatCore send emoji | {emoji_id} | query={query}")
         return chain
+
+    def _resolve_image_path(self, raw: str) -> str | None:
+        """Resolve an ``[[image:...]]`` marker path inside the sandbox.
+
+        ``./`` refers to the sandbox root (the plugin data directory). Paths
+        escaping the sandbox are rejected.
+
+        Args:
+            raw: The marker's path argument.
+
+        Returns:
+            The resolved absolute path, or None when invalid.
+        """
+        from .tools import _resolve_chroot_path
+
+        try:
+            target = _resolve_chroot_path(self.sandbox_root, raw)
+        except ValueError as e:
+            self.logger.warning(f"ChatCore image marker rejected: {e}")
+            return None
+        return str(target)
+
+    async def _read_forward_handler(
+        self, event: AstrMessageEvent, message_id: str = ""
+    ) -> dict:
+        """Handler for reading forwarded (merged) chat records.
+
+        Forwarded messages arrive as ``Nodes`` components in the incoming
+        message (or are fetched by id when ``message_id`` is given). Their
+        content is flattened into readable text so the model can reference it.
+
+        Args:
+            event: The message event driving the tool call.
+            message_id: Optional target message id to fetch.
+
+        Returns:
+            A dict with ``content`` or ``error``.
+        """
+        nodes: list[Node] = []
+        components = event.get_messages()
+        for comp in components:
+            if isinstance(comp, Nodes):
+                nodes.extend(comp.nodes)
+            elif isinstance(comp, Node):
+                nodes.append(comp)
+        if not nodes and message_id:
+            try:
+                bot = getattr(event, "bot", None)
+                if bot is not None:
+                    raw = await bot.call_action("get_forward_msg", message_id=message_id)
+                    msgs = (raw.get("data") or raw.get("messages")) if isinstance(raw, dict) else raw
+                    for item in msgs or []:
+                        nodes.append(
+                            Node(
+                                content=[
+                                    Plain(str(item.get("message") or ""))
+                                ],
+                                name=str(item.get("nickname") or item.get("user_id") or ""),
+                                uin=str(item.get("user_id") or "0"),
+                            )
+                        )
+            except Exception as e:
+                return {"error": f"获取转发消息失败: {e}"}
+        if not nodes:
+            return {"error": "当前消息没有转发记录"}
+        lines = []
+        for node in nodes[:100]:
+            name = node.name or node.uin or "未知"
+            text_parts = []
+            for comp in node.content or []:
+                if isinstance(comp, Plain):
+                    text_parts.append(comp.text)
+                elif isinstance(comp, Image):
+                    text_parts.append("[图片]")
+                elif isinstance(comp, At):
+                    text_parts.append(f"@{comp.name or comp.qq}")
+            lines.append(f"{name}: {' '.join(text_parts)}")
+        return {"content": "\n".join(lines)}
+
+    async def _forward_chat_handler(
+        self,
+        event: AstrMessageEvent,
+        source: str,
+        count: int = 20,
+        target: str = "",
+    ) -> dict:
+        """Handler for packaging recent chat records into a forward message.
+
+        Args:
+            event: The message event driving the tool call.
+            source: Conversation to read from (unified_msg_origin), or
+                "current" for the current conversation.
+            count: How many recent records to package.
+            target: Where to send; empty sends back to the current session.
+
+        Returns:
+            A dict with ``ok`` or ``error``.
+        """
+        conv_id = event.unified_msg_origin if source in ("", "current") else source
+        records = self.context_mgr._history(conv_id)
+        if not records:
+            return {"error": "没有可转发的聊天记录"}
+        nodes: list[Node] = []
+        for record in records[-max(1, min(int(count), 100)) :]:
+            if record.role == "assistant":
+                content: list = [Plain(record.text or "[图片]")]
+                nodes.append(Node(content=content, name="Sylvia", uin="0"))
+            else:
+                nodes.append(
+                    Node(
+                        content=[Plain(record.text or "[图片]")],
+                        name=record.sender_name or record.sender_id or "用户",
+                        uin=record.sender_id or "0",
+                    )
+                )
+        if not nodes:
+            return {"error": "没有可转发的聊天记录"}
+        session = target or conv_id
+        try:
+            await self.context.send_message(
+                session,
+                MessageChain(chain=[Nodes(nodes)]),
+            )
+        except Exception as e:
+            return {"error": f"转发失败: {e}"}
+        return {"ok": True, "count": len(nodes), "to": session}
 
     async def _decorate_segment(
         self,
