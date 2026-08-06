@@ -571,6 +571,67 @@
       }
     }
   },
+  "sandbox": {
+    "description": "Agent 沙箱工具",
+    "type": "object",
+    "items": {
+      "root": {
+        "description": "沙箱根目录",
+        "type": "text",
+        "default": "",
+        "hint": "AI 的文件/终端工具的 chroot；留空用插件数据目录下的 sandbox/"
+      },
+      "bash_timeout": {
+        "description": "终端命令默认超时（秒）",
+        "type": "int",
+        "default": 30
+      },
+      "fetch_max_bytes": {
+        "description": "fetch 响应体上限（字节）",
+        "type": "int",
+        "default": 2097152
+      }
+    }
+  },
+  "selflearn": {
+    "description": "自我学习（反思循环）",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "自我学习开关",
+        "type": "bool",
+        "default": true,
+        "hint": "周期性反思最近对话，提炼降智行为/有效表达/对方偏好，注入系统提示"
+      },
+      "interval_minutes": {
+        "description": "反思间隔（分钟）",
+        "type": "int",
+        "default": 120
+      },
+      "max_rules": {
+        "description": "每类规则保留上限",
+        "type": "int",
+        "default": 20
+      }
+    }
+  },
+  "selfimprove": {
+    "description": "自我改进（AI 改源码）",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "自我改进开关",
+        "type": "bool",
+        "default": true,
+        "hint": "周期性让 AI 审视并改进自己的源码，改动需 ruff 通过并经 chatcore approve 审批"
+      },
+      "interval_minutes": {
+        "description": "改进会话间隔（分钟）",
+        "type": "int",
+        "default": 300
+      }
+    }
+  },
   "emotion": {
     "description": "情绪/状态系统",
     "type": "object",

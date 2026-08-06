@@ -61,6 +61,7 @@ from .memory import MemoryStore
 from .profile import ProfileStore
 from .request_log import RequestLogger
 from .segmentation import build_interval_calc, stream_respond
+from .selfimprove import SelfImprove, _SYSTEM_PROMPT as _SELFIMPROVE_SYSTEM_PROMPT, ruff_check
 from .selflearn import SelfLearnStore, _REFLECT_PROMPT, parse_reflection
 from .tools import SandboxTools
 from .webui import ChatCoreWebUI
@@ -428,6 +429,21 @@ class Main(Star):
                 max_rules=int(selflearn_cfg.get("max_rules", 20)),
             )
         self._selflearn_task: asyncio.Task | None = None
+
+        selfimprove_cfg = config.get("selfimprove", {})
+        self.selfimprove_enabled = bool(selfimprove_cfg.get("enabled", True))
+        self.selfimprove_interval = max(
+            60, int(selfimprove_cfg.get("interval_minutes", 300))
+        )
+        self.selfimprove = None
+        if self.selfimprove_enabled:
+            self.selfimprove = SelfImprove(
+                Path(__file__).resolve().parent,
+                Path(get_astrbot_plugin_data_path())
+                / "astrbot_plugin_chatcore"
+                / "selfimprove",
+            )
+        self._selfimprove_task: asyncio.Task | None = None
 
         emotion_cfg = config.get("emotion", {})
         self.emotion_mgr = None
@@ -2901,6 +2917,15 @@ class Main(Star):
         if len(parts) > 1 and parts[1].lower() == "reset":
             yield await self._chatcore_reset(event)
             return
+        if len(parts) > 1 and parts[1].lower() == "view":
+            yield self._chatcore_view_pending(event)
+            return
+        if len(parts) > 1 and parts[1].lower() == "approve":
+            yield await self._chatcore_approve(event, parts)
+            return
+        if len(parts) > 1 and parts[1].lower() == "reject":
+            yield self._chatcore_reject(event, parts)
+            return
         lines = [
             "ChatCore 运行状态：",
             f"- 聊天模型: {self.chat_provider_id or '(未配置)'}",
@@ -3003,6 +3028,91 @@ class Main(Star):
         self.logger.info(f"ChatCore reset | {conv_id} | by {event.get_sender_id()}")
         return event.plain_result("✅ ChatCore 会话已重置。")
 
+    def _chatcore_view_pending(self, event: AstrMessageEvent):
+        """List pending self-improvements with their diffs.
+
+        ``chatcore view`` shows pending proposals (id + note); append a
+        pending id to see its full diff, e.g. ``chatcore view a1b2c3d4e5``.
+
+        Args:
+            event: Current platform message event.
+
+        Returns:
+            The plain result to send.
+        """
+        if not self.selfimprove:
+            return event.plain_result("自改进未启用。")
+        pending = self.selfimprove.list_pending()
+        if not pending:
+            return event.plain_result("没有待审批的自我改进。")
+        if len(event.get_message_str().split()) > 2:
+            pid = event.get_message_str().split()[2]
+            diff = self.selfimprove.diff(pid)
+            return event.plain_result(f"[{pid}] diff:\n{diff[:3000]}")
+        lines = [f"待审批 {len(pending)} 个自我改进："]
+        for p in pending:
+            lines.append(
+                f"- {p['id']} | {p.get('created_at', 0):.0f} | {p.get('note', '')[:80]}"
+            )
+        lines.append("查看 diff: chatcore view <id>")
+        return event.plain_result("\n".join(lines))
+
+    async def _chatcore_approve(
+        self, event: AstrMessageEvent, parts: list[str]
+    ):
+        """Apply a pending self-improvement and reload the plugin.
+
+        Args:
+            event: Current platform message event.
+            parts: Whitespace-split message words.
+
+        Returns:
+            The plain result to send.
+        """
+        if not self.selfimprove:
+            yield event.plain_result("自改进未启用。")
+            return
+        if not event.is_admin():
+            yield event.plain_result("只有管理员可以审批自我改进。")
+            return
+        if len(parts) < 3:
+            yield event.plain_result("用法: chatcore approve <id>")
+            return
+        pid = parts[2]
+        ok, msg = self.selfimprove.apply(pid)
+        if not ok:
+            yield event.plain_result(f"应用失败: {msg}")
+            return
+        yield event.plain_result(f"✅ {msg}\n正在重载插件…")
+        try:
+            manager = getattr(self.context, "_star_manager", None)
+            if manager is not None:
+                await manager.reload("astrbot_plugin_chatcore")
+        except Exception as e:
+            self.logger.warning(f"ChatCore approve reload failed: {e}")
+            yield event.plain_result("代码已应用，但自动重载失败，请手动重载插件。")
+
+    def _chatcore_reject(self, event: AstrMessageEvent, parts: list[str]):
+        """Reject a pending self-improvement.
+
+        Args:
+            event: Current platform message event.
+            parts: Whitespace-split message words.
+
+        Returns:
+            The plain result to send.
+        """
+        if not self.selfimprove:
+            return event.plain_result("自改进未启用。")
+        if not event.is_admin():
+            return event.plain_result("只有管理员可以拒绝自我改进。")
+        if len(parts) < 3:
+            return event.plain_result("用法: chatcore reject <id>")
+        pid = parts[2]
+        if self.selfimprove.reject(pid):
+            return event.plain_result(f"已拒绝 {pid}。")
+        return event.plain_result(f"未找到 {pid}。")
+
     async def initialize(self) -> None:
         """Start background tasks when the plugin is activated."""
         if self.implicit_enabled and self.analysis_client:
@@ -3011,6 +3121,10 @@ class Main(Star):
             self._expression_task = asyncio.create_task(self._expression_learn_loop())
         if self.selflearn:
             self._selflearn_task = asyncio.create_task(self._selflearn_loop())
+        if self.selfimprove:
+            self._selfimprove_task = asyncio.create_task(
+                self._selfimprove_loop()
+            )
 
     async def _expression_learn_loop(self) -> None:
         """Periodically sample active groups and learn their expression style.
@@ -3104,6 +3218,196 @@ class Main(Star):
             self.selflearn.last_reflect_at = time.time()
             self.selflearn._save()
             self.logger.info("ChatCore self-learn | rules updated")
+
+    async def _selfimprove_loop(self) -> None:
+        """Periodically ask the model to propose source improvements.
+
+        Runs every ``selfimprove_interval`` minutes. The model gets a
+        read-only view of the plugin source plus recent chat samples, and may
+        only write into a fresh staging directory; proposals must pass ruff
+        before being registered as pending.
+
+        Returns:
+            None.
+        """
+        while True:
+            await asyncio.sleep(
+                self.selfimprove_interval * 60 + random.uniform(0, 300)
+            )
+            try:
+                await self._run_selfimprove_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger.warning(f"Self-improve failed: {e}")
+
+    async def _run_selfimprove_once(self) -> None:
+        """Run one self-improvement session.
+
+        Returns:
+            None.
+        """
+        if not self.selfimprove:
+            return
+        session_root = self.selfimprove.new_staging_root()
+        samples: list[str] = []
+        for conv_id in self.context_mgr.active_conversations():
+            text = self.context_mgr.summary_text(conv_id, max_chars=1200)
+            if text:
+                samples.append(f"--- 会话 {conv_id} ---\n{text}")
+            if len(samples) >= 5:
+                break
+        sample_path = Path(session_root) / "chat_samples.txt"
+        sample_path.write_text("\n\n".join(samples) or "(无聊天样本)", encoding="utf-8")
+
+        src_sandbox = SandboxTools(self.selfimprove.source_dir)
+        staging_sandbox = SandboxTools(session_root)
+        from astrbot.core.agent.tool import FunctionTool, ToolSet
+
+        tool_set = ToolSet()
+        tool_set.add_tool(
+            FunctionTool(
+                name="read_source",
+                description="读取插件源码文件（只读）。路径相对于插件源码根目录。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "源码文件路径。"}
+                    },
+                    "required": ["path"],
+                },
+                handler=src_sandbox.read_files,
+            )
+        )
+        tool_set.add_tool(
+            FunctionTool(
+                name="list_source",
+                description="列出插件源码目录内容。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "目录路径。"}
+                    },
+                    "required": [],
+                },
+                handler=src_sandbox.list_files,
+            )
+        )
+        tool_set.add_tool(
+            FunctionTool(
+                name="write_staging",
+                description=(
+                    "把修改后的文件写入本次改进的 staging 目录。"
+                    "path 与源码目录同结构（如 main.py、tools.py），"
+                    "改哪个源码文件就写哪个相对路径。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "相对源码根的文件路径。"},
+                        "content": {"type": "string", "description": "文件完整新内容。"},
+                    },
+                    "required": ["path", "content"],
+                },
+                handler=staging_sandbox.write_files,
+            )
+        )
+        tool_set.add_tool(
+            FunctionTool(
+                name="run_ruff",
+                description="对 staging 中的文件运行 ruff 校验。path 为相对源码根的文件路径。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "要校验的相对文件路径。"}
+                    },
+                    "required": ["path"],
+                },
+                handler=self._make_ruff_handler(session_root),
+            )
+        )
+        tool_set.add_tool(
+            FunctionTool(
+                name="submit_improvement",
+                description=(
+                    "完成修改并通过 ruff 后调用：提交本次改进为待审批。"
+                    "note 说明问题与改动，files 列出所有改动的相对路径。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "note": {"type": "string", "description": "改动说明。"},
+                        "files": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "改动的相对文件路径列表。",
+                        },
+                    },
+                    "required": ["note", "files"],
+                },
+                handler=self._make_submit_handler(session_root),
+            )
+        )
+
+        try:
+            persona = (await self._resolve_persona_prompt("")) or FALLBACK_SYSTEM_PROMPT
+        except Exception:
+            persona = FALLBACK_SYSTEM_PROMPT
+        from astrbot.core.provider.entities import LLMResponse
+
+        req = ProviderRequest(
+            prompt=(
+                "请分析源码与聊天样本，找到可以改进的地方并动手改进。"
+                "完成后调用 submit_improvement 提交。"
+            ),
+            session_id="selfimprove",
+            contexts=[
+                {
+                    "role": "system",
+                    "content": persona
+                    + "\n\n"
+                    + _SELFIMPROVE_SYSTEM_PROMPT
+                    + f"\n聊天样本文件: {sample_path}",
+                },
+                {
+                    "role": "user",
+                    "content": "开始分析并改进。",
+                },
+            ],
+            system_prompt=persona + "\n\n" + _SELFIMPROVE_SYSTEM_PROMPT,
+        )
+        try:
+            resp = await self.chat_client.chat_stream_raw(
+                req.contexts,
+                func_tool=tool_set,
+                log_name="latest_selfimprove",
+            )
+            for r in resp:
+                if isinstance(r, LLMResponse) and not r.is_chunk:
+                    self.logger.info(
+                        f"ChatCore self-improve done | {r.completion_text[:200]}"
+                    )
+        except Exception as e:
+            self.logger.warning(f"ChatCore self-improve session failed: {e}")
+
+    def _make_ruff_handler(self, session_root: str):
+        async def handler(event, path: str) -> dict:
+            staged = Path(session_root) / path
+            if not staged.is_file():
+                return {"error": f"staging 中不存在 {path}"}
+            ok, out = await ruff_check([str(staged)])
+            return {"ok": ok, "output": out[:2000]}
+
+        return handler
+
+    def _make_submit_handler(self, session_root: str):
+        def handler(event, note: str, files: list) -> dict:
+            pid = self.selfimprove.submit(
+                Path(session_root).name, str(note or ""), [str(f) for f in files]
+            )
+            return {"ok": True, "pending_id": pid}
+
+        return handler
 
     async def _run_expression_learn_once(self) -> None:
         """Sample each active group and update its learned expression style.
