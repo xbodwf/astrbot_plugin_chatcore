@@ -61,6 +61,7 @@ from .memory import MemoryStore
 from .profile import ProfileStore
 from .request_log import RequestLogger
 from .segmentation import build_interval_calc, stream_respond
+from .selflearn import SelfLearnStore, _REFLECT_PROMPT, parse_reflection
 from .tools import SandboxTools
 from .webui import ChatCoreWebUI
 
@@ -412,6 +413,21 @@ class Main(Star):
                     emoji_cfg["vision_provider_id"],
                     self.request_logger,
                 )
+
+        selflearn_cfg = config.get("selflearn", {})
+        self.selflearn_enabled = bool(selflearn_cfg.get("enabled", True))
+        self.selflearn_interval = max(
+            30, int(selflearn_cfg.get("interval_minutes", 120))
+        )
+        self.selflearn = None
+        if self.selflearn_enabled and self.summary_client:
+            self.selflearn = SelfLearnStore(
+                Path(get_astrbot_plugin_data_path())
+                / "astrbot_plugin_chatcore"
+                / "selflearn.json",
+                max_rules=int(selflearn_cfg.get("max_rules", 20)),
+            )
+        self._selflearn_task: asyncio.Task | None = None
 
         emotion_cfg = config.get("emotion", {})
         self.emotion_mgr = None
@@ -1294,6 +1310,10 @@ class Main(Star):
             rules += self.emotion_mgr.inject_text(conv_id)
         if self.affinity_mgr and sender_id:
             rules += self.affinity_mgr.inject_text(sender_id)
+        if self.selflearn:
+            learned = self.selflearn.render()
+            if learned:
+                rules += "\n\n" + learned
         if sender_id and event is not None:
             info_text = await self._fetch_public_info(event, sender_id)
             if info_text:
@@ -2989,6 +3009,8 @@ class Main(Star):
             self._analysis_task = asyncio.create_task(self._implicit_analysis_loop())
         if self.expression_store:
             self._expression_task = asyncio.create_task(self._expression_learn_loop())
+        if self.selflearn:
+            self._selflearn_task = asyncio.create_task(self._selflearn_loop())
 
     async def _expression_learn_loop(self) -> None:
         """Periodically sample active groups and learn their expression style.
@@ -3006,6 +3028,82 @@ class Main(Star):
                 raise
             except Exception as e:
                 self.logger.warning(f"Expression learning failed: {e}")
+
+    async def _selflearn_loop(self) -> None:
+        """Periodically reflect over recent chats and learn behavior rules.
+
+        Runs every ``selflearn_interval`` minutes (plus jitter) and skips
+        conversations that are actively generating.
+        """
+        while True:
+            await asyncio.sleep(
+                self.selflearn_interval * 60 + random.uniform(0, 300),
+            )
+            try:
+                await self._run_selflearn_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger.warning(f"Self-learn failed: {e}")
+
+    async def _run_selflearn_once(self) -> None:
+        """Sample recent conversations and ask the model to reflect.
+
+        Uses the same summary source as expression learning. The model is
+        told its persona is only a reference, so it criticizes its own
+        replies honestly instead of staying in character.
+
+        Returns:
+            None.
+        """
+        if not self.selflearn:
+            return
+        persona_name = "Sylvia"
+        try:
+            persona = await self._resolve_persona_prompt("")
+            if persona:
+                import re as _re
+
+                m = _re.search(r"你叫([\u4e00-\u9fffA-Za-z0-9]+)", persona)
+                if m:
+                    persona_name = m.group(1)
+        except Exception:
+            pass
+        reflected = False
+        for conv_id in self.context_mgr.active_conversations():
+            if conv_id in self.active_tasks:
+                continue
+            context_text = self.context_mgr.summary_text(conv_id, max_chars=2500)
+            if not context_text:
+                continue
+            prompt = _REFLECT_PROMPT.replace("{name}", persona_name).replace(
+                "{sample}", context_text
+            )
+            try:
+                raw = await self.summary_client.chat(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "你是冷静的自我观察者，不是角色扮演。"
+                                "分析聊天记录后只输出 JSON。"
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.4,
+                    log_name="latest_selflearn",
+                )
+            except Exception as e:
+                self.logger.debug(f"Self-learn analysis failed: {e}")
+                continue
+            parsed = parse_reflection(raw)
+            if self.selflearn.merge(parsed):
+                reflected = True
+        if reflected:
+            self.selflearn.last_reflect_at = time.time()
+            self.selflearn._save()
+            self.logger.info("ChatCore self-learn | rules updated")
 
     async def _run_expression_learn_once(self) -> None:
         """Sample each active group and update its learned expression style.
