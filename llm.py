@@ -288,17 +288,29 @@ class LLMProvider:
             yield resp
 
     async def describe_image(
-        self, image_url: str, log_name: str = "latest_vision"
+        self,
+        image_url: str,
+        log_name: str = "latest_vision",
+        prompt: str = _VISION_PROMPT,
     ) -> str:
         """Describe a single image with the vision provider.
 
+        When ``prompt`` is empty the image is sent without any instruction, so
+        multimodal chat models describe it in their own words (no prompt
+        pollution, useful for aligning with the chat model's own perception).
+
         Args:
             image_url: URL or base64 data URI of the image.
+            log_name: Request log name.
+            prompt: Instruction text; empty for a bare image.
 
         Returns:
             A short text description of the image.
         """
-        messages = [{"role": "user", "content": _VISION_PROMPT}]
+        content = prompt.strip() if (prompt or "").strip() else ""
+        messages = [
+            {"role": "user", "content": content or ""},
+        ]
         return await self.chat(
             messages,
             temperature=0.0,

@@ -56,7 +56,7 @@ from .history import (
     clean_placeholder_text,
     escape_user_markers,
 )
-from .llm import EmbeddingAdapter, LLMProvider, ThinkStripper
+from .llm import EmbeddingAdapter, LLMProvider, ThinkStripper, _VISION_PROMPT
 from .memory import MemoryStore
 from .profile import ProfileStore
 from .request_log import RequestLogger
@@ -2402,9 +2402,11 @@ class Main(Star):
     async def _describe_images(self, images: list[Image]) -> list[str]:
         """Describe attached images.
 
-        Uses the multimodal chat model itself when available (it reads the
-        image and returns a description marker), otherwise falls back to the
-        dedicated vision model.
+        Two paths:
+        - Multimodal chat model: the image is sent bare (no prompt) so the
+          model describes it in its own words, then the description is handed
+          to the chat context as text.
+        - Otherwise: the dedicated vision model summarizes the image.
 
         Args:
             images: Image components of the triggering message.
@@ -2414,16 +2416,23 @@ class Main(Star):
         """
         if not images:
             return []
-        model = self.chat_client if self.chat_multimodal else self.vision_client
+        descriptions: list[str] = []
+        if self.chat_multimodal and self.chat_client:
+            model = self.chat_client
+            prompt = ""
+        else:
+            model = self.vision_client
+            prompt = _VISION_PROMPT
         if not model:
             return []
-        descriptions: list[str] = []
         for img in images:
             url = img.url or img.file
             if not url:
                 continue
             try:
-                descriptions.append(await model.describe_image(url, "latest_vision"))
+                descriptions.append(
+                    await model.describe_image(url, "latest_vision", prompt=prompt)
+                )
             except Exception as e:
                 self.logger.warning(f"Image description failed: {e}")
         return descriptions
