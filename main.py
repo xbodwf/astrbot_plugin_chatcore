@@ -3308,6 +3308,15 @@ class Main(Star):
         if self.selflearn:
             self._selflearn_task = asyncio.create_task(self._selflearn_loop())
         if self.selfimprove:
+            try:
+                registered = self.selfimprove.register_orphan_sessions()
+                if registered:
+                    self.logger.info(
+                        f"ChatCore self-improve | registered orphan sessions: "
+                        f"{registered}"
+                    )
+            except Exception as e:
+                self.logger.warning(f"ChatCore orphan sessions failed: {e}")
             self._selfimprove_task = asyncio.create_task(
                 self._selfimprove_loop()
             )
@@ -3662,10 +3671,52 @@ class Main(Star):
                         f"ChatCore self-improve tool | {name}: {result[:200]}"
                     )
             self.logger.info("ChatCore self-improve session finished")
+            # 兜底：AI 写了 staging 文件但忘了 submit_improvement 时，自动登记。
+            self._auto_register_staging(session_root)
         except Exception as e:
             self.logger.warning(
                 f"ChatCore self-improve session failed: {e}", exc_info=True
             )
+            self._auto_register_staging(session_root)
+
+    def _auto_register_staging(self, session_root: str) -> None:
+        """Register un-submitted staging files as a pending improvement.
+
+        The AI sometimes writes and ruff-checks files but forgets to call
+        ``submit_improvement``. Scan the session root for changed files
+        (excluding the chat-samples artifact) and register them so the admin
+        can still review and approve them.
+
+        Args:
+            session_root: Absolute path of the session's staging root.
+
+        Returns:
+            None.
+        """
+        if not self.selfimprove:
+            return
+        session_dir = Path(session_root)
+        if not session_dir.is_dir():
+            return
+        session_name = session_dir.name
+        already = any(
+            p.get("session") == session_name for p in self.selfimprove.list_pending()
+        )
+        if already:
+            return
+        files = sorted(
+            p.name
+            for p in session_dir.iterdir()
+            if p.is_file() and p.name != "chat_samples.txt"
+        )
+        if not files:
+            return
+        pid = self.selfimprove.submit(
+            session_name,
+            "（AI 未调用 submit_improvement，改动由系统自动登记）",
+            files,
+        )
+        self.logger.info(f"ChatCore self-improve auto-registered | {pid} | {files}")
 
     def _make_stop_handler(self, event, note: str = "") -> dict:
         """Handler for the ``stop_improvement`` tool: ends the session.

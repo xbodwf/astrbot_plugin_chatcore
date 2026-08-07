@@ -65,6 +65,40 @@ class SelfImprove:
         except (OSError, json.JSONDecodeError):
             self._pending = {}
 
+    def register_orphan_sessions(self) -> list[str]:
+        """Register staging sessions that have files but no pending record.
+
+        Sessions whose AI wrote files but never called ``submit_improvement``
+        (e.g. after a crash or a missed submission) are registered so the
+        admin can review them. Called once at startup.
+
+        Returns:
+            List of newly registered pending ids.
+        """
+        registered: list[str] = []
+        known = {p.get("session") for p in self._pending.values()}
+        if not self.staging_dir.is_dir():
+            return registered
+        for session_dir in sorted(self.staging_dir.iterdir()):
+            if not session_dir.is_dir():
+                continue
+            if session_dir.name in known:
+                continue
+            files = sorted(
+                p.name
+                for p in session_dir.iterdir()
+                if p.is_file() and p.name != "chat_samples.txt"
+            )
+            if not files:
+                continue
+            pid = self.submit(
+                session_dir.name,
+                "（孤儿 staging：AI 未提交，启动时自动登记）",
+                files,
+            )
+            registered.append(pid)
+        return registered
+
     def _save(self) -> None:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.pending_path.with_suffix(".tmp")
