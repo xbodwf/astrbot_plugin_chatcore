@@ -3579,7 +3579,9 @@ class Main(Star):
                     )
             self.logger.info("ChatCore self-improve session finished")
         except Exception as e:
-            self.logger.warning(f"ChatCore self-improve session failed: {e}")
+            self.logger.warning(
+                f"ChatCore self-improve session failed: {e}", exc_info=True
+            )
 
     def _make_ruff_handler(self, session_root: str):
         async def handler(event, path: str) -> dict:
