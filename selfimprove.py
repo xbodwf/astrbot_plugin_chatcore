@@ -79,11 +79,17 @@ class SelfImprove:
         known = {p.get("session") for p in self._pending.values()}
         if not self.staging_dir.is_dir():
             return registered
-        for session_dir in sorted(self.staging_dir.iterdir()):
-            if not session_dir.is_dir():
-                continue
-            if session_dir.name in known:
-                continue
+        sessions = [
+            d
+            for d in self.staging_dir.iterdir()
+            if d.is_dir() and d.name not in known
+        ]
+        # 只登记最新一个有文件的孤儿 session：更早的是失败残留，
+        # 全部登记会制造互相冲突的 pending。
+        sessions.sort(
+            key=lambda d: d.stat().st_mtime, reverse=True
+        )
+        for session_dir in sessions:
             files = sorted(
                 p.name
                 for p in session_dir.iterdir()
@@ -97,6 +103,7 @@ class SelfImprove:
                 files,
             )
             registered.append(pid)
+            break
         return registered
 
     def _save(self) -> None:
@@ -196,6 +203,11 @@ class SelfImprove:
     def apply(self, pid: str) -> tuple[bool, str]:
         """Apply a pending improvement onto the source directory.
 
+        A file can only be applied from its newest pending record: if another
+        pending (newer than this one) touches the same file, applying this
+        record would overwrite newer work with an older snapshot, so it is
+        rejected with a hint.
+
         Args:
             pid: Pending id.
 
@@ -205,6 +217,23 @@ class SelfImprove:
         pending = self._pending.get(pid)
         if not pending:
             return False, f"未找到审批 {pid}"
+        pending_files = set(pending.get("files", []))
+        newer_conflicts = []
+        for other in self._pending.values():
+            if other["id"] == pid:
+                continue
+            if other.get("created_at", 0) > pending.get("created_at", 0):
+                overlap = pending_files & set(other.get("files", []))
+                if overlap:
+                    newer_conflicts.append((other["id"], sorted(overlap)))
+        if newer_conflicts:
+            detail = "；".join(
+                f"{oid}（文件: {', '.join(files)}）" for oid, files in newer_conflicts
+            )
+            return (
+                False,
+                f"存在更新的待审批改动包含相同文件，先处理它们以避免覆盖：{detail}",
+            )
         session = self.staging_dir / str(pending["session"])
         if not session.is_dir():
             return False, "staging 目录已不存在"
