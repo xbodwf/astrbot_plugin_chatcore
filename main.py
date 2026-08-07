@@ -3237,8 +3237,11 @@ class Main(Star):
             return event.plain_result(f"[{pid}] diff:\n{diff[:3000]}")
         lines = [f"待审批 {len(pending)} 个自我改进："]
         for p in pending:
+            created = time.strftime(
+                "%m-%d %H:%M", time.localtime(p.get("created_at", 0))
+            )
             lines.append(
-                f"- {p['id']} | {p.get('created_at', 0):.0f} | {p.get('note', '')[:80]}"
+                f"- {p['id']} | {created} | {p.get('note', '')[:80]}"
             )
         lines.append("查看 diff: chatcore view <id>")
         return event.plain_result("\n".join(lines))
