@@ -88,17 +88,30 @@ class SelfImprove:
         that baseline. Failures are non-fatal (diffing falls back to the
         plain-text comparison).
 
+        Also snapshots the current source state: when the plugin loads with
+        uncommitted changes on disk (e.g. after an automatic update replaced
+        files), they are committed so every load leaves a trace in history.
+
         Returns:
             None.
         """
         git_dir = self.source_dir / ".git"
         if not git_dir.exists():
-            code, _ = self._git("init", "-q")
-            if code == 0:
-                self._git("add", "-A")
-                self._git(
-                    "commit", "-q", "-m", "chatcore baseline", "--allow-empty"
-                )
+            self._git("init", "-q")
+        # 工作区有未提交变更（或还没有任何提交）时，把当前源码固化为基线。
+        code, _ = self._git("diff", "--quiet")
+        has_changes = code != 0
+        code2, _ = self._git("rev-parse", "--verify", "HEAD")
+        has_commits = code2 == 0
+        if has_changes or not has_commits:
+            self._git("add", "-A")
+            self._git(
+                "commit",
+                "-q",
+                "-m",
+                f"chatcore sync baseline {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                "--allow-empty",
+            )
 
     def baseline_commit(self) -> str:
         """Create (or reuse) the baseline commit for a new session.
