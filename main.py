@@ -3347,18 +3347,16 @@ class Main(Star):
             The plain result to send.
         """
         if not event.is_admin():
-            yield event.plain_result("只有管理员可以重载插件。")
-            return
-        yield event.plain_result("正在重载 ChatCore 插件…")
+            return event.plain_result("只有管理员可以重载插件。")
         try:
             manager = getattr(self.context, "_star_manager", None)
             if manager is None:
-                yield event.plain_result("未找到插件管理器，重载失败。")
-                return
+                return event.plain_result("未找到插件管理器，重载失败。")
             await manager.reload("astrbot_plugin_chatcore")
+            return event.plain_result("重载完成。")
         except Exception as e:
             self.logger.warning(f"ChatCore reload failed: {e}", exc_info=True)
-            yield event.plain_result(f"重载失败: {e}")
+            return event.plain_result(f"重载失败: {e}")
 
     async def initialize(self) -> None:
         """Start background tasks when the plugin is activated."""
