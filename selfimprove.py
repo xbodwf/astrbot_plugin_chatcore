@@ -248,6 +248,8 @@ class SelfImprove:
             applied.append(rel)
         self._pending.pop(pid, None)
         self._save()
+        # 清理 session 目录，避免重载后 register_orphan_sessions 重复登记。
+        shutil.rmtree(session, ignore_errors=True)
         return True, f"已应用 {len(applied)} 个文件: {', '.join(applied)}"
 
     def reject(self, pid: str) -> bool:
@@ -259,11 +261,14 @@ class SelfImprove:
         Returns:
             True when removed.
         """
-        if pid in self._pending:
-            self._pending.pop(pid, None)
-            self._save()
-            return True
-        return False
+        pending = self._pending.get(pid)
+        if not pending:
+            return False
+        session = self.staging_dir / str(pending.get("session", ""))
+        self._pending.pop(pid, None)
+        self._save()
+        shutil.rmtree(session, ignore_errors=True)
+        return True
 
 
 async def ruff_check(paths: list[str]) -> tuple[bool, str]:
