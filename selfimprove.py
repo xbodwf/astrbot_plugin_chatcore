@@ -13,6 +13,7 @@ from __future__ import annotations
 import difflib
 import json
 import shutil
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -56,6 +57,96 @@ class SelfImprove:
         self.pending_path = self.work_dir / "pending.json"
         self._pending: dict[str, dict] = {}
         self._load()
+        self._git_ensure()
+
+    def _git(self, *args: str) -> tuple[int, str]:
+        """Run a git command inside the source directory.
+
+        Args:
+            *args: Git arguments.
+
+        Returns:
+            ``(returncode, combined_output)``.
+        """
+        try:
+            proc = subprocess.run(
+                ["git", *args],
+                cwd=str(self.source_dir),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return proc.returncode, (proc.stdout + proc.stderr).strip()
+        except Exception as e:
+            return 1, str(e)
+
+    def _git_ensure(self) -> None:
+        """Initialize a git repository on the plugin source, if missing.
+
+        The repo makes every improvement session auditable: each session
+        commits a baseline, and proposals are reviewed as git diffs against
+        that baseline. Failures are non-fatal (diffing falls back to the
+        plain-text comparison).
+
+        Returns:
+            None.
+        """
+        git_dir = self.source_dir / ".git"
+        if not git_dir.exists():
+            code, _ = self._git("init", "-q")
+            if code == 0:
+                self._git("add", "-A")
+                self._git(
+                    "commit", "-q", "-m", "chatcore baseline", "--allow-empty"
+                )
+
+    def baseline_commit(self) -> str:
+        """Create (or reuse) the baseline commit for a new session.
+
+        Staging the current source and committing it gives the session a
+        stable reference point; proposals diff against it.
+
+        Returns:
+            The baseline commit hash (or empty on failure).
+        """
+        self._git("add", "-A")
+        code, out = self._git(
+            "commit", "-q", "-m", "chatcore session baseline", "--allow-empty"
+        )
+        if code != 0:
+            return ""
+        return out.splitlines()[-1] if out else ""
+
+    def commit_apply(self, pid: str, note: str) -> None:
+        """Commit an applied improvement into the source git history.
+
+        Args:
+            pid: The applied pending id.
+            note: The improvement note.
+
+        Returns:
+            None.
+        """
+        self._git("add", "-A")
+        self._git(
+            "commit", "-q", "-m", f"chatcore apply {pid}: {note[:60]}", "--allow-empty"
+        )
+
+    def file_changed_since_baseline(self, rel: str) -> bool:
+        """Whether a source file differs from the last committed baseline.
+
+        Used as a conflict hint before applying: if the file already changed
+        after the session's baseline (e.g. by a previous apply), applying an
+        older snapshot may clobber newer work.
+
+        Args:
+            rel: Relative file path.
+
+        Returns:
+            True when git reports the file as modified vs HEAD.
+        """
+        code, _ = self._git("diff", "--quiet", "HEAD", "--", rel)
+        return code != 0
 
     def _load(self) -> None:
         try:
@@ -178,13 +269,19 @@ class SelfImprove:
         return self._pending.get(pid)
 
     def diff(self, pid: str) -> str:
-        """Render the unified diff of a pending improvement.
+        """Render the diff of a pending improvement against its git baseline.
+
+        The baseline is the source as committed when the session started
+        (``HEAD`` at session time). Staging copies are compared to that
+        version, so the diff shows exactly what the AI changed even if the
+        live source has since moved on. Falls back to comparing against the
+        live source when git is unavailable.
 
         Args:
             pid: Pending id.
 
         Returns:
-            The unified diff text, or a message when missing.
+            The diff text, or a message when missing.
         """
         pending = self._pending.get(pid)
         if not pending:
@@ -195,15 +292,18 @@ class SelfImprove:
         parts: list[str] = []
         for rel in pending.get("files", []):
             staged = session / rel
-            original = self.source_dir / rel
             if not staged.is_file():
                 continue
             new_text = staged.read_text(encoding="utf-8", errors="replace")
-            old_text = (
-                original.read_text(encoding="utf-8", errors="replace")
-                if original.is_file()
-                else ""
-            )
+            code, out = self._git("show", f"HEAD:{rel}")
+            old_text = out if code == 0 else ""
+            if code != 0:
+                # 基线里没有该文件（可能是源码目录无 git 或新文件）。
+                original = self.source_dir / rel
+                if original.is_file():
+                    old_text = original.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
             parts.append(
                 "".join(
                     difflib.unified_diff(
@@ -264,6 +364,8 @@ class SelfImprove:
             applied.append(rel)
         self._pending.pop(pid, None)
         self._save()
+        # 应用结果提交进 git 历史，保证每次变更可审计、可回滚。
+        self.commit_apply(pid, str(pending.get("note", "")))
         # 清理 session 目录，避免重载后 register_orphan_sessions 重复登记。
         shutil.rmtree(session, ignore_errors=True)
         return True, f"已应用 {len(applied)} 个文件: {', '.join(applied)}"

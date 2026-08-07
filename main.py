@@ -3519,6 +3519,11 @@ class Main(Star):
         if not self.selfimprove:
             return
         session_root = self.selfimprove.new_staging_root()
+        # 建立 git 基线：本次会话的改动与之对比，保证可审计。
+        try:
+            self.selfimprove.baseline_commit()
+        except Exception as e:
+            self.logger.debug(f"ChatCore baseline commit failed: {e}")
         samples: list[str] = []
         for conv_id in self.context_mgr.active_conversations():
             text = self.context_mgr.summary_text(conv_id, max_chars=1200)
