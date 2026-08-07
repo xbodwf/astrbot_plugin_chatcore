@@ -446,6 +446,8 @@ class Main(Star):
                 / "selfimprove",
             )
         self._selfimprove_task: asyncio.Task | None = None
+        self._improve_running = False
+        self._improve_stop = False
 
         emotion_cfg = config.get("emotion", {})
         self.emotion_mgr = None
@@ -3036,6 +3038,9 @@ class Main(Star):
             async for result in self._chatcore_improve(event):
                 yield result
             return
+        if len(parts) > 1 and parts[1].lower() == "stop-improve":
+            yield self._chatcore_stop_improve(event)
+            return
         if len(parts) > 1 and parts[1].lower() == "approve":
             async for result in self._chatcore_approve(event, parts):
                 yield result
@@ -3148,6 +3153,11 @@ class Main(Star):
     async def _chatcore_improve(self, event: AstrMessageEvent):
         """Manually trigger a self-improvement session right now.
 
+        Rejects when a session is already running. The session runs in a
+        background task so the command returns immediately; it ends when the
+        AI calls ``stop_improvement``, ``chatcore stop-improve`` is issued,
+        or the hard round cap is reached.
+
         Args:
             event: Current platform message event.
 
@@ -3160,21 +3170,49 @@ class Main(Star):
         if not event.is_admin():
             yield event.plain_result("只有管理员可以触发自我改进。")
             return
-        yield event.plain_result("开始自我改进会话，完成后可用 chatcore view 查看…")
-        try:
-            await self._run_selfimprove_once()
-        except Exception as e:
-            self.logger.warning(f"ChatCore improve failed: {e}")
-            yield event.plain_result(f"自我改进会话失败: {e}")
+        if self._improve_running:
+            yield event.plain_result("已有一个自我改进会话在运行中，请等待其结束。")
             return
-        pending = self.selfimprove.list_pending()
-        if pending:
-            yield event.plain_result(
-                f"已完成，产生 {len(pending)} 个待审批项。"
-                "用 chatcore view 查看 diff，chatcore approve <id> 应用。"
-            )
-        else:
-            yield event.plain_result("会话完成，但 AI 没有提交任何改动。")
+        self._improve_running = True
+        self._improve_stop = False
+
+        async def _run() -> None:
+            try:
+                await self._run_selfimprove_once()
+            except asyncio.CancelledError:
+                self.logger.info("ChatCore self-improve cancelled by user")
+                raise
+            except Exception as e:
+                self.logger.warning(f"ChatCore improve failed: {e}", exc_info=True)
+            finally:
+                self._improve_running = False
+
+        self._improve_task = asyncio.create_task(_run())
+        yield event.plain_result(
+            "开始自我改进会话（后台运行）。可用 chatcore stop-improve 停止，"
+            "完成后用 chatcore view 查看结果…"
+        )
+
+    def _chatcore_stop_improve(self, event: AstrMessageEvent):
+        """Force-stop a running self-improvement session.
+
+        Args:
+            event: Current platform message event.
+
+        Returns:
+            The plain result to send.
+        """
+        if not event.is_admin():
+            return event.plain_result("只有管理员可以停止自我改进。")
+        if not self._improve_running:
+            return event.plain_result("没有正在运行的自我改进会话。")
+        self._improve_stop = True
+        task = self._improve_task
+        if task is not None:
+            task.cancel()
+        self._improve_running = False
+        self.logger.info("ChatCore self-improve stopped by admin")
+        return event.plain_result("已停止自我改进会话。")
 
     def _chatcore_view_pending(self, event: AstrMessageEvent):
         """List pending self-improvements with their diffs.
@@ -3382,12 +3420,19 @@ class Main(Star):
             await asyncio.sleep(
                 self.selfimprove_interval * 60 + random.uniform(0, 300)
             )
+            if self._improve_running:
+                # A manual session is already running; skip the auto trigger.
+                continue
+            self._improve_running = True
+            self._improve_stop = False
             try:
                 await self._run_selfimprove_once()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 self.logger.warning(f"Self-improve failed: {e}")
+            finally:
+                self._improve_running = False
 
     async def _run_selfimprove_once(self) -> None:
         """Run one self-improvement session.
@@ -3499,6 +3544,26 @@ class Main(Star):
                 handler=self._make_submit_handler(session_root),
             )
         )
+        tool_set.add_tool(
+            FunctionTool(
+                name="stop_improvement",
+                description=(
+                    "当你认为改进已经完成（或确认无需改动）时调用此工具结束本次"
+                    "自我改进会话。结束后无需再做任何事。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "note": {
+                            "type": "string",
+                            "description": "结束原因或总结。",
+                        }
+                    },
+                    "required": [],
+                },
+                handler=self._make_stop_handler,
+            )
+        )
 
         try:
             persona = (await self._resolve_persona_prompt("")) or FALLBACK_SYSTEM_PROMPT
@@ -3530,7 +3595,9 @@ class Main(Star):
         )
         messages = list(req.contexts)
         try:
-            for _ in range(30):
+            rounds = 0
+            while not self._improve_stop and rounds < 30:
+                rounds += 1
                 tool_calls: tuple | None = None
                 async for r in self.chat_client.chat_stream_raw(
                     messages,
@@ -3599,6 +3666,20 @@ class Main(Star):
             self.logger.warning(
                 f"ChatCore self-improve session failed: {e}", exc_info=True
             )
+
+    def _make_stop_handler(self, event, note: str = "") -> dict:
+        """Handler for the ``stop_improvement`` tool: ends the session.
+
+        Args:
+            event: Ignored (sandbox-local call).
+            note: Optional closing summary.
+
+        Returns:
+            A confirmation dict.
+        """
+        self._improve_stop = True
+        self.logger.info(f"ChatCore self-improve stopped by AI | {note[:100]}")
+        return {"ok": True, "message": "本次自我改进会话已结束。"}
 
     def _make_ruff_handler(self, session_root: str):
         async def handler(event, path: str) -> dict:
