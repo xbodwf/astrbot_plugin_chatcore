@@ -77,6 +77,12 @@ FALLBACK_SYSTEM_PROMPT = (
     "你是一个友善、自然的聊天机器人，请像真人一样聊天，回复不要机械化。"
 )
 
+# 默认作息规则：深夜压低发言概率（可在 attention.time_rules 覆盖；留空数组则关闭）。
+DEFAULT_TIME_RULES = [
+    {"start": "00:00", "end": "07:00", "multiplier": 0.3},
+    {"start": "23:00", "end": "23:59", "multiplier": 0.5},
+]
+
 HISTORY_SUMMARY_PROMPT = (
     "请把下面的群聊/对话历史压缩成一段简洁的中文摘要，保留关键人物、"
     "事件和结论，丢弃寒暄和无关细节。只输出摘要本身，不要任何前缀。\n\n"
@@ -273,6 +279,9 @@ class Main(Star):
             )
 
         attn = config.get("attention", {})
+        time_rules_conf = attn.get("time_rules")
+        if time_rules_conf is None:
+            time_rules_conf = list(DEFAULT_TIME_RULES)
         self.attention = AttentionManager(
             bubble_base=attn.get("bubble_base_prob", 0.02),
             active_cap=attn.get("active_max_prob", 0.30),
@@ -281,7 +290,7 @@ class Main(Star):
             cool_down_seconds=attn.get("cool_down_seconds", 120),
             no_action_backoff=attn.get("no_action_backoff", 0.6),
             backoff_floor=attn.get("backoff_floor", 0.25),
-            time_rules=attn.get("time_rules", []),
+            time_rules=time_rules_conf,
             read_air_factor=attn.get("read_air_factor", 0.5),
             others_density_threshold=attn.get("others_density_threshold", 3),
             followup_boost=attn.get("followup_boost", 0.05),
@@ -670,6 +679,8 @@ class Main(Star):
         # 概率触发：poke 专属概率（戳前=聊天概率，戳后按次数/间隔累积，3 次连戳必触发）。
         if self.attention:
             self.attention.record_poke(conv_id)
+            # 戳一戳也走概率：第一戳只小幅抬升，连戳/密集戳才累积到必回。
+            # 这样不会“戳一下必回”，更像真人的随性反应。
             if not self.attention.should_respond_poke(conv_id):
                 event.stop_event()
                 return
@@ -1296,6 +1307,13 @@ class Main(Star):
                 "作为自由的聊天 bot，想戳谁、什么时候戳、要不要戳都由你随性决定，"
                 "这不是什么必须执行的指令。"
             )
+        rules += (
+            "⑩ 不要每句话都带表情或口癖，也不要机械地每句都收尾（比如每句都加"
+            "同一个语气词）；根据内容自然流露即可，有些句子就是平铺直叙的。"
+            "⑪ 有的话不需要说满：别人问一个点就答一个点，不要抢答、不要复述"
+            "对方的话、不要总结自己刚说的话。话多时拆成多条发，但每条都要有"
+            "新信息，宁可少说两句也别刷屏。"
+        )
         style = (
             self.expression_store.render(
                 conv_id,
