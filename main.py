@@ -2921,10 +2921,12 @@ class Main(Star):
             yield self._chatcore_view_pending(event)
             return
         if len(parts) > 1 and parts[1].lower() == "improve":
-            yield await self._chatcore_improve(event)
+            async for result in self._chatcore_improve(event):
+                yield result
             return
         if len(parts) > 1 and parts[1].lower() == "approve":
-            yield await self._chatcore_approve(event, parts)
+            async for result in self._chatcore_approve(event, parts):
+                yield result
             return
         if len(parts) > 1 and parts[1].lower() == "reject":
             yield self._chatcore_reject(event, parts)
