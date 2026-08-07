@@ -12,6 +12,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import time
 import uuid
 from pathlib import Path
@@ -3484,11 +3485,22 @@ class Main(Star):
         tool_set.add_tool(
             FunctionTool(
                 name="read_source",
-                description="读取插件源码文件（只读）。路径相对于插件源码根目录。",
+                description=(
+                    "读取插件源码文件（只读）。路径相对于插件源码根目录。"
+                    "大文件可用 offset（起始行号）和 limit（行数）分片读取。"
+                ),
                 parameters={
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string", "description": "源码文件路径。"}
+                        "path": {"type": "string", "description": "源码文件路径。"},
+                        "offset": {
+                            "type": "integer",
+                            "description": "可选：起始行号（从 0 开始）。",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "可选：最多读取行数。",
+                        },
                     },
                     "required": ["path"],
                 },
@@ -3511,11 +3523,51 @@ class Main(Star):
         )
         tool_set.add_tool(
             FunctionTool(
+                name="edit_staging",
+                description=(
+                    "在 staging 中精确替换文件中的一段文本（推荐，省 token）。"
+                    "path 与源码目录同结构；若 staging 还没有该文件，会自动从源码"
+                    "复制一份快照再替换。old 必须精确出现一次。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "相对源码根的文件路径。"},
+                        "old": {
+                            "type": "string",
+                            "description": "要被替换的原文，必须精确出现一次。",
+                        },
+                        "new": {"type": "string", "description": "替换后的文本。"},
+                    },
+                    "required": ["path", "old", "new"],
+                },
+                handler=self._make_staging_edit_handler(session_root),
+            )
+        )
+        tool_set.add_tool(
+            FunctionTool(
+                name="add_staging",
+                description=(
+                    "在 staging 文件末尾追加内容，或创建新文件。"
+                    "path 与源码目录同结构；文件不存在时自动创建（即新增文件）。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "相对源码根的文件路径。"},
+                        "content": {"type": "string", "description": "要追加的内容。"},
+                    },
+                    "required": ["path", "content"],
+                },
+                handler=self._make_staging_add_handler(session_root),
+            )
+        )
+        tool_set.add_tool(
+            FunctionTool(
                 name="write_staging",
                 description=(
-                    "把修改后的文件写入本次改进的 staging 目录。"
-                    "path 与源码目录同结构（如 main.py、tools.py），"
-                    "改哪个源码文件就写哪个相对路径。"
+                    "整文件覆盖写入 staging（兜底，仅当 edit/add 无法完成时用）。"
+                    "path 与源码目录同结构。"
                 ),
                 parameters={
                     "type": "object",
@@ -3733,6 +3785,71 @@ class Main(Star):
             files,
         )
         self.logger.info(f"ChatCore self-improve auto-registered | {pid} | {files}")
+
+    def _make_staging_edit_handler(self, session_root: str):
+        """Build the ``edit_staging`` handler for one session.
+
+        Edits operate on the staging copy: if the file is not staged yet, a
+        snapshot is first copied from the source so the AI only sends the
+        changed snippet instead of the whole file.
+
+        Args:
+            session_root: Absolute path of the session's staging root.
+
+        Returns:
+            The async handler.
+        """
+
+        async def handler(event, path: str, old: str, new: str) -> dict:
+            root = Path(session_root)
+            target = root / path
+            if not target.is_file():
+                src = self.selfimprove.source_dir / path
+                if not src.is_file():
+                    return {"error": f"源码中不存在 {path}，新增文件请用 add_staging"}
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, target)
+            try:
+                text = target.read_text(encoding="utf-8")
+            except OSError as e:
+                return {"error": f"读取失败: {e}"}
+            count = text.count(old)
+            if count != 1:
+                return {
+                    "error": f"old 文本出现 {count} 次（要求恰好 1 次）；请提供更精确的片段"
+                }
+            target.write_text(text.replace(old, new), encoding="utf-8")
+            return {"ok": True, "path": path}
+
+        return handler
+
+    def _make_staging_add_handler(self, session_root: str):
+        """Build the ``add_staging`` handler for one session.
+
+        Appends to an existing staged file or creates a new one. New files
+        are recorded separately so ``apply`` knows it must copy them over.
+
+        Args:
+            session_root: Absolute path of the session's staging root.
+
+        Returns:
+            The async handler.
+        """
+
+        async def handler(event, path: str, content: str) -> dict:
+            root = Path(session_root)
+            target = root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists() and not target.is_file():
+                return {"error": f"{path} 不是文件"}
+            try:
+                with target.open("a", encoding="utf-8") as fh:
+                    fh.write(content or "")
+            except OSError as e:
+                return {"error": f"追加失败: {e}"}
+            return {"ok": True, "path": path, "created": not target.exists()}
+
+        return handler
 
     def _make_stop_handler(self, event, note: str = "") -> dict:
         """Handler for the ``stop_improvement`` tool: ends the session.

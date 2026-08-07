@@ -65,16 +65,25 @@ class SandboxTools:
         self.bash_timeout = max(1.0, float(bash_timeout))
         self.fetch_max_bytes = max(1024, int(fetch_max_bytes))
 
-    async def read_files(self, event, path: str, max_bytes: int = 0) -> dict:
+    async def read_files(
+        self,
+        event,
+        path: str,
+        offset: int = 0,
+        limit: int = 0,
+        max_bytes: int = 0,
+    ) -> dict:
         """读取沙箱内的文件内容（文本）。
 
         Args:
             event: The message event.
             path: 文件路径（相对沙箱根或绝对路径）。
+            offset: 起始行号（从 0 开始），只读该行起的部分。
+            limit: 最多读取的行数，0 表示读到末尾。
             max_bytes: 最多读取的字符数，0 表示使用默认上限。
 
         Returns:
-            dict: ``{"content": ...}`` 或 ``{"error": ...}``。
+            dict: ``{"content": ..., "lines": N}`` 或 ``{"error": ...}``。
         """
         try:
             target = _resolve_chroot_path(self.chroot, path)
@@ -82,12 +91,23 @@ class SandboxTools:
             return {"error": str(e)}
         if not target.is_file():
             return {"error": f"文件不存在: {path}"}
-        limit = max_bytes or _MAX_FILE_BYTES
         try:
-            data = target.read_bytes()[:limit]
-            return {"content": data.decode("utf-8", errors="replace")}
+            lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError as e:
             return {"error": f"读取失败: {e}"}
+        start = max(0, int(offset or 0))
+        end = None if not limit else start + max(0, int(limit))
+        selected = lines[start:end]
+        text = "\n".join(selected)
+        limit_chars = max_bytes or _MAX_FILE_BYTES
+        if len(text) > limit_chars:
+            text = text[:limit_chars]
+        return {
+            "content": text,
+            "lines": len(selected),
+            "offset": start,
+            "total_lines": len(lines),
+        }
 
     async def list_files(self, event, path: str = ".") -> dict:
         """列出沙箱内目录的内容。
