@@ -3389,7 +3389,6 @@ class Main(Star):
             persona = (await self._resolve_persona_prompt("")) or FALLBACK_SYSTEM_PROMPT
         except Exception:
             persona = FALLBACK_SYSTEM_PROMPT
-        from astrbot.core.provider.entities import LLMResponse
 
         req = ProviderRequest(
             prompt=(
@@ -3412,16 +3411,61 @@ class Main(Star):
             ],
             system_prompt=persona + "\n\n" + _SELFIMPROVE_SYSTEM_PROMPT,
         )
+        messages = list(req.contexts)
         try:
-            async for r in self.chat_client.chat_stream_raw(
-                req.contexts,
-                func_tool=tool_set,
-                log_name="latest_selfimprove",
-            ):
-                if isinstance(r, LLMResponse) and not r.is_chunk:
-                    self.logger.info(
-                        f"ChatCore self-improve done | {r.completion_text[:200]}"
+            for _ in range(self.max_tool_rounds + 3):
+                tool_calls: tuple | None = None
+                async for r in self.chat_client.chat_stream_raw(
+                    messages,
+                    func_tool=tool_set,
+                    log_name="latest_selfimprove",
+                ):
+                    if r.is_chunk:
+                        continue
+                    if r.tools_call_name:
+                        tool_calls = (
+                            r.tools_call_name,
+                            r.tools_call_args,
+                            r.tools_call_ids,
+                        )
+                if not tool_calls:
+                    break
+                names, args_list, ids = tool_calls
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": tid,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": json.dumps(
+                                        args or {},
+                                        ensure_ascii=False,
+                                    ),
+                                },
+                            }
+                            for name, args, tid in zip(names, args_list, ids)
+                        ],
+                    }
+                )
+                for name, args, tid in zip(names, args_list, ids):
+                    result = await self._execute_tool(
+                        event, tool_set, name, args or {}
                     )
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tid,
+                            "content": result,
+                        }
+                    )
+                    self.logger.info(
+                        f"ChatCore self-improve tool | {name}: {result[:200]}"
+                    )
+            self.logger.info("ChatCore self-improve session finished")
         except Exception as e:
             self.logger.warning(f"ChatCore self-improve session failed: {e}")
 
