@@ -82,6 +82,7 @@ HISTORY_SUMMARY_PROMPT = (
 
 # 模型声明"需要工具"的标记行（AI 在回复开头独占一行输出）。
 _TOOLS_REQUEST_MARK = "[[tools]]"
+_SUBAGENT_TOOL_NAME = "call_subagent"
 
 _EMOJI_SEARCH_RE = re.compile(r"\[\[search_emoji:([^\]]+)\]\]")
 
@@ -820,8 +821,6 @@ class Main(Star):
             tool_set = self._build_tool_set()
             tool_round = False
             tool_rounds = 0
-            tools_armed = False
-            tools_requested = False
             t_round_start = time.monotonic()
             t_first_token: float | None = None
             t_first_send: float | None = None
@@ -855,13 +854,12 @@ class Main(Star):
                             if tool_set.get_tool(name)
                         )
                         system_prompt += (
-                            "\n\n【可用工具目录】仅在确实需要时使用；需要完整参数时输出 "
-                            f"{_TOOLS_REQUEST_MARK}。可用工具：{tool_index}"
+                            "\n\n【可用工具目录】可直接调用的工具如下，需要时直接用：\n"
+                            f"{tool_index}"
                         )
                     if _tool_intent_hint(current_text) and tool_set:
                         system_prompt += (
-                            "\n【工具提示】当前消息看起来可能需要工具，请认真判断；"
-                            f"如需要请输出 {_TOOLS_REQUEST_MARK}。"
+                            "\n【工具提示】当前消息看起来可能需要工具，请认真判断并直接调用。"
                         )
                     if self.reminder:
                         system_prompt = f"{system_prompt}\n\n{self.reminder}"
@@ -929,7 +927,7 @@ class Main(Star):
                     async for resp in self.chat_client.chat_stream_raw(
                         messages,
                         images=image_urls,
-                        func_tool=(tool_set if (tool_round or tools_armed) else None),
+                        func_tool=tool_set,
                         log_name="latest_chat",
                     ):
                         if resp.is_chunk:
@@ -950,7 +948,7 @@ class Main(Star):
                 image_urls = []
 
                 async def send_fn(segment: str) -> None:
-                    nonlocal t_first_send, reply_decision_task, tools_requested
+                    nonlocal t_first_send, reply_decision_task
                     nonlocal reply_decision_started
                     nonlocal reply_decision
                     nonlocal emoji_search_query
@@ -967,7 +965,6 @@ class Main(Star):
                         t_first_send = time.monotonic()
                     if _TOOLS_REQUEST_MARK in segment:
                         segment = segment.replace(_TOOLS_REQUEST_MARK, "").strip()
-                        tools_requested = True
                         if not segment:
                             return
                     search = _EMOJI_SEARCH_RE.search(segment)
@@ -1062,16 +1059,6 @@ class Main(Star):
                         f" first_send={((t_first_send or time.monotonic()) - t_round_start) * 1000:.0f}ms"
                         f" total={(time.monotonic() - t_round_start) * 1000:.0f}ms"
                     )
-                    if (
-                        tools_requested
-                        and tool_set
-                        and not tools_armed
-                        and not tool_calls
-                        and tool_rounds == 0
-                    ):
-                        tools_armed = True
-                        tool_rounds += 1
-                        continue
                     # Stream finished naturally. If the model requested tool
                     # calls, execute them, feed the results back and loop
                     # again without rebuilding the messages (the tool results
@@ -1271,9 +1258,11 @@ class Main(Star):
             )
         if self.tools_enabled:
             rules += (
-                "④ 如果请求需要查资料、执行操作或定时提醒，直接调用系统提供的工具；"
-                "不要把工具名称、JSON 参数或调用过程写成普通文本。工具调用完成后，"
-                "再用自然语言回复用户；不需要工具时直接聊天。旧版兼容标记 "
+                "④ 你拥有少量直接工具：查用户公开信息、读写文件、执行命令、"
+                "以及委托子 Agent。需要查资料、执行操作、调用其他插件能力时"
+                "直接调用这些工具；不要把工具名称、JSON 参数或调用过程写成"
+                "普通文本。工具调用完成后，再用自然语言回复用户；"
+                "不需要工具时直接聊天。旧版兼容标记 "
                 + _TOOLS_REQUEST_MARK
                 + " 如出现也必须独占一行，但通常不需要输出它。"
             )
@@ -1471,31 +1460,51 @@ class Main(Star):
         return messages
 
     def _build_tool_set(self) -> ToolSet | None:
-        """Build the ToolSet from AstrBot's registered tools, once.
+        """Build the main agent's ToolSet, once.
 
-        Includes all plugin-registered tools (``llm_tools.func_list``) plus
-        AstrBot's built-in future-task tool and ChatCore's own
-        ``get_user_public_info`` observation tool. None when tools are
-        disabled or nothing is registered.
+        The chat agent only carries a small direct toolset:
+        ``call_subagent`` (delegates everything else to a subagent with the
+        full tool list), the ``get_user_public_info`` observation tool, and
+        the sandboxed file/bash tools. Everything else lives behind the
+        subagent so the chat model is not drowned in tool schemas.
 
         Returns:
-            The ToolSet, or None when there are no tools.
+            The ToolSet, or None when tools are disabled or no subagent is
+            configured.
         """
         if not self.tools_enabled:
             return None
         if self._tool_set is not None:
             return self._tool_set
         try:
+            from astrbot.core.agent.handoff import HandoffTool
             from astrbot.core.agent.tool import FunctionTool
-            from astrbot.core.provider.register import llm_tools
-            from astrbot.core.tools.cron_tools import FutureTaskTool
 
             ts = ToolSet()
-            for tool in llm_tools.func_list:
-                ts.add_tool(tool)
-            ts.add_tool(
-                self.context.get_llm_tool_manager().get_builtin_tool(FutureTaskTool)
+            orchestrator = getattr(self.context, "subagent_orchestrator", None)
+            handoffs = getattr(orchestrator, "handoffs", None) or []
+            handoff = next(
+                (
+                    item
+                    for item in handoffs
+                    if getattr(item, "agent", None) is not None
+                ),
+                None,
             )
+            if handoff is not None:
+                subagent_tool = HandoffTool(
+                    agent=handoff.agent,
+                    tool_description=(
+                        "静默委托任务给后台子 Agent。需要查询信息、执行操作、"
+                        "使用外部能力或调用插件工具时调用；不要向用户透露"
+                        "子 Agent 或工具调用过程。"
+                    ),
+                )
+                subagent_tool.name = _SUBAGENT_TOOL_NAME
+                subagent_tool.provider_id = getattr(handoff, "provider_id", None)
+                ts.add_tool(subagent_tool)
+            else:
+                self.logger.warning("ChatCore: no configured subagent is available")
             ts.add_tool(
                 FunctionTool(
                     name="get_user_public_info",
@@ -1517,58 +1526,25 @@ class Main(Star):
                     handler=self._public_info_tool_handler,
                 )
             )
-            ts.add_tool(
-                FunctionTool(
-                    name="schedule_task",
-                    description=(
-                        "Create, list or delete a scheduled reminder. "
-                        "Use action='create' with an ISO run_at datetime and a note "
-                        "describing what to say to the user when it fires; "
-                        "action='list' lists tasks; action='delete' removes one by job_id."
-                    ),
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "action": {
-                                "type": "string",
-                                "enum": ["create", "list", "delete"],
-                                "description": "Action to perform.",
-                            },
-                            "name": {
-                                "type": "string",
-                                "description": "Optional task label.",
-                            },
-                            "note": {
-                                "type": "string",
-                                "description": "What to say when the task fires.",
-                            },
-                            "run_at": {
-                                "type": "string",
-                                "description": "ISO datetime for one-time execution, e.g. 2026-02-02T08:00:00+08:00.",
-                            },
-                            "job_id": {
-                                "type": "string",
-                                "description": "Task id, required for delete.",
-                            },
-                        },
-                        "required": ["action"],
-                    },
-                    handler=self._schedule_tool_handler,
-                )
-            )
-            self._add_sandbox_tools(ts, FunctionTool)
+            self._add_sandbox_tools(ts, FunctionTool, direct_only=True)
             self._tool_set = ts if not ts.empty() else None
         except Exception as e:
             self.logger.warning(f"ChatCore: tool set build failed: {e}")
             self._tool_set = None
         return self._tool_set
 
-    def _add_sandbox_tools(self, ts: ToolSet, FunctionTool) -> None:
+    def _add_sandbox_tools(
+        self, ts: ToolSet, FunctionTool, direct_only: bool = False
+    ) -> None:
         """Register ChatCore's sandboxed agent tools on the tool set.
 
         Args:
             ts: The ToolSet to populate.
             FunctionTool: The FunctionTool class to instantiate.
+            direct_only: When True only the compact direct set is added
+                (read_files, write_files, edit_files, bash); the rest
+                (fetch, screenshot_bash, list_files, forward tools) are left
+                for the subagent.
         """
         sandbox = self.sandbox
         specs = [
@@ -1672,7 +1648,10 @@ class Main(Star):
                 sandbox.fetch,
             ),
         ]
+        direct_names = {"read_files", "write_files", "edit_files", "bash"}
         for name, desc, props, required, handler in specs:
+            if direct_only and name not in direct_names:
+                continue
             ts.add_tool(
                 FunctionTool(
                     name=name,
@@ -1685,6 +1664,8 @@ class Main(Star):
                     handler=handler,
                 )
             )
+        if direct_only:
+            return
         ts.add_tool(
             FunctionTool(
                 name="read_forward",
