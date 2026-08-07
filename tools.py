@@ -48,8 +48,14 @@ def _resolve_chroot_path(chroot: str | Path, target: str) -> Path:
 class SandboxTools:
     """Filesystem / bash / fetch tools confined to a sandbox root.
 
+    Reads are allowed anywhere inside ``chroot`` (the AstrBot project root by
+    default, so the model can inspect framework/plugin code). Writes are
+    confined to ``write_root`` (the plugin's staging directory) — every write
+    path is resolved against it and rejected otherwise.
+
     Args:
-        chroot: Sandbox root directory (plugin data dir).
+        chroot: Read-only sandbox root.
+        write_root: The only directory where writes are permitted.
         bash_timeout: Default timeout for bash commands, in seconds.
         fetch_max_bytes: Maximum response body size for fetch, in bytes.
     """
@@ -57,13 +63,32 @@ class SandboxTools:
     def __init__(
         self,
         chroot: str | Path,
+        write_root: str | Path | None = None,
         bash_timeout: float = _BASH_DEFAULT_TIMEOUT,
         fetch_max_bytes: int = _FETCH_MAX_BYTES,
     ) -> None:
         self.chroot = Path(chroot)
         self.chroot.mkdir(parents=True, exist_ok=True)
+        self.write_root = (
+            Path(write_root) if write_root is not None else self.chroot
+        )
+        self.write_root.mkdir(parents=True, exist_ok=True)
         self.bash_timeout = max(1.0, float(bash_timeout))
         self.fetch_max_bytes = max(1024, int(fetch_max_bytes))
+
+    def _resolve_write_path(self, target: str) -> Path:
+        """Resolve a write target inside ``write_root``, rejecting escapes.
+
+        Args:
+            target: The requested path (absolute or relative to write_root).
+
+        Returns:
+            The absolute path inside the write root.
+
+        Raises:
+            ValueError: When the path escapes the write root.
+        """
+        return _resolve_chroot_path(self.write_root, target)
 
     async def read_files(
         self,
@@ -152,7 +177,7 @@ class SandboxTools:
             dict: ``{"ok": True}`` 或 ``{"error": ...}``。
         """
         try:
-            target = _resolve_chroot_path(self.chroot, path)
+            target = self._resolve_write_path(path)
         except ValueError as e:
             return {"error": str(e)}
         if len(content or "") > _MAX_FILE_BYTES:
@@ -160,7 +185,7 @@ class SandboxTools:
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content or "", encoding="utf-8")
-            return {"ok": True, "path": str(target.relative_to(self.chroot))}
+            return {"ok": True, "path": str(target.relative_to(self.write_root))}
         except OSError as e:
             return {"error": f"写入失败: {e}"}
 
@@ -179,7 +204,7 @@ class SandboxTools:
             dict: ``{"ok": True}`` 或 ``{"error": ...}``。
         """
         try:
-            target = _resolve_chroot_path(self.chroot, path)
+            target = self._resolve_write_path(path)
         except ValueError as e:
             return {"error": str(e)}
         if not target.is_file():
@@ -192,7 +217,7 @@ class SandboxTools:
         if count != 1:
             return {"error": f"old 文本在文件中出现 {count} 次，要求恰好 1 次"}
         target.write_text(text.replace(old, new), encoding="utf-8")
-        return {"ok": True, "path": str(target.relative_to(self.chroot))}
+        return {"ok": True, "path": str(target.relative_to(self.write_root))}
 
     async def bash(self, event, command: str, timeout: float = 0) -> dict:
         """在沙箱根目录执行终端命令。

@@ -43,7 +43,10 @@ from astrbot.core.message.message_event_result import (
 from astrbot.core.pipeline.context_utils import call_event_hook
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.star.star_handler import EventType, star_handlers_registry
-from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+from astrbot.core.utils.astrbot_path import (
+    get_astrbot_path,
+    get_astrbot_plugin_data_path,
+)
 
 from .actions import parse_actions, parse_reply_decision
 from .affinity import AffinityManager
@@ -241,14 +244,17 @@ class Main(Star):
         self.max_tool_rounds = max(1, int(chat_main_cfg.get("max_tool_rounds", 3)))
         self._tool_set: ToolSet | None = None
         sandbox_cfg = config.get("sandbox", {})
+        # 读沙箱：整个 AstrBot 项目根目录（框架/插件代码可读，兼容 docker 与
+        # 普通部署，不写死路径）；写沙箱：仅插件 staging 目录。
         self.sandbox_root = Path(
-            sandbox_cfg.get(
-                "root",
-                Path(get_astrbot_plugin_data_path()) / "astrbot_plugin_chatcore" / "sandbox",
-            )
+            sandbox_cfg.get("root", get_astrbot_path())
         )
+        self.sandbox_write_root = Path(
+            get_astrbot_plugin_data_path()
+        ) / "astrbot_plugin_chatcore" / "selfimprove" / "staging"
         self.sandbox = SandboxTools(
             self.sandbox_root,
+            write_root=self.sandbox_write_root,
             bash_timeout=float(sandbox_cfg.get("bash_timeout", 30)),
             fetch_max_bytes=int(sandbox_cfg.get("fetch_max_bytes", 2 * 1024 * 1024)),
         )
@@ -3532,7 +3538,10 @@ class Main(Star):
         sample_path = Path(session_root) / "chat_samples.txt"
         sample_path.write_text("\n\n".join(samples) or "(无聊天样本)", encoding="utf-8")
 
-        src_sandbox = SandboxTools(self.selfimprove.source_dir)
+        src_sandbox = SandboxTools(
+            self.selfimprove.source_dir,
+            write_root=self.selfimprove.staging_dir / "no_write",
+        )
         staging_sandbox = SandboxTools(session_root)
         from astrbot.core.agent.tool import FunctionTool, ToolSet
 
