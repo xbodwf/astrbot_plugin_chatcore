@@ -2920,6 +2920,9 @@ class Main(Star):
         if len(parts) > 1 and parts[1].lower() == "view":
             yield self._chatcore_view_pending(event)
             return
+        if len(parts) > 1 and parts[1].lower() == "improve":
+            yield await self._chatcore_improve(event)
+            return
         if len(parts) > 1 and parts[1].lower() == "approve":
             yield await self._chatcore_approve(event, parts)
             return
@@ -3027,6 +3030,37 @@ class Main(Star):
             self.logger.warning(f"ChatCore reset: clear astrbot history failed: {e}")
         self.logger.info(f"ChatCore reset | {conv_id} | by {event.get_sender_id()}")
         return event.plain_result("✅ ChatCore 会话已重置。")
+
+    async def _chatcore_improve(self, event: AstrMessageEvent):
+        """Manually trigger a self-improvement session right now.
+
+        Args:
+            event: Current platform message event.
+
+        Returns:
+            The plain result to send.
+        """
+        if not self.selfimprove:
+            yield event.plain_result("自改进未启用。")
+            return
+        if not event.is_admin():
+            yield event.plain_result("只有管理员可以触发自我改进。")
+            return
+        yield event.plain_result("开始自我改进会话，完成后可用 chatcore view 查看…")
+        try:
+            await self._run_selfimprove_once()
+        except Exception as e:
+            self.logger.warning(f"ChatCore improve failed: {e}")
+            yield event.plain_result(f"自我改进会话失败: {e}")
+            return
+        pending = self.selfimprove.list_pending()
+        if pending:
+            yield event.plain_result(
+                f"已完成，产生 {len(pending)} 个待审批项。"
+                "用 chatcore view 查看 diff，chatcore approve <id> 应用。"
+            )
+        else:
+            yield event.plain_result("会话完成，但 AI 没有提交任何改动。")
 
     def _chatcore_view_pending(self, event: AstrMessageEvent):
         """List pending self-improvements with their diffs.
@@ -3377,12 +3411,11 @@ class Main(Star):
             system_prompt=persona + "\n\n" + _SELFIMPROVE_SYSTEM_PROMPT,
         )
         try:
-            resp = await self.chat_client.chat_stream_raw(
+            async for r in self.chat_client.chat_stream_raw(
                 req.contexts,
                 func_tool=tool_set,
                 log_name="latest_selfimprove",
-            )
-            for r in resp:
+            ):
                 if isinstance(r, LLMResponse) and not r.is_chunk:
                     self.logger.info(
                         f"ChatCore self-improve done | {r.completion_text[:200]}"
