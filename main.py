@@ -3072,6 +3072,9 @@ class Main(Star):
         if len(parts) > 1 and parts[1].lower() == "reject":
             yield self._chatcore_reject(event, parts)
             return
+        if len(parts) > 1 and parts[1].lower() == "reload":
+            yield await self._chatcore_reload(event)
+            return
         lines = [
             "ChatCore 运行状态：",
             f"- 聊天模型: {self.chat_provider_id or '(未配置)'}",
@@ -3330,6 +3333,32 @@ class Main(Star):
         if self.selfimprove.reject(pid):
             return event.plain_result(f"已拒绝 {pid}。")
         return event.plain_result(f"未找到 {pid}。")
+
+    async def _chatcore_reload(self, event: AstrMessageEvent):
+        """Reload the plugin itself (``chatcore reload``).
+
+        Re-reads the plugin code from disk, so changes synced into the plugin
+        directory take effect without restarting AstrBot.
+
+        Args:
+            event: Current platform message event.
+
+        Returns:
+            The plain result to send.
+        """
+        if not event.is_admin():
+            yield event.plain_result("只有管理员可以重载插件。")
+            return
+        yield event.plain_result("正在重载 ChatCore 插件…")
+        try:
+            manager = getattr(self.context, "_star_manager", None)
+            if manager is None:
+                yield event.plain_result("未找到插件管理器，重载失败。")
+                return
+            await manager.reload("astrbot_plugin_chatcore")
+        except Exception as e:
+            self.logger.warning(f"ChatCore reload failed: {e}", exc_info=True)
+            yield event.plain_result(f"重载失败: {e}")
 
     async def initialize(self) -> None:
         """Start background tasks when the plugin is activated."""
