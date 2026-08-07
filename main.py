@@ -3035,7 +3035,7 @@ class Main(Star):
             yield self._chatcore_view_pending(event)
             return
         if len(parts) > 1 and parts[1].lower() == "improve":
-            async for result in self._chatcore_improve(event):
+            async for result in self._chatcore_improve(event, parts):
                 yield result
             return
         if len(parts) > 1 and parts[1].lower() == "stop-improve":
@@ -3150,16 +3150,19 @@ class Main(Star):
         self.logger.info(f"ChatCore reset | {conv_id} | by {event.get_sender_id()}")
         return event.plain_result("✅ ChatCore 会话已重置。")
 
-    async def _chatcore_improve(self, event: AstrMessageEvent):
+    async def _chatcore_improve(self, event: AstrMessageEvent, parts: list[str]):
         """Manually trigger a self-improvement session right now.
 
         Rejects when a session is already running. The session runs in a
         background task so the command returns immediately; it ends when the
         AI calls ``stop_improvement``, ``chatcore stop-improve`` is issued,
-        or the hard round cap is reached.
+        or the hard round cap is reached. Extra words after ``improve`` are
+        passed to the AI as a focus hint, e.g.
+        ``chatcore improve 重点看上下文构建``.
 
         Args:
             event: Current platform message event.
+            parts: Whitespace-split message words.
 
         Returns:
             The plain result to send.
@@ -3173,12 +3176,13 @@ class Main(Star):
         if self._improve_running:
             yield event.plain_result("已有一个自我改进会话在运行中，请等待其结束。")
             return
+        hint = " ".join(parts[2:]).strip()
         self._improve_running = True
         self._improve_stop = False
 
         async def _run() -> None:
             try:
-                await self._run_selfimprove_once()
+                await self._run_selfimprove_once(hint)
             except asyncio.CancelledError:
                 self.logger.info("ChatCore self-improve cancelled by user")
                 raise
@@ -3191,6 +3195,7 @@ class Main(Star):
         yield event.plain_result(
             "开始自我改进会话（后台运行）。可用 chatcore stop-improve 停止，"
             "完成后用 chatcore view 查看结果…"
+            + (f"\n提示词: {hint}" if hint else "")
         )
 
     def _chatcore_stop_improve(self, event: AstrMessageEvent):
@@ -3446,11 +3451,14 @@ class Main(Star):
             finally:
                 self._improve_running = False
 
-    async def _run_selfimprove_once(self) -> None:
+    async def _run_selfimprove_once(self, hint: str = "") -> None:
         """Run one self-improvement session.
 
         The session tools are sandbox-local (read source, write staging,
         ruff, submit) and are invoked directly without a message event.
+
+        Args:
+            hint: Optional admin-provided focus hint for the AI.
 
         Returns:
             None.
@@ -3600,7 +3608,12 @@ class Main(Star):
                 },
                 {
                     "role": "user",
-                    "content": "开始分析并改进。",
+                    "content": "开始分析并改进。"
+                    + (
+                        f"\n\n【管理员提示】本次重点方向：{hint}"
+                        if hint
+                        else ""
+                    ),
                 },
             ],
             system_prompt=persona + "\n\n" + _SELFIMPROVE_SYSTEM_PROMPT,
