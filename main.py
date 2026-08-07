@@ -63,7 +63,12 @@ from .memory import MemoryStore
 from .profile import ProfileStore
 from .request_log import RequestLogger
 from .segmentation import build_interval_calc, stream_respond
-from .selfimprove import SelfImprove, _SYSTEM_PROMPT as _SELFIMPROVE_SYSTEM_PROMPT, ruff_check
+from .selfimprove import (
+    SelfImprove,
+    _SYSTEM_PROMPT as _SELFIMPROVE_SYSTEM_PROMPT,
+    _is_legit_source_file,
+    ruff_check,
+)
 from .selflearn import SelfLearnStore, _REFLECT_PROMPT, parse_reflection
 from .tools import SandboxTools
 from .webui import ChatCoreWebUI
@@ -3793,7 +3798,9 @@ class Main(Star):
         files = sorted(
             p.name
             for p in session_dir.iterdir()
-            if p.is_file() and p.name != "chat_samples.txt"
+            if p.is_file()
+            and p.name != "chat_samples.txt"
+            and _is_legit_source_file(self.selfimprove.source_dir, p.name)
         )
         if not files:
             return

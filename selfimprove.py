@@ -95,7 +95,9 @@ class SelfImprove:
             files = sorted(
                 p.name
                 for p in session_dir.iterdir()
-                if p.is_file() and p.name != "chat_samples.txt"
+                if p.is_file()
+                and p.name != "chat_samples.txt"
+                and _is_legit_source_file(self.source_dir, p.name)
             )
             if not files:
                 continue
@@ -104,7 +106,8 @@ class SelfImprove:
                 "（孤儿 staging：AI 未提交，启动时自动登记）",
                 files,
             )
-            registered.append(pid)
+            if pid:
+                registered.append(pid)
             break
         return registered
 
@@ -132,20 +135,31 @@ class SelfImprove:
     ) -> str:
         """Register a pending improvement from a session's staging files.
 
+        Files that are not legitimate source files (probes, temp files,
+        path traversal) are filtered out; if nothing remains, no pending
+        record is created.
+
         Args:
             session_id: Staging root folder name.
             note: Model's explanation of the change.
             files: Relative file paths changed within the session.
 
         Returns:
-            The new pending id.
+            The new pending id, or an empty string when nothing valid.
         """
+        valid = [
+            rel
+            for rel in files
+            if _is_legit_source_file(self.source_dir, rel)
+        ]
+        if not valid:
+            return ""
         pid = uuid.uuid4().hex[:10]
         self._pending[pid] = {
             "id": pid,
             "session": session_id,
             "note": note,
-            "files": files,
+            "files": valid,
             "created_at": time.time(),
         }
         self._save()
@@ -271,6 +285,33 @@ class SelfImprove:
         self._save()
         shutil.rmtree(session, ignore_errors=True)
         return True
+
+
+def _is_legit_source_file(source_dir: Path, rel: str) -> bool:
+    """Whether a relative path is a legitimate plugin source file.
+
+    Existing source files are always fine. New files must be plausible
+    plugin files (python modules, schema, metadata) and must not look like
+    temporary probes (``ruff_probe``, ``test_`` probes, ``tmp_`` etc.).
+
+    Args:
+        source_dir: Plugin source directory.
+        rel: Relative file path.
+
+    Returns:
+        True when the file is legitimate.
+    """
+    name = Path(str(rel)).name
+    if not str(rel).strip() or ".." in str(rel):
+        return False
+    if (source_dir / rel).is_file():
+        return True
+    lowered = name.lower()
+    if lowered.startswith(("ruff_", "probe", "test_", "tmp_", "._")):
+        return False
+    if name.endswith((".py", ".json", ".yaml", ".md", ".txt")):
+        return True
+    return False
 
 
 async def ruff_check(paths: list[str]) -> tuple[bool, str]:
