@@ -3517,7 +3517,9 @@ class Main(Star):
                     "content": persona
                     + "\n\n"
                     + _SELFIMPROVE_SYSTEM_PROMPT
-                    + f"\n聊天样本文件: {sample_path}",
+                    + "\n\n【聊天样本】以下是最近对话片段，用于发现你在角色扮演中的"
+                    "降智行为与改进点：\n"
+                    + ("\n".join(samples)[:1500] or "(无聊天样本)"),
                 },
                 {
                     "role": "user",
@@ -3528,7 +3530,7 @@ class Main(Star):
         )
         messages = list(req.contexts)
         try:
-            for _ in range(self.max_tool_rounds + 3):
+            for _ in range(30):
                 tool_calls: tuple | None = None
                 async for r in self.chat_client.chat_stream_raw(
                     messages,
