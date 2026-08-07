@@ -3392,6 +3392,9 @@ class Main(Star):
     async def _run_selfimprove_once(self) -> None:
         """Run one self-improvement session.
 
+        The session tools are sandbox-local (read source, write staging,
+        ruff, submit) and are invoked directly without a message event.
+
         Returns:
             None.
         """
@@ -3564,9 +3567,21 @@ class Main(Star):
                     }
                 )
                 for name, args, tid in zip(names, args_list, ids):
-                    result = await self._execute_tool(
-                        event, tool_set, name, args or {}
-                    )
+                    tool = tool_set.get_tool(name)
+                    if tool is None or tool.handler is None:
+                        result = f"error: tool {name} not found"
+                    else:
+                        try:
+                            raw = tool.handler(None, **dict(args or {}))
+                            if asyncio.iscoroutine(raw):
+                                raw = await raw
+                            result = (
+                                json.dumps(raw, ensure_ascii=False, default=str)
+                                if isinstance(raw, dict)
+                                else str(raw)
+                            )
+                        except Exception as e:
+                            result = f"error: tool {name} failed: {e}"
                     messages.append(
                         {
                             "role": "tool",
