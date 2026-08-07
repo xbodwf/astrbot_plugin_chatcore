@@ -13,6 +13,7 @@ import os
 import random
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -1402,6 +1403,129 @@ class Main(Star):
             "notice": "仅昵称和性别可作为可靠参考，其他字段可能为默认值或不可用。",
         }
 
+    def _build_subagent_tool_set(self) -> ToolSet:
+        """Build the full tool set handed to the subagent.
+
+        The subagent gets every plugin-registered tool (``llm_tools.func_list``),
+        AstrBot's built-in tools, ChatCore's full sandbox tool set and the
+        observation tool — everything the chat main agent deliberately keeps
+        out of its own context.
+
+        Returns:
+            The full ToolSet.
+        """
+        from astrbot.core.agent.tool import FunctionTool, ToolSet
+        from astrbot.core.provider.register import llm_tools
+        from astrbot.core.tools.cron_tools import FutureTaskTool
+
+        ts = ToolSet()
+        for tool in llm_tools.func_list:
+            ts.add_tool(tool)
+        try:
+            ts.add_tool(
+                self.context.get_llm_tool_manager().get_builtin_tool(FutureTaskTool)
+            )
+        except Exception:
+            pass
+        self._add_sandbox_tools(ts, FunctionTool)
+        ts.add_tool(
+            FunctionTool(
+                name="get_user_public_info",
+                description=(
+                    "获取指定 QQ 用户的公开信息（昵称、性别、年龄、等级等）。"
+                    "传入目标 QQ 号即可。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "target_id": {
+                            "type": "string",
+                            "description": "目标用户的 QQ 号。",
+                        }
+                    },
+                    "required": ["target_id"],
+                },
+                handler=self._public_info_tool_handler,
+            )
+        )
+        return ts
+
+    async def _subagent_tool_handler(
+        self,
+        event: AstrMessageEvent,
+        input: str,
+        background_task: bool = False,
+    ) -> dict:
+        """Handler for the self-implemented ``call_subagent`` tool.
+
+        Delegates the task to a fresh sub-agent session with the full tool
+        set (plugin tools, sandbox, filesystem, terminal, network). The
+        sub-agent carries the main persona as reference only.
+
+        Args:
+            event: The message event driving the tool call.
+            input: The full task description.
+            background_task: Whether to run in the background.
+
+        Returns:
+            A dict with the sub-agent's final text (or a task id).
+        """
+        if not (input or "").strip():
+            return {"error": "没有提供任务描述"}
+        try:
+            persona = (await self._resolve_persona_prompt("")) or FALLBACK_SYSTEM_PROMPT
+        except Exception:
+            persona = FALLBACK_SYSTEM_PROMPT
+        sub_tools = self._build_subagent_tool_set()
+        system_prompt = (
+            persona
+            + "\n\n你是被委托执行任务的子 Agent。使用提供的工具完成主 Agent "
+            "交给你的任务：查询信息、执行操作、调用插件能力。完成后用自然语言"
+            "简洁汇报结果，不要提及自己是子 Agent 或工具调用过程。"
+        )
+        prov_id = self.chat_provider_id
+        if background_task:
+            task_id = uuid.uuid4().hex[:10]
+
+            async def _run() -> None:
+                try:
+                    resp = await self.context.tool_loop_agent(
+                        event=event,
+                        chat_provider_id=prov_id,
+                        prompt=input,
+                        tools=sub_tools,
+                        system_prompt=system_prompt,
+                        max_steps=max(10, self.max_tool_rounds * 3),
+                    )
+                    self.logger.info(
+                        f"ChatCore subagent bg done | {task_id} | "
+                        f"{(resp.completion_text or '')[:200]}"
+                    )
+                    await self.context.send_message(
+                        event.unified_msg_origin,
+                        MessageChain().message(
+                            f"[后台任务完成] {resp.completion_text or '（无结果）'}"
+                        ),
+                    )
+                except Exception as e:
+                    self.logger.warning(f"ChatCore subagent bg failed: {e}")
+
+            asyncio.create_task(_run())
+            return {"ok": True, "task_id": task_id, "status": "background"}
+        try:
+            resp = await self.context.tool_loop_agent(
+                event=event,
+                chat_provider_id=prov_id,
+                prompt=input,
+                tools=sub_tools,
+                system_prompt=system_prompt,
+                max_steps=max(10, self.max_tool_rounds * 3),
+            )
+        except Exception as e:
+            self.logger.warning(f"ChatCore subagent failed: {e}")
+            return {"error": f"子 Agent 执行失败: {e}"}
+        return {"result": resp.completion_text or "（无结果）"}
+
     def _merge_llm_request(
         self,
         req: ProviderRequest,
@@ -1477,34 +1601,41 @@ class Main(Star):
         if self._tool_set is not None:
             return self._tool_set
         try:
-            from astrbot.core.agent.handoff import HandoffTool
             from astrbot.core.agent.tool import FunctionTool
 
             ts = ToolSet()
-            orchestrator = getattr(self.context, "subagent_orchestrator", None)
-            handoffs = getattr(orchestrator, "handoffs", None) or []
-            handoff = next(
-                (
-                    item
-                    for item in handoffs
-                    if getattr(item, "agent", None) is not None
-                ),
-                None,
-            )
-            if handoff is not None:
-                subagent_tool = HandoffTool(
-                    agent=handoff.agent,
-                    tool_description=(
+            ts.add_tool(
+                FunctionTool(
+                    name=_SUBAGENT_TOOL_NAME,
+                    description=(
                         "静默委托任务给后台子 Agent。需要查询信息、执行操作、"
-                        "使用外部能力或调用插件工具时调用；不要向用户透露"
-                        "子 Agent 或工具调用过程。"
+                        "使用外部能力或调用插件工具时调用；子 Agent 拥有完整的"
+                        "工具集（插件工具、文件、终端、网络等）。"
+                        "不要向用户透露子 Agent 或工具调用过程。"
                     ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "input": {
+                                "type": "string",
+                                "description": (
+                                    "要委托的完整任务描述，包括必要上下文、"
+                                    "目标和约束。"
+                                ),
+                            },
+                            "background_task": {
+                                "type": "boolean",
+                                "description": (
+                                    "默认 false。任务耗时较长或用户不需要等待时"
+                                    "设为 true（完成后提醒用户）。"
+                                ),
+                            },
+                        },
+                        "required": ["input"],
+                    },
+                    handler=self._subagent_tool_handler,
                 )
-                subagent_tool.name = _SUBAGENT_TOOL_NAME
-                subagent_tool.provider_id = getattr(handoff, "provider_id", None)
-                ts.add_tool(subagent_tool)
-            else:
-                self.logger.warning("ChatCore: no configured subagent is available")
+            )
             ts.add_tool(
                 FunctionTool(
                     name="get_user_public_info",
