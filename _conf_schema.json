@@ -222,7 +222,7 @@
         "description": "分段发送间隔(秒)",
         "type": "string",
         "default": "1+length*0.07",
-        "hint": "每段发送后的等待秒数。可以是固定数字（如 1），或按段字数计算的公式，公式中 length 代表该段字数，可用 log/sqrt/abs/min/max/floor/ceil 等，如 1+length*0.07（20 字段约等 2.4 秒）、log(length)、1。留空回退 1 秒"
+        "hint": "每段发送后的等待秒数。可以填固定数字（如 1 或 1.5，旧配置里的数字也兼容），或按段字数计算的公式字符串，公式中 length 代表该段字数，可用 log/sqrt/abs/min/max/floor/ceil 等，如 1+length*0.07（20 字段约等 2.4 秒）、log(length)。留空回退 1 秒"
       },
       "max_segment_chars": {
         "description": "单段最大字符数",
