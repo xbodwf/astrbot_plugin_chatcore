@@ -451,6 +451,9 @@ class Main(Star):
                 / "selflearn.json",
                 max_rules=int(selflearn_cfg.get("max_rules", 6)),
                 embed_fn=self._embed_fn,
+                min_new_messages=int(
+                    selflearn_cfg.get("min_new_messages", 20)
+                ),
             )
         self._selflearn_task: asyncio.Task | None = None
 
@@ -1357,7 +1360,9 @@ class Main(Star):
         if self.affinity_mgr and sender_id:
             rules += self.affinity_mgr.inject_text(sender_id)
         if self.selflearn:
-            learned = self.selflearn.render()
+            # 只注入与当前对话场景匹配的规则，提高命中率、减小 prompt。
+            scene_context = self.context_mgr.summary_text(conv_id, max_chars=300)
+            learned = self.selflearn.render(scene_context)
             if learned:
                 rules += "\n\n" + learned
         if sender_id and event is not None:
@@ -3475,6 +3480,9 @@ class Main(Star):
         for conv_id in self.context_mgr.active_conversations():
             if conv_id in self.active_tasks:
                 continue
+            records = self.context_mgr._history(conv_id)
+            if not self.selflearn.has_enough_new_messages(conv_id, len(records)):
+                continue
             context_text = self.context_mgr.summary_text(conv_id, max_chars=2500)
             if not context_text:
                 continue
@@ -3502,6 +3510,7 @@ class Main(Star):
             parsed = parse_reflection(raw)
             if await self.selflearn.merge(parsed):
                 reflected = True
+            self.selflearn.mark_reflected(conv_id, len(records))
         if reflected:
             self.selflearn.last_reflect_at = time.time()
             self.selflearn._save()
