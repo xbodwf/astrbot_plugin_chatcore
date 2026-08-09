@@ -294,17 +294,17 @@ class Main(Star):
         if time_rules_conf is None:
             time_rules_conf = list(DEFAULT_TIME_RULES)
         self.attention = AttentionManager(
-            bubble_base=attn.get("bubble_base_prob", 0.02),
-            active_cap=attn.get("active_max_prob", 0.30),
+            bubble_base=attn.get("bubble_base_prob", 0.01),
+            active_cap=attn.get("active_max_prob", 0.10),
             decay_minutes=attn.get("decay_minutes", 10.0),
-            hard_trigger_boost=attn.get("hard_trigger_boost", 0.10),
-            cool_down_seconds=attn.get("cool_down_seconds", 120),
-            no_action_backoff=attn.get("no_action_backoff", 0.6),
-            backoff_floor=attn.get("backoff_floor", 0.25),
+            hard_trigger_boost=attn.get("hard_trigger_boost", 0.06),
+            cool_down_seconds=attn.get("cool_down_seconds", 180),
+            no_action_backoff=attn.get("no_action_backoff", 0.5),
+            backoff_floor=attn.get("backoff_floor", 0.02),
             time_rules=time_rules_conf,
             read_air_factor=attn.get("read_air_factor", 0.5),
             others_density_threshold=attn.get("others_density_threshold", 3),
-            followup_boost=attn.get("followup_boost", 0.05),
+            followup_boost=attn.get("followup_boost", 0.03),
             poke_decay_seconds=float(attn.get("poke_decay_seconds", 300)),
             poke_first_boost=float(attn.get("poke_first_boost", 0.2)),
             poke_step_boost=float(attn.get("poke_step_boost", 0.08)),
@@ -498,10 +498,10 @@ class Main(Star):
         implicit_cfg = config.get("implicit", {})
         self.implicit_enabled = implicit_cfg.get("enabled", True)
         self.implicit_interval = max(
-            1,
-            int(implicit_cfg.get("interval_minutes", 30)),
+            30,
+            int(implicit_cfg.get("interval_minutes", 90)),
         )
-        self.implicit_boost = implicit_cfg.get("prob_boost", 0.05)
+        self.implicit_boost = implicit_cfg.get("prob_boost", 0.02)
         self.implicit_prompt = (
             str(implicit_cfg.get("prompt", "")).strip() or DEFAULT_IMPLICIT_PROMPT
         )
