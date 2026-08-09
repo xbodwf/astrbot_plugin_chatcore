@@ -13,6 +13,7 @@ stays honest about failures instead of staying in character.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -21,27 +22,42 @@ from pathlib import Path
 _REFLECT_PROMPT = (
     "以下是最近的聊天记录片段（你自己是 {name}）。\n"
     "{sample}\n\n"
-    "请以冷静的旁观者视角分析这段对话，找出：\n"
-    "1. 你自己的哪些回复显得机械、降智、不像真人（如汇报式语气、重复套话、过度礼貌）；\n"
-    "2. 哪些表达方式与对方合拍、效果好，值得保留；\n"
-    "3. 对方的明显偏好（话题、语气、称呼习惯）。\n"
-    "只输出 JSON：{{\"bad\": [\"具体降智行为\"], \"good\": [\"有效表达\"], "
-    "\"prefs\": [\"对方偏好\"], \"rules\": [\"以后要遵守的短规则\"]}}。"
-    "每条最多 20 字，宁缺毋滥，没有就不写。"
+    "请以冷静的旁观者视角分析这段对话。你的任务不是罗列所有观察，"
+    "而是**归纳**：把同一类问题合并成一条概括性的规则。\n"
+    "输出要求：\n"
+    "1. bad：你暴露出的**最多 3 类**机械/降智行为，每类一句话概括"
+    "（如把'每句加喵''重复卖萌'归并为'过度使用语气词卖萌'）；\n"
+    "2. good：**最多 2 条**与对方合拍的有效表达；\n"
+    "3. rules：**最多 3 条**可执行的改进准则，每条一个独立主题；\n"
+    "4. prefs：对方**最多 3 条**最明显的偏好。\n"
+    "宁缺毋滥：如果某类没有明显发现就输出空数组。每条不超过 25 字。\n"
+    "只输出 JSON：{{\"bad\": [], \"good\": [], \"prefs\": [], \"rules\": []}}"
 )
 
 
 class SelfLearnStore:
     """Persistent self-reflection rules.
 
+    Rules are kept tiny and semantically deduplicated: reflection output is
+    forced to a handful of categories, and merging replaces near-duplicate
+    rules instead of appending them, so the store always holds a small set
+    of *independent* rules rather than an ever-growing pile of observations.
+
     Args:
         path: JSON file to persist the learned rules.
         max_rules: Maximum number of rules kept per bucket.
+        embed_fn: Optional async embedding callable for semantic dedup.
     """
 
-    def __init__(self, path: str | Path, max_rules: int = 20) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        max_rules: int = 6,
+        embed_fn=None,
+    ) -> None:
         self.path = Path(path)
         self.max_rules = max_rules
+        self.embed_fn = embed_fn
         self.rules: dict[str, list[str]] = {"bad": [], "good": [], "prefs": [], "rules": []}
         self.last_reflect_at: float = 0.0
         self._load()
@@ -71,8 +87,60 @@ class SelfLearnStore:
         )
         tmp.replace(self.path)
 
-    def merge(self, parsed: dict) -> bool:
-        """Merge a reflection result into the store, deduplicating.
+    async def _similar_to_existing(self, key: str, text: str) -> str | None:
+        """Find an existing rule semantically similar to ``text``.
+
+        Args:
+            key: Bucket name (bad/good/prefs/rules).
+            text: The candidate rule.
+
+        Returns:
+            The existing rule text when similar (embedding cosine > 0.85),
+            else None. Falls back to exact-match when no embedder.
+        """
+        existing = self.rules[key]
+        if not existing:
+            return None
+        if self.embed_fn is None:
+            return text if text in existing else None
+        try:
+            vec = self.embed_fn(text)
+            if asyncio.iscoroutine(vec):
+                vec = await vec
+            for other in existing:
+                other_vec = self.embed_fn(other)
+                if asyncio.iscoroutine(other_vec):
+                    other_vec = await other_vec
+                if self._cosine(vec, other_vec) > 0.85:
+                    return other
+        except Exception:
+            return text if text in existing else None
+        return None
+
+    @staticmethod
+    def _cosine(a: list[float], b: list[float]) -> float:
+        """Cosine similarity between two vectors.
+
+        Args:
+            a: First vector.
+            b: Second vector.
+
+        Returns:
+            Similarity in ``[0, 1]``.
+        """
+        if not a or not b or len(a) != len(b):
+            return 0.0
+        dot = sum(x * y for x, y in zip(a, b))
+        na = sum(x * x for x in a) ** 0.5
+        nb = sum(y * y for y in b) ** 0.5
+        return dot / (na * nb) if na and nb else 0.0
+
+    async def merge(self, parsed: dict) -> bool:
+        """Merge a reflection result into the store, semantically deduplicating.
+
+        A candidate that matches an existing rule (cosine > 0.85) *replaces*
+        it with the fresher wording; genuinely new candidates are appended.
+        Buckets are capped at ``max_rules``.
 
         Args:
             parsed: Dict with ``bad``/``good``/``prefs``/``rules`` lists.
@@ -86,9 +154,15 @@ class SelfLearnStore:
                 text = str(item).strip()
                 if not text:
                     continue
-                if text not in self.rules[key]:
-                    self.rules[key].append(text)
-                    changed = True
+                similar = await self._similar_to_existing(key, text)
+                if similar is not None:
+                    if similar != text:
+                        idx = self.rules[key].index(similar)
+                        self.rules[key][idx] = text
+                        changed = True
+                    continue
+                self.rules[key].append(text)
+                changed = True
         for key in self.rules:
             self.rules[key] = self.rules[key][-self.max_rules :]
         if changed:

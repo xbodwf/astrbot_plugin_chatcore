@@ -449,7 +449,8 @@ class Main(Star):
                 Path(get_astrbot_plugin_data_path())
                 / "astrbot_plugin_chatcore"
                 / "selflearn.json",
-                max_rules=int(selflearn_cfg.get("max_rules", 20)),
+                max_rules=int(selflearn_cfg.get("max_rules", 6)),
+                embed_fn=self._embed_fn,
             )
         self._selflearn_task: asyncio.Task | None = None
 
@@ -3499,7 +3500,7 @@ class Main(Star):
                 self.logger.debug(f"Self-learn analysis failed: {e}")
                 continue
             parsed = parse_reflection(raw)
-            if self.selflearn.merge(parsed):
+            if await self.selflearn.merge(parsed):
                 reflected = True
         if reflected:
             self.selflearn.last_reflect_at = time.time()
