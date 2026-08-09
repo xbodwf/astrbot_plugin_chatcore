@@ -306,14 +306,14 @@ class Main(Star):
             others_density_threshold=attn.get("others_density_threshold", 3),
             followup_boost=attn.get("followup_boost", 0.05),
             poke_decay_seconds=float(attn.get("poke_decay_seconds", 300)),
-            poke_first_boost=float(attn.get("poke_first_boost", 0.5)),
-            poke_step_boost=float(attn.get("poke_step_boost", 0.2)),
+            poke_first_boost=float(attn.get("poke_first_boost", 0.2)),
+            poke_step_boost=float(attn.get("poke_step_boost", 0.08)),
             poke_dense_window=float(attn.get("poke_dense_window", 15)),
             poke_sparse_window=float(attn.get("poke_sparse_window", 120)),
             poke_sparse_factor=float(attn.get("poke_sparse_factor", 0.5)),
             poke_weak_factor=float(attn.get("poke_weak_factor", 0.15)),
-            poke_force_count=int(attn.get("poke_force_count", 3)),
-            poke_force_window=float(attn.get("poke_force_window", 30)),
+            poke_force_count=int(attn.get("poke_force_count", 6)),
+            poke_force_window=float(attn.get("poke_force_window", 60)),
         )
         self.hard_trigger_force = attn.get("hard_trigger_force", True)
         self.wake_prefix = [str(w).lower() for w in attn.get("wake_prefix", [])]
@@ -687,7 +687,14 @@ class Main(Star):
         )
         if self.affinity_mgr and sender_id:
             self.affinity_mgr.interact(sender_id, 2.0)
-        # 概率触发：poke 专属概率（戳前=聊天概率，戳后按次数/间隔累积，3 次连戳必触发）。
+        task = self.active_tasks.get(conv_id)
+        if task:
+            # 已有回复在进行中：连戳不再开新对话。把这次 poke 并入 debounce
+            # 队列，当前回复结束后会带着它继续，避免连戳并行起多个任务。
+            task.enqueue(poke_text, "")
+            event.stop_event()
+            return
+        # 概率触发：poke 专属概率（戳前=聊天概率，戳后按次数/间隔累积，连戳才必回）。
         if self.attention:
             self.attention.record_poke(conv_id)
             # 戳一戳也走概率：第一戳只小幅抬升，连戳/密集戳才累积到必回。

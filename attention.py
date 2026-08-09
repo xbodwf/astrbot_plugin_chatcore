@@ -143,10 +143,17 @@ class AttentionManager:
     def record_reply(self, group_id: str) -> None:
         """Record that the AI just sent a reply (starts the cooldown).
 
+        The poke accumulation is reset so a burst of pokes stops forcing
+        replies once the AI has already answered; otherwise every poke after
+        a reply keeps stacking toward a guaranteed response.
+
         Args:
             group_id: Group identifier.
         """
-        self._get_state(group_id)["last_reply_ts"] = time.time()
+        state = self._get_state(group_id)
+        state["last_reply_ts"] = time.time()
+        state["poke_total"] = 0.0
+        state["poke_count"] = 0
 
     def record_hard_trigger(self, group_id: str) -> None:
         """Record an @-mention / reply: refreshes activity and adds a boost.
@@ -325,9 +332,11 @@ class AttentionManager:
     def effective_poke_probability(self, group_id: str) -> float:
         """Effective poke reply probability with natural decay.
 
-        Before any poke this equals the normal chat probability; after pokes
-        it is the max of that and the poke-accumulated target, which decays
-        linearly back to the chat baseline over ``poke_decay_seconds``.
+        The poke probability is independent of the chat-activity baseline:
+        a poke is a poke, and its reply chance comes purely from the poke
+        accumulation (which decays linearly over ``poke_decay_seconds``).
+        A fresh conversation without pokes yields 0, so a single poke only
+        replies with the first-poke boost instead of riding the chat base.
 
         Args:
             group_id: Group identifier.
@@ -344,8 +353,7 @@ class AttentionManager:
                 0.0,
                 poke_total - (now - last) / self.poke_decay_seconds,
             )
-        base = self.current_probability(group_id)
-        return max(0.0, min(1.0, max(base, poke_total)))
+        return max(0.0, min(1.0, poke_total))
 
     def should_respond_poke(self, group_id: str) -> bool:
         """Roll the dice for a poke-triggered reply.
