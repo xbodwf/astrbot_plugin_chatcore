@@ -69,7 +69,7 @@ from .segmentation import build_interval_calc, stream_respond
 from .selfimprove import (
     SelfImprove,
     _SYSTEM_PROMPT as _SELFIMPROVE_SYSTEM_PROMPT,
-    _is_legit_source_file,
+    _session_files,
     ruff_check,
 )
 from .selflearn import SelfLearnStore, _REFLECT_PROMPT, parse_reflection
@@ -3003,6 +3003,11 @@ class Main(Star):
     async def _summarize_history(self, conv_id: str) -> None:
         """Compress older history with the chat model, caching the summary.
 
+        Incremental: when a summary already exists, only the records newer
+        than the covered window are summarized, and the result is folded into
+        the old summary. This keeps the summary fresh (and the context small)
+        without repeatedly re-reading everything every few messages.
+
         Args:
             conv_id: Conversation identifier.
         """
@@ -3010,11 +3015,26 @@ class Main(Star):
             older_count = self.context_mgr.older_count(conv_id)
             if older_count <= 0:
                 return
-            payload = self.context_mgr.summary_payload(conv_id)
-            if not payload.strip():
+            old_summary = self.context_mgr.get_summary(conv_id)
+            covered = self.context_mgr.covered_count(conv_id)
+            new_payload = self.context_mgr.summary_payload(
+                conv_id, max_records=max(50, self.context_mgr.history_count)
+            )
+            if not new_payload.strip():
                 return
+            if old_summary:
+                prompt = (
+                    "已有摘要：\n"
+                    f"{old_summary}\n\n"
+                    "下面是该会话新增的更早聊天记录。请把新记录的关键信息"
+                    "（新人物、新事件、结论变化）合并进旧摘要，保持简洁中文，"
+                    "去掉已过时或不再重要的内容。只输出合并后的完整摘要，不要前缀。\n\n"
+                    f"{new_payload}"
+                )
+            else:
+                prompt = HISTORY_SUMMARY_PROMPT + new_payload
             summary = await self.summary_client.chat(
-                [{"role": "user", "content": HISTORY_SUMMARY_PROMPT + payload}],
+                [{"role": "user", "content": prompt}],
                 temperature=0.3,
                 log_name="latest_summary",
             )
@@ -3836,13 +3856,7 @@ class Main(Star):
         )
         if already:
             return
-        files = sorted(
-            p.name
-            for p in session_dir.iterdir()
-            if p.is_file()
-            and p.name != "chat_samples.txt"
-            and _is_legit_source_file(self.selfimprove.source_dir, p.name)
-        )
+        files = _session_files(session_dir, self.selfimprove.source_dir)
         if not files:
             return
         pid = self.selfimprove.submit(

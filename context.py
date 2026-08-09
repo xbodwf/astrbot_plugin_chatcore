@@ -136,7 +136,12 @@ class ContextManager:
         )
 
     def _load(self) -> None:
-        """Load persisted conversation history from disk."""
+        """Load persisted conversation history and summaries from disk.
+
+        The file format is ``{"histories": {...}, "summaries": {...}}``; the
+        older flat ``{conv_id: [records]}`` layout is still accepted so
+        existing data keeps loading after an upgrade.
+        """
         path = self._persist_path
         if path is None:
             return
@@ -146,7 +151,9 @@ class ContextManager:
             return
         if not isinstance(raw, dict):
             return
-        for conv_id, records in raw.items():
+        histories = raw.get("histories") if isinstance(raw.get("histories"), dict) else raw
+        summaries = raw.get("summaries") if isinstance(raw.get("summaries"), dict) else {}
+        for conv_id, records in histories.items():
             if not isinstance(conv_id, str) or not isinstance(records, list):
                 continue
             loaded = [
@@ -156,6 +163,16 @@ class ContextManager:
             ]
             if loaded:
                 self._histories[conv_id] = loaded
+        for conv_id, entry in summaries.items():
+            if not isinstance(conv_id, str) or not isinstance(entry, dict):
+                continue
+            text = str(entry.get("text", "") or "")
+            try:
+                count = int(entry.get("count", 0))
+            except (TypeError, ValueError):
+                count = 0
+            if text:
+                self._summaries[conv_id] = {"text": text, "count": count}
 
     def _persist(self) -> None:
         """Atomically persist conversation history to disk.
@@ -170,8 +187,11 @@ class ContextManager:
             tmp.write_text(
                 json.dumps(
                     {
-                        conv_id: [self._record_to_dict(r) for r in records]
-                        for conv_id, records in self._histories.items()
+                        "histories": {
+                            conv_id: [self._record_to_dict(r) for r in records]
+                            for conv_id, records in self._histories.items()
+                        },
+                        "summaries": self._summaries,
                     },
                     ensure_ascii=False,
                 ),
@@ -273,6 +293,7 @@ class ContextManager:
             covered_count: How many older records the summary covers.
         """
         self._summaries[conv_id] = {"text": text, "count": covered_count}
+        self._persist()
 
     def get_summary(self, conv_id: str) -> str:
         """Return the cached LLM summary of a conversation, if any.
@@ -285,6 +306,18 @@ class ContextManager:
         """
         entry = self._summaries.get(conv_id)
         return entry["text"] if entry else ""
+
+    def covered_count(self, conv_id: str) -> int:
+        """How many older records the current summary already covers.
+
+        Args:
+            conv_id: Conversation identifier.
+
+        Returns:
+            The covered record count (0 when no summary exists).
+        """
+        entry = self._summaries.get(conv_id)
+        return int(entry["count"]) if entry else 0
 
     def summary_stale(self, conv_id: str, threshold: int = 1) -> bool:
         """Whether older history needs a fresh LLM summary.
@@ -725,11 +758,11 @@ class ContextManager:
                         "是消息容器，其属性（uid、nickname、msg_id、time）只标记边界和发送者，"
                         "不是内容。容器内的组件按书写顺序**连起来读**：只有 `<text>...</text>`"
                         '内部才是真正的消息原文（文本片段）；`<at uid="..." name="..."/>`'
-                        "表示艾特了某个人（`uid=\"yourself\"` 表示艾特了你），阅读时把它转译成"
+                        '表示艾特了某个人（`uid="yourself"` 表示艾特了你），阅读时把它转译成'
                         '“@名字”；`<reply uid="..." msg_id="...">...</reply>` 是引用消息，'
                         "内部是被引用的原文；`<image .../>` 是图片占位。例如"
-                        "`<text>我要</text><at uid=\"3505269587\" name=\"Yqloss\"/>` 读作"
-                        "\"我要 @Yqloss\"。要戳 `<at>` 或 `<poke>` 里标记的人，用"
+                        '`<text>我要</text><at uid="3505269587" name="Yqloss"/>` 读作'
+                        '"我要 @Yqloss"。要戳 `<at>` 或 `<poke>` 里标记的人，用'
                         "`[[poke:对方QQ号]]`。"
                     ),
                 }

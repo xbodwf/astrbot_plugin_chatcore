@@ -190,13 +190,7 @@ class SelfImprove:
             key=lambda d: d.stat().st_mtime, reverse=True
         )
         for session_dir in sessions:
-            files = sorted(
-                p.name
-                for p in session_dir.iterdir()
-                if p.is_file()
-                and p.name != "chat_samples.txt"
-                and _is_legit_source_file(self.source_dir, p.name)
-            )
+            files = _session_files(session_dir, self.source_dir)
             if not files:
                 continue
             pid = self.submit(
@@ -394,6 +388,34 @@ class SelfImprove:
         self._save()
         shutil.rmtree(session, ignore_errors=True)
         return True
+
+
+def _session_files(session_dir: Path, source_dir: Path) -> list[str]:
+    """List a staging session's changed source files (excluding artifacts).
+
+    Recursively walks the session root so nested files (e.g. new modules
+    under ``pages/``) are registered too; artifacts like the chat-samples
+    file are skipped.
+
+    Args:
+        session_dir: The session's staging root directory.
+        source_dir: Plugin source directory (for legitimacy checks).
+
+    Returns:
+        Sorted relative file paths.
+    """
+    if not session_dir.is_dir():
+        return []
+    files: list[str] = []
+    for path in sorted(session_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.name == "chat_samples.txt":
+            continue
+        rel = str(path.relative_to(session_dir))
+        if _is_legit_source_file(source_dir, rel):
+            files.append(rel)
+    return files
 
 
 def _is_legit_source_file(source_dir: Path, rel: str) -> bool:
