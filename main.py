@@ -145,6 +145,7 @@ class GenerationTask:
         self.trigger_message_id = trigger_message_id
         self.cancel_requested = False
         self.suppress_record = False
+        self.soft_trigger = False
         self._pending: str | None = None
 
     def enqueue(self, text: str, message_id: str = "") -> None:
@@ -576,6 +577,7 @@ class Main(Star):
         hard = self._is_hard_trigger(event, text)
 
         should_reply = False
+        soft_hit = False
         if conv_id not in self.llm_blacklist:
             # 黑名单会话完全禁用 LLM：消息照常记录，但任何触发都不回复。
             if is_private:
@@ -594,11 +596,11 @@ class Main(Star):
                 else:
                     should_reply = self.attention.should_respond(conv_id)
                     if should_reply:
+                        soft_hit = True
                         self.attention.record_interaction(conv_id)
                         self.attention.record_soft_hit(conv_id)
                     else:
                         self.attention.record_soft_miss(conv_id)
-
         if self.memory:
             asyncio.create_task(
                 self._remember(conv_id, event.get_sender_name(), text),
@@ -638,6 +640,7 @@ class Main(Star):
             return
 
         task = GenerationTask(conv_id, msg_id)
+        task.soft_trigger = soft_hit
         self.active_tasks[conv_id] = task
         event.stop_event()
         asyncio.create_task(
@@ -907,6 +910,18 @@ class Main(Star):
                         history_texts=history_blocks,
                         profile_texts=await self._inject_profile(event),
                     )
+                    if task.soft_trigger:
+                        # 主动插话：明确聚焦最新消息，避免回到更早的话题。
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "你正在主动加入群聊。请只针对**最新那条消息**"
+                                    "（最后一条 user 消息）回应，简短自然；"
+                                    "不要回到更早的话题，也不要复述之前的对话。"
+                                ),
+                            }
+                        )
                     ctx_ms = (time.monotonic() - t_ctx_start) * 1000
 
                 # Replay OnLLMRequestEvent hooks (e.g. LLMPerception) so
