@@ -627,7 +627,7 @@
       },
       "blocks": {
         "description": "默认作息块（agent 自主设定前的底色）",
-        "type": "array",
+        "type": "list",
         "default": [],
         "hint": "每项含 state/level/cron 或 start+end，如 [{state:睡觉, level:0, cron:'0 0 * * *'}]"
       }
