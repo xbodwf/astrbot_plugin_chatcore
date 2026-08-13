@@ -369,12 +369,27 @@ class EmojiStore:
                 scored.sort(key=lambda item: item[0], reverse=True)
                 top = [record for _, record in scored[:top_k]]
                 if len(top) < top_k:
+                    # 嵌入匹配不足时，剩余候选按关键词命中数补齐，而不是按存储顺序硬塞。
+                    ql = q.lower()
+                    keyword_scored = []
                     for record in records:
                         if record in top:
                             continue
-                        top.append(record)
-                        if len(top) >= top_k:
-                            break
+                        haystack = " ".join(
+                            [
+                                record.get("category", ""),
+                                " ".join(record.get("tags", [])),
+                                record.get("source_text", ""),
+                                record.get("source_context", ""),
+                            ]
+                        ).lower()
+                        score = sum(1 for token in ql.split() if token in haystack)
+                        if score:
+                            keyword_scored.append((score, record))
+                    keyword_scored.sort(key=lambda item: item[0], reverse=True)
+                    top.extend(
+                        record for _, record in keyword_scored[: top_k - len(top)]
+                    )
                 return top
             except Exception:
                 pass

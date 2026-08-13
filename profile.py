@@ -198,19 +198,23 @@ class ProfileStore:
             fact = item.get("fact", "") if isinstance(item, dict) else str(item)
             if not fact:
                 continue
-            if isinstance(item, dict) and item.get("action") == "remove":
+            if isinstance(item, dict) and item.get("action") in ("remove", "replace"):
+                # 近似匹配：LLM 复述措辞可能与存储条目不一致（“小明是大学生” vs
+                # “小明在读大学”），用与去重相同的模糊阈值定位目标条目。
                 existing = [
                     old
                     for old in existing
-                    if (old.get("fact", "") if isinstance(old, dict) else old) != fact
+                    if not (
+                        difflib.SequenceMatcher(
+                            None,
+                            fact,
+                            old.get("fact", "") if isinstance(old, dict) else old,
+                        ).ratio()
+                        > 0.65
+                    )
                 ]
-                continue
-            if isinstance(item, dict) and item.get("action") == "replace":
-                existing = [
-                    old
-                    for old in existing
-                    if (old.get("fact", "") if isinstance(old, dict) else old) != fact
-                ]
+                if item.get("action") == "remove":
+                    continue
             # 近似去重: LLM 措辞变体（"小明是大学生" vs "小明在读大学"）不重复累积
             if any(
                 difflib.SequenceMatcher(

@@ -127,7 +127,7 @@ def _tool_intent_hint(text: str) -> bool:
             "创建任务",
             "删除任务",
             "查询任务",
-            "执行",
+            "执行任务",
         )
     )
 
@@ -1631,12 +1631,15 @@ class Main(Star):
             if not merged:
                 return messages
             if current_text and current_text in merged:
+                # 找到当前触发消息（build_messages 最后追加的那条 user 消息，
+                # 渲染为 <message uid=... nickname=...> 结构），把 hook 合并后的
+                # 内容就地替换，避免“原文+合并文”双份 user 消息重复进上下文。
                 for i in range(len(messages) - 1, -1, -1):
                     content = str(messages[i].get("content") or "")
                     if (
                         messages[i].get("role") == "user"
                         and content.startswith("<message ")
-                        and f'user="{sender_name}' in content
+                        and current_text in content
                     ):
                         messages[i]["content"] = merged
                         return messages
@@ -2897,6 +2900,10 @@ class Main(Star):
                 self.logger.warning(f"Profile writeback failed: {e}")
 
         if self.profile_store and text:
+            stripped = text.strip()
+            if stripped.startswith("<poke") or stripped.startswith("（定时任务提醒）"):
+                # 戳一戳/定时任务不是真实发言，不参与人物画像提取，避免污染画像。
+                return
             asyncio.create_task(_run())
 
     async def _collect_emoji(
@@ -3954,12 +3961,13 @@ class Main(Star):
             target.parent.mkdir(parents=True, exist_ok=True)
             if target.exists() and not target.is_file():
                 return {"error": f"{path} 不是文件"}
+            created = not target.exists()
             try:
                 with target.open("a", encoding="utf-8") as fh:
                     fh.write(content or "")
             except OSError as e:
                 return {"error": f"追加失败: {e}"}
-            return {"ok": True, "path": path, "created": not target.exists()}
+            return {"ok": True, "path": path, "created": created}
 
         return handler
 
