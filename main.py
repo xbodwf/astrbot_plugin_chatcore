@@ -73,6 +73,7 @@ from .selfimprove import (
     ruff_check,
 )
 from .selflearn import SelfLearnStore, _REFLECT_PROMPT, parse_reflection
+from .schedule import LEVEL_ACTIVE, LEVEL_FOCUS, LEVEL_OFFLINE, ScheduleBlock
 from .tools import SandboxTools
 from .webui import ChatCoreWebUI
 
@@ -458,6 +459,30 @@ class Main(Star):
             )
         self._selflearn_task: asyncio.Task | None = None
 
+        schedule_cfg = config.get("schedule", {})
+        self.schedule_enabled = bool(schedule_cfg.get("enabled", True))
+        self.schedule = None
+        if self.schedule_enabled:
+            from .schedule import ScheduleEngine
+
+            default_blocks = [
+                {
+                    "state": "睡觉",
+                    "level": 0,
+                    "cron": b.get("cron"),
+                    "start": b.get("start"),
+                    "end": b.get("end"),
+                    "priority": 0,
+                }
+                for b in schedule_cfg.get("blocks", [])
+            ]
+            self.schedule = ScheduleEngine(
+                Path(get_astrbot_plugin_data_path())
+                / "astrbot_plugin_chatcore"
+                / "schedule.json",
+                default_blocks=default_blocks,
+            )
+
         selfimprove_cfg = config.get("selfimprove", {})
         self.selfimprove_enabled = bool(selfimprove_cfg.get("enabled", True))
         self.selfimprove_interval = max(
@@ -578,29 +603,47 @@ class Main(Star):
 
         should_reply = False
         soft_hit = False
+        # 作息感知级别：0 睡觉（静默，连 @ 也累积）、1 专注（只回 @/回复）、
+        # 2 活跃（正常）。切换低→高会触发补读。
+        schedule_level = LEVEL_ACTIVE
+        if self.schedule:
+            schedule_level = self.schedule.effective_level()
         if conv_id not in self.llm_blacklist:
             # 黑名单会话完全禁用 LLM：消息照常记录，但任何触发都不回复。
             if is_private:
                 should_reply = chat_cfg.get("private_force_reply", True)
+                if schedule_level == LEVEL_OFFLINE:
+                    should_reply = False
             elif chat_cfg.get("group_enabled", True):
                 self.attention.record_others_message(conv_id)
                 if hard:
                     self.attention.record_hard_trigger(conv_id)
-                    should_reply = (
-                        self.hard_trigger_force
-                        or self.attention.should_respond(conv_id)
-                    )
+                    if schedule_level == LEVEL_OFFLINE:
+                        # 睡觉：@ 也静默累积，醒来补读。
+                        should_reply = False
+                    elif schedule_level == LEVEL_FOCUS:
+                        # 专注：只回 @/提及，不走概率。
+                        should_reply = True
+                    else:
+                        should_reply = (
+                            self.hard_trigger_force
+                            or self.attention.should_respond(conv_id)
+                        )
                 elif self._addresses_other_user(event):
                     # Directed at someone else; don't chime in on a soft trigger.
                     should_reply = False
                 else:
-                    should_reply = self.attention.should_respond(conv_id)
-                    if should_reply:
-                        soft_hit = True
-                        self.attention.record_interaction(conv_id)
-                        self.attention.record_soft_hit(conv_id)
+                    if schedule_level == LEVEL_OFFLINE or schedule_level == LEVEL_FOCUS:
+                        # 睡觉/专注：非硬触发一律静默。
+                        should_reply = False
                     else:
-                        self.attention.record_soft_miss(conv_id)
+                        should_reply = self.attention.should_respond(conv_id)
+                        if should_reply:
+                            soft_hit = True
+                            self.attention.record_interaction(conv_id)
+                            self.attention.record_soft_hit(conv_id)
+                        else:
+                            self.attention.record_soft_miss(conv_id)
         if self.memory:
             asyncio.create_task(
                 self._remember(conv_id, event.get_sender_name(), text),
@@ -910,6 +953,25 @@ class Main(Star):
                         history_texts=history_blocks,
                         profile_texts=await self._inject_profile(event),
                     )
+                    if self.schedule:
+                        rose, from_lv, to_lv = self.schedule.transition()
+                        if rose:
+                            # 从低感知醒来（睡醒/忙完）：补读错过的 @/提及。
+                            self.logger.info(
+                                f"ChatCore schedule catch-up | {conv_id} | "
+                                f"level {from_lv} -> {to_lv}"
+                            )
+                            messages.append(
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "你刚睡醒/忙完回来，以下是离线期间错过的消息。"
+                                        "先快速扫一遍最近记录：优先回应**@你的、直接问你的人**"
+                                        "（他们可能等很久了），其余的看情况带一句即可，"
+                                        "不用逐条回复。像人拿起手机先回要紧的消息那样。"
+                                    ),
+                                }
+                            )
                     if task.soft_trigger:
                         # 主动插话：明确聚焦最新消息，避免回到更早的话题。
                         messages.append(
@@ -1721,11 +1783,167 @@ class Main(Star):
                 )
             )
             self._add_sandbox_tools(ts, FunctionTool, direct_only=True)
+            self._add_schedule_tools(ts, FunctionTool)
             self._tool_set = ts if not ts.empty() else None
         except Exception as e:
             self.logger.warning(f"ChatCore: tool set build failed: {e}")
             self._tool_set = None
         return self._tool_set
+
+    def _add_schedule_tools(self, ts: ToolSet, FunctionTool) -> None:
+        """Register the agent's self-schedule tools on the main tool set.
+
+        The agent can declare its own life rhythm: sleep, focus on a task,
+        stay up, etc. The system respects that state (sleep = silent, wake =
+        catch-up read).
+
+        Args:
+            ts: The ToolSet to populate.
+            FunctionTool: The FunctionTool class to instantiate.
+        """
+        ts.add_tool(
+            FunctionTool(
+                name="set_schedule",
+                description=(
+                    "声明你接下来的作息/状态。例如'我困了要睡觉'→ 设一个睡觉块"
+                    "（level=0）；'我在帮主人写代码，先专注'→ 设专注块（level=1）；"
+                    "'今晚陪你熬夜'→ 设活跃块（level=2）。level 0 期间你不回任何消息，"
+                    "醒来会补读错过的@；level 1 只回@你的。可指定时长 minutes，或"
+                    "start/end 时间戳，或用 cron 表达式。这是你自主的生活安排，"
+                    "由你自己决定。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "state": {
+                            "type": "string",
+                            "description": "状态描述，如 睡觉/帮主人写代码/熬夜。",
+                        },
+                        "level": {
+                            "type": "integer",
+                            "description": "0睡觉 1专注 2活跃。",
+                        },
+                        "minutes": {
+                            "type": "number",
+                            "description": "可选：持续分钟数（从现在起）。",
+                        },
+                        "cron": {
+                            "type": "string",
+                            "description": "可选：cron 表达式（重复作息）。",
+                        },
+                        "priority": {
+                            "type": "integer",
+                            "description": "可选：优先级，高的可覆盖低的。",
+                        },
+                    },
+                    "required": ["state", "level"],
+                },
+                handler=self._schedule_set_handler,
+            )
+        )
+        ts.add_tool(
+            FunctionTool(
+                name="clear_schedule",
+                description=(
+                    "取消你之前设定的某个作息块（按 id）。例如熬夜结束了想恢复正常作息，"
+                    "或某次专注结束了。list_schedule 查看所有块。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "block_id": {
+                            "type": "string",
+                            "description": "要取消的作息块 id。",
+                        }
+                    },
+                    "required": ["block_id"],
+                },
+                handler=self._schedule_clear_handler,
+            )
+        )
+        ts.add_tool(
+            FunctionTool(
+                name="list_schedule",
+                description="查看你当前的所有作息块及其状态。",
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+                handler=self._schedule_list_handler,
+            )
+        )
+
+    async def _schedule_set_handler(
+        self, event, state: str, level: int, minutes: float = 0, cron: str = "", priority: int = 0
+    ) -> dict:
+        """Handler for ``set_schedule``.
+
+        Args:
+            event: The message event.
+            state: State label.
+            level: Perception level 0/1/2.
+            minutes: Optional duration in minutes.
+            cron: Optional cron expression.
+            priority: Optional priority.
+
+        Returns:
+            The schedule block info.
+        """
+        if not self.schedule:
+            return {"error": "作息系统未启用"}
+        now = self.schedule.now()
+        start = now
+        end = None
+        if minutes and float(minutes) > 0:
+            end = start + float(minutes) * 60
+        block = ScheduleBlock(
+            state=state,
+            level=level,
+            start=start,
+            end=end,
+            cron=cron or None,
+            priority=priority,
+            dynamic=True,
+        )
+        bid = self.schedule.add_block(block)
+        self.logger.info(
+            f"ChatCore schedule set | {state} | level={level} | id={bid}"
+        )
+        return {"ok": True, "block_id": bid, "state": state, "level": level}
+
+    async def _schedule_clear_handler(self, event, block_id: str) -> dict:
+        """Handler for ``clear_schedule``.
+
+        Args:
+            event: The message event.
+            block_id: The block id to remove.
+
+        Returns:
+            Confirmation.
+        """
+        if not self.schedule:
+            return {"error": "作息系统未启用"}
+        if self.schedule.remove_block(block_id):
+            return {"ok": True, "removed": block_id}
+        return {"error": f"未找到作息块 {block_id}"}
+
+    async def _schedule_list_handler(self, event) -> dict:
+        """Handler for ``list_schedule``.
+
+        Args:
+            event: The message event.
+
+        Returns:
+            Current blocks and effective level.
+        """
+        if not self.schedule:
+            return {"error": "作息系统未启用"}
+        return {
+            "level": self.schedule.effective_level(),
+            "state": self.schedule.current_state(),
+            "blocks": self.schedule.list_blocks(),
+        }
 
     def _add_sandbox_tools(
         self, ts: ToolSet, FunctionTool, direct_only: bool = False

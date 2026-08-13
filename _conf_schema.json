@@ -615,6 +615,24 @@
       }
     }
   },
+  "schedule": {
+    "description": "作息节律引擎（agent 自主设定）",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "作息引擎开关",
+        "type": "bool",
+        "default": true,
+        "hint": "agent 可自主声明睡觉/专注/熬夜等作息块；睡觉时不回消息，醒来补读@"
+      },
+      "blocks": {
+        "description": "默认作息块（agent 自主设定前的底色）",
+        "type": "array",
+        "default": [],
+        "hint": "每项含 state/level/cron 或 start+end，如 [{state:睡觉, level:0, cron:'0 0 * * *'}]"
+      }
+    }
+  },
   "selfimprove": {
     "description": "自我改进（AI 改源码）",
     "type": "object",
