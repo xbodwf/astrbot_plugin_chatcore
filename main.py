@@ -1059,8 +1059,6 @@ class Main(Star):
                                 resp.tools_call_ids,
                             )
 
-                image_urls = []
-
                 async def send_fn(segment: str) -> None:
                     nonlocal t_first_send, reply_decision_task
                     nonlocal reply_decision_started
