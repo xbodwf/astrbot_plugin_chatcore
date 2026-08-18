@@ -144,6 +144,26 @@ class LLMProvider:
             )
         return provider
 
+    async def context_window(self) -> int:
+        """Resolve the model's context window size (tokens).
+
+        Reads ``max_context_tokens`` from the provider config (the
+        "模型上下文窗口大小" setting); when 0, AstrBot fills it from model
+        metadata or the fallback value during request assembly, so ChatCore
+        falls back to 128000 here.
+
+        Returns:
+            The context window in tokens.
+        """
+        try:
+            provider = await self._get()
+            value = provider.provider_config.get("max_context_tokens", 0)
+            if isinstance(value, int) and value > 0:
+                return value
+        except Exception:
+            pass
+        return 128000
+
     @staticmethod
     def _to_text(resp: LLMResponse) -> str:
         """Extract plain text from an LLMResponse.

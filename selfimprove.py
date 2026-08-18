@@ -24,8 +24,9 @@ _SYSTEM_PROMPT = (
     "你的目标是找出自己在日常角色扮演中的降智行为、缺失的真人化能力、"
     "插件代码中可以改进的地方，并直接动手改进。\n"
     "工作流程：\n"
-    "1. 先 list_source 了解源码结构，再 read_source 阅读相关文件"
-    "（大文件用 offset/limit 分片读）；\n"
+    "1. 先 list_source 了解结构，用 bash_source 的 grep/ls 快速定位，"
+    "**不要从头到尾盲读文件**——只读与目标相关的部分（read_source 支持 "
+    "offset/limit 分片）；\n"
     "2. 找出问题后用 edit_staging 做精确片段替换（推荐，只传改动部分即可），"
     "追加或新建文件用 add_staging，只有整体重写才用 write_staging；\n"
     "3. 每改完一个文件用 run_ruff 校验，不通过就修正；\n"
@@ -33,11 +34,16 @@ _SYSTEM_PROMPT = (
     "files 列出所有改动的相对路径）。\n"
     "5. 当你认为已经完成（提交了改进，或确认无需改动）时，调用 stop_improvement "
     "主动结束会话。\n"
-    "规则：只能读取插件源码目录（read-only）；只能写 staging 目录；"
+    "重要约束：\n"
+    "- 你**最多只有 12 轮工具调用**，不要浪费在无休止的探索上；"
+    "尽早定位、尽早动手。\n"
+    "- 不要只分析不行动。哪怕只是小改进（注释、边界处理、提示词措辞），"
+    "也至少完成一项 write_staging/edit_staging + run_ruff + submit_improvement "
+    "并提交；只有在你确认代码完全无需改动时才可以不提交。\n"
+    "- 只能读取插件源码目录（read-only）；只能写 staging 目录；"
     "不要改动与目标无关的文件，不要提交无法通过 ruff 的代码。\n"
-    "重要：不要只分析不行动。哪怕只是小改进（注释、边界处理、提示词措辞），"
-    "也至少完成一项 write_staging + run_ruff + submit_improvement 并提交；"
-    "只有在你确认代码完全无需改动时才可以不提交。"
+    "- 定位问题时优先 bash_source 的 grep（一次能搜全项目），"
+    "而非逐个文件 read_source。"
 )
 
 
@@ -55,9 +61,47 @@ class SelfImprove:
         self.staging_dir = self.work_dir / "staging"
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         self.pending_path = self.work_dir / "pending.json"
+        self.summary_path = self.work_dir / "improve_summaries.json"
         self._pending: dict[str, dict] = {}
+        self._summaries: list[dict] = []
         self._load()
         self._git_ensure()
+
+    def add_session_summary(self, summary: str) -> None:
+        """Store a self-improve session summary for later chat injection.
+
+        Keeps the most recent few summaries so the chat persona can recall
+        what the engineer-self has been working on.
+
+        Args:
+            summary: The detailed session summary text.
+        """
+        if not (summary or "").strip():
+            return
+        self._summaries.append(
+            {"ts": time.time(), "text": summary.strip()}
+        )
+        self._summaries = self._summaries[-5:]
+        try:
+            self.summary_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.summary_path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(self._summaries, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(self.summary_path)
+        except OSError:
+            pass
+
+    def latest_session_summary(self) -> str:
+        """The most recent session summary, if any.
+
+        Returns:
+            The summary text, or "".
+        """
+        if self._summaries:
+            return self._summaries[-1]["text"]
+        return ""
 
     def _git(self, *args: str) -> tuple[int, str]:
         """Run a git command inside the source directory.
@@ -164,6 +208,14 @@ class SelfImprove:
                 }
         except (OSError, json.JSONDecodeError):
             self._pending = {}
+        try:
+            summaries = json.loads(self.summary_path.read_text(encoding="utf-8"))
+            if isinstance(summaries, list):
+                self._summaries = [
+                    s for s in summaries if isinstance(s, dict) and s.get("text")
+                ][-5:]
+        except (OSError, json.JSONDecodeError):
+            self._summaries = []
 
     def register_orphan_sessions(self) -> list[str]:
         """Register staging sessions that have files but no pending record.

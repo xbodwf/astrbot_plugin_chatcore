@@ -1440,6 +1440,15 @@ class Main(Star):
             learned = self.selflearn.render(scene_context)
             if learned:
                 rules += "\n\n" + learned
+        if self.selfimprove:
+            # 最近一次自我改进会话的总结（AI 的工程反思），供聊天参考。
+            session_summary = self.selfimprove.latest_session_summary()
+            if session_summary:
+                rules += (
+                    "\n\n【自我改进记录】你最近一次审视/改进自己代码时的工作总结"
+                    "（仅作背景参考，聊天时不要主动提起）：\n"
+                    + session_summary[:800]
+                )
         if sender_id and event is not None:
             info_text = await self._fetch_public_info(event, sender_id)
             if info_text:
@@ -2857,8 +2866,16 @@ class Main(Star):
             if not url:
                 continue
             try:
+                image_ref = url
+                if not url.startswith(("http://", "https://", "data:")):
+                    # 本地文件路径：转 base64 data URI，确保 provider 能读到。
+                    b64 = await img.convert_to_base64()
+                    if b64:
+                        image_ref = f"data:image;base64,{b64}"
                 descriptions.append(
-                    await model.describe_image(url, "latest_vision", prompt=prompt)
+                    await model.describe_image(
+                        image_ref, "latest_vision", prompt=prompt
+                    )
                 )
             except Exception as e:
                 self.logger.warning(f"Image description failed: {e}")
@@ -3862,6 +3879,28 @@ class Main(Star):
         )
         tool_set.add_tool(
             FunctionTool(
+                name="bash_source",
+                description=(
+                    "在源码根目录执行 shell 命令（只读定位用）：如 `ls`、"
+                    "`grep -rn \"关键词\" main.py`、`python3 -c \"...\"`。"
+                    "用于快速定位代码，比逐个 read_source 高效。"
+                    "禁止写操作（rm/mv/重定向到源码文件）。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "要执行的 shell 命令。",
+                        }
+                    },
+                    "required": ["command"],
+                },
+                handler=self._make_source_bash_handler(src_sandbox),
+            )
+        )
+        tool_set.add_tool(
+            FunctionTool(
                 name="edit_staging",
                 description=(
                     "在 staging 中精确替换文件中的一段文本（推荐，省 token）。"
@@ -4011,10 +4050,43 @@ class Main(Star):
         )
         messages = list(req.contexts)
         try:
+            # 模型上下文窗口（token），用于决定何时让 AI 自行总结压缩。
+            try:
+                context_window = await self.chat_client.context_window()
+            except Exception:
+                context_window = 128000
+            compress_threshold = int(context_window * 0.8)
             rounds = 0
-            while not self._improve_stop and rounds < 30:
+            while not self._improve_stop and rounds < 12:
                 rounds += 1
                 tool_calls: tuple | None = None
+                # 上下文达到 ~80% 时，先暂停工具，让 AI 详细总结当前会话，
+                # 用总结替换旧消息后再继续。
+                if self._estimate_tokens(messages) >= compress_threshold:
+                    summary = await self._summarize_improve_session(
+                        messages, tool_set
+                    )
+                    if summary:
+                        self.logger.info(
+                            f"ChatCore self-improve compressed | rounds={rounds}"
+                        )
+                        # 总结持久化，供 ChatCore 聊天部分注入（AI 的工程反思）。
+                        self.selfimprove.add_session_summary(summary)
+                        messages = [
+                            messages[0],
+                            {
+                                "role": "user",
+                                "content": (
+                                    "（会话已总结，以下是此前工作的详细总结，"
+                                    "继续之前的工作）\n"
+                                    + summary
+                                ),
+                            },
+                        ]
+                        rounds += 1
+                        if self._improve_stop:
+                            break
+                        continue
                 async for r in self.chat_client.chat_stream_raw(
                     messages,
                     func_tool=tool_set,
@@ -4086,6 +4158,77 @@ class Main(Star):
             )
             self._auto_register_staging(session_root)
 
+    @staticmethod
+    def _estimate_tokens(messages: list) -> int:
+        """Estimate the token count of an OpenAI-style message list.
+
+        Mirrors AstrBot's ``EstimateTokenCounter`` heuristic: Chinese chars
+        ≈ 0.6 token, other chars ≈ 0.3 token, tool-call JSON included.
+
+        Args:
+            messages: OpenAI-style message dict list.
+
+        Returns:
+            Estimated token count.
+        """
+        total = 0
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = "".join(
+                    str(part.get("text") or "")
+                    for part in content
+                    if isinstance(part, dict)
+                )
+            else:
+                text = ""
+            chinese = sum(1 for c in text if "\u4e00" <= c <= "\u9fff")
+            total += int(chinese * 0.6 + (len(text) - chinese) * 0.3)
+            for tc in msg.get("tool_calls") or []:
+                total += len(str(tc)) // 3
+        return total
+
+    async def _summarize_improve_session(
+        self, messages: list, tool_set: ToolSet
+    ) -> str:
+        """Ask the AI to summarize the improvement session so far.
+
+        Called when the context approaches the window limit: tools are
+        withheld so the model must produce a detailed summary of what it has
+        done and what remains, which then replaces the old messages.
+
+        Args:
+            messages: The current OpenAI-style message list.
+            tool_set: The session tool set (withheld during summarization).
+
+        Returns:
+            The detailed summary text, or "" on failure.
+        """
+        try:
+            summary_messages = list(messages) + [
+                {
+                    "role": "user",
+                    "content": (
+                        "上下文即将占满。请**详细总结**本次自我改进会话到目前为止的：\n"
+                        "1. 已经阅读/了解的源码情况；\n"
+                        "2. 已经做出的改动（改了哪些文件、改了什么、是否通过 ruff）；\n"
+                        "3. 尚未完成的工作和接下来的计划。\n"
+                        "要足够详细，足以让一个失去全部上下文的你仅凭这份总结继续工作。"
+                    ),
+                }
+            ]
+            summary = await self.chat_client.chat(
+                summary_messages,
+                temperature=0.2,
+                log_name="latest_selfimprove_summary",
+            )
+            return (summary or "").strip()
+        except Exception as e:
+            self.logger.warning(f"ChatCore self-improve summary failed: {e}")
+            return ""
+
     def _auto_register_staging(self, session_root: str) -> None:
         """Register un-submitted staging files as a pending improvement.
 
@@ -4120,6 +4263,35 @@ class Main(Star):
             files,
         )
         self.logger.info(f"ChatCore self-improve auto-registered | {pid} | {files}")
+
+    def _make_source_bash_handler(self, sandbox: SandboxTools):
+        """Build a read-only bash handler for the self-improve session.
+
+        Allows listing/grepping/python inspection but blocks commands that
+        mutate the source tree (rm/mv/cp/redirect/truncate/install etc.).
+
+        Args:
+            sandbox: The read-only source sandbox.
+
+        Returns:
+            The async handler.
+        """
+        _DANGEROUS = (
+            "rm ", "rm -", "mv ", "cp ", "mkdir", "rmdir", "touch ",
+            ">", ">>", "|", "&&", ";", "chmod", "chown", "sudo",
+            "pip ", "install", "wget", "curl ", "git ",
+        )
+
+        async def handler(event, command: str) -> dict:
+            lowered = (command or "").strip().lower()
+            if not lowered:
+                return {"error": "命令为空"}
+            for token in _DANGEROUS:
+                if token in lowered:
+                    return {"error": f"禁止危险命令（包含 {token.strip()}），只允许只读操作"}
+            return await sandbox.bash(event, command)
+
+        return handler
 
     def _make_staging_edit_handler(self, session_root: str):
         """Build the ``edit_staging`` handler for one session.
