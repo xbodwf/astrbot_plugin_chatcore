@@ -417,3 +417,33 @@ class SelfImprove:
                 ][-5:]
         except (OSError, json.JSONDecodeError):
             self._summaries = []
+
+
+async def ruff_check(paths: list[str]) -> tuple[bool, str]:
+    """Run ``ruff check`` on the given paths.
+
+    Args:
+        paths: Absolute file paths to check.
+
+    Returns:
+        ``(ok, message)``.
+    """
+    import asyncio
+
+    if not paths:
+        return True, ""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ruff",
+            "check",
+            *paths,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+    except FileNotFoundError:
+        return False, "ruff 未安装（pip install ruff）"
+    except asyncio.TimeoutError:
+        return False, "ruff 超时"
+    out = (stdout + stderr).decode("utf-8", errors="replace")
+    return proc.returncode == 0, out
