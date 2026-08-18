@@ -69,7 +69,6 @@ from .segmentation import build_interval_calc, stream_respond
 from .selfimprove import (
     SelfImprove,
     _SYSTEM_PROMPT as _SELFIMPROVE_SYSTEM_PROMPT,
-    _session_files,
     ruff_check,
 )
 from .selflearn import SelfLearnStore, _REFLECT_PROMPT, parse_reflection
@@ -3662,14 +3661,10 @@ class Main(Star):
             self._selflearn_task = asyncio.create_task(self._selflearn_loop())
         if self.selfimprove:
             try:
-                registered = self.selfimprove.register_orphan_sessions()
-                if registered:
-                    self.logger.info(
-                        f"ChatCore self-improve | registered orphan sessions: "
-                        f"{registered}"
-                    )
+                # 载入时把最新插件源码同步进工作区，保证改进基于当前运行代码。
+                self.selfimprove.sync_from_source()
             except Exception as e:
-                self.logger.warning(f"ChatCore orphan sessions failed: {e}")
+                self.logger.warning(f"ChatCore selfimprove sync failed: {e}")
             self._selfimprove_task = asyncio.create_task(
                 self._selfimprove_loop()
             )
@@ -3814,12 +3809,11 @@ class Main(Star):
         """
         if not self.selfimprove:
             return
-        session_root = self.selfimprove.new_staging_root()
-        # 建立 git 基线：本次会话的改动与之对比，保证可审计。
+        # 会话开始：记录当前工作区基线 commit。
         try:
-            self.selfimprove.baseline_commit()
+            self.selfimprove.new_session()
         except Exception as e:
-            self.logger.debug(f"ChatCore baseline commit failed: {e}")
+            self.logger.debug(f"ChatCore session baseline failed: {e}")
         samples: list[str] = []
         for conv_id in self.context_mgr.active_conversations():
             text = self.context_mgr.summary_text(conv_id, max_chars=1200)
@@ -3827,14 +3821,14 @@ class Main(Star):
                 samples.append(f"--- 会话 {conv_id} ---\n{text}")
             if len(samples) >= 5:
                 break
-        sample_path = Path(session_root) / "chat_samples.txt"
-        sample_path.write_text("\n\n".join(samples) or "(无聊天样本)", encoding="utf-8")
-
-        src_sandbox = SandboxTools(
-            self.selfimprove.source_dir,
-            write_root=self.selfimprove.staging_dir / "no_write",
+        # 工作区沙箱：AI 的编辑/写入都在 work_dir（改进仓库的工作树）。
+        workspace_sandbox = SandboxTools(self.selfimprove.work_dir)
+        # 只读沙箱：AI 可读取整个 AstrBot 代码库（框架+插件）以便定位参考，
+        # 但不能修改。chroot = AstrBot 根目录（docker / 普通部署自动解析）。
+        read_sandbox = SandboxTools(
+            get_astrbot_path(),
+            write_root=self.selfimprove.work_dir / "no_write",
         )
-        staging_sandbox = SandboxTools(session_root)
         from astrbot.core.agent.tool import FunctionTool, ToolSet
 
         tool_set = ToolSet()
@@ -3842,13 +3836,15 @@ class Main(Star):
             FunctionTool(
                 name="read_source",
                 description=(
-                    "读取插件源码文件（只读）。路径相对于插件源码根目录。"
+                    "读取 AstrBot 代码库中的文件（只读参考，路径相对 AstrBot 根目录，"
+                    "如 astrbot/core/main.py、data/plugins/xxx.py）。"
+                    "可读框架源码、插件源码、配置等，但都不能修改。"
                     "大文件可用 offset（起始行号）和 limit（行数）分片读取。"
                 ),
                 parameters={
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string", "description": "源码文件路径。"},
+                        "path": {"type": "string", "description": "相对 AstrBot 根的文件路径。"},
                         "offset": {
                             "type": "integer",
                             "description": "可选：起始行号（从 0 开始）。",
@@ -3860,13 +3856,15 @@ class Main(Star):
                     },
                     "required": ["path"],
                 },
-                handler=src_sandbox.read_files,
+                handler=read_sandbox.read_files,
             )
         )
         tool_set.add_tool(
             FunctionTool(
                 name="list_source",
-                description="列出插件源码目录内容。",
+                description=(
+                    "列出 AstrBot 代码库目录内容（只读参考，路径相对 AstrBot 根目录）。"
+                ),
                 parameters={
                     "type": "object",
                     "properties": {
@@ -3874,17 +3872,17 @@ class Main(Star):
                     },
                     "required": [],
                 },
-                handler=src_sandbox.list_files,
+                handler=read_sandbox.list_files,
             )
         )
         tool_set.add_tool(
             FunctionTool(
                 name="bash_source",
                 description=(
-                    "在源码根目录执行 shell 命令（只读定位用）：如 `ls`、"
-                    "`grep -rn \"关键词\" main.py`、`python3 -c \"...\"`。"
-                    "用于快速定位代码，比逐个 read_source 高效。"
-                    "禁止写操作（rm/mv/重定向到源码文件）。"
+                    "在 AstrBot 根目录执行 shell 命令（只读定位用）：如 `ls`、"
+                    "`grep -rn \"关键词\" astrbot/`、`python3 -c \"...\"`、glob。"
+                    "用于在整个 AstrBot 代码库中快速定位，比逐个 read_source 高效。"
+                    "**禁止任何写操作**（rm/mv/cp/重定向/管道/安装等）和输出重定向。"
                 ),
                 parameters={
                     "type": "object",
@@ -3896,21 +3894,21 @@ class Main(Star):
                     },
                     "required": ["command"],
                 },
-                handler=self._make_source_bash_handler(src_sandbox),
+                handler=self._make_source_bash_handler(read_sandbox),
             )
         )
         tool_set.add_tool(
             FunctionTool(
-                name="edit_staging",
+                name="edit_source",
                 description=(
-                    "在 staging 中精确替换文件中的一段文本（推荐，省 token）。"
-                    "path 与源码目录同结构；若 staging 还没有该文件，会自动从源码"
-                    "复制一份快照再替换。old 必须精确出现一次。"
+                    "在工作区中精确替换文件中的一段文本（推荐，省 token）。"
+                    "path 相对工作区根（工作区 = 插件源码副本）。"
+                    "old 必须精确出现一次。"
                 ),
                 parameters={
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string", "description": "相对源码根的文件路径。"},
+                        "path": {"type": "string", "description": "相对工作区根的文件路径。"},
                         "old": {
                             "type": "string",
                             "description": "要被替换的原文，必须精确出现一次。",
@@ -3919,49 +3917,48 @@ class Main(Star):
                     },
                     "required": ["path", "old", "new"],
                 },
-                handler=self._make_staging_edit_handler(session_root),
+                handler=workspace_sandbox.edit_files,
             )
         )
         tool_set.add_tool(
             FunctionTool(
-                name="add_staging",
+                name="add_source",
                 description=(
-                    "在 staging 文件末尾追加内容，或创建新文件。"
-                    "path 与源码目录同结构；文件不存在时自动创建（即新增文件）。"
+                    "在工作区文件末尾追加内容，或创建新文件（相对工作区根）。"
+                    "文件不存在时自动创建。"
                 ),
                 parameters={
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string", "description": "相对源码根的文件路径。"},
+                        "path": {"type": "string", "description": "相对工作区根的文件路径。"},
                         "content": {"type": "string", "description": "要追加的内容。"},
                     },
                     "required": ["path", "content"],
                 },
-                handler=self._make_staging_add_handler(session_root),
+                handler=self._make_workspace_add_handler(workspace_sandbox),
             )
         )
         tool_set.add_tool(
             FunctionTool(
-                name="write_staging",
+                name="write_source",
                 description=(
-                    "整文件覆盖写入 staging（兜底，仅当 edit/add 无法完成时用）。"
-                    "path 与源码目录同结构。"
+                    "整文件覆盖写入工作区（兜底，仅当 edit/add 无法完成时用）。"
                 ),
                 parameters={
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string", "description": "相对源码根的文件路径。"},
+                        "path": {"type": "string", "description": "相对工作区根的文件路径。"},
                         "content": {"type": "string", "description": "文件完整新内容。"},
                     },
                     "required": ["path", "content"],
                 },
-                handler=staging_sandbox.write_files,
+                handler=workspace_sandbox.write_files,
             )
         )
         tool_set.add_tool(
             FunctionTool(
                 name="run_ruff",
-                description="对 staging 中的文件运行 ruff 校验。path 为相对源码根的文件路径。",
+                description="对工作区中的文件运行 ruff 校验。path 为相对工作区根的文件路径。",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -3969,29 +3966,24 @@ class Main(Star):
                     },
                     "required": ["path"],
                 },
-                handler=self._make_ruff_handler(session_root),
+                handler=self._make_workspace_ruff_handler(),
             )
         )
         tool_set.add_tool(
             FunctionTool(
                 name="submit_improvement",
                 description=(
-                    "完成修改并通过 ruff 后调用：提交本次改进为待审批。"
-                    "note 说明问题与改动，files 列出所有改动的相对路径。"
+                    "完成修改并通过 ruff 后调用：把当前工作区的所有改动提交为一个"
+                    "待审批的 commit。note 说明问题与改动。"
                 ),
                 parameters={
                     "type": "object",
                     "properties": {
                         "note": {"type": "string", "description": "改动说明。"},
-                        "files": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "改动的相对文件路径列表。",
-                        },
                     },
-                    "required": ["note", "files"],
+                    "required": ["note"],
                 },
-                handler=self._make_submit_handler(session_root),
+                handler=self._make_submit_handler(),
             )
         )
         tool_set.add_tool(
@@ -4150,13 +4142,13 @@ class Main(Star):
                         f"ChatCore self-improve tool | {name}: {result[:200]}"
                     )
             self.logger.info("ChatCore self-improve session finished")
-            # 兜底：AI 写了 staging 文件但忘了 submit_improvement 时，自动登记。
-            self._auto_register_staging(session_root)
+            # 兜底：AI 改了工作区但忘了 submit_improvement 时，自动提交。
+            self._auto_register_workspace_changes()
         except Exception as e:
             self.logger.warning(
                 f"ChatCore self-improve session failed: {e}", exc_info=True
             )
-            self._auto_register_staging(session_root)
+            self._auto_register_workspace_changes()
 
     @staticmethod
     def _estimate_tokens(messages: list) -> int:
@@ -4229,40 +4221,28 @@ class Main(Star):
             self.logger.warning(f"ChatCore self-improve summary failed: {e}")
             return ""
 
-    def _auto_register_staging(self, session_root: str) -> None:
-        """Register un-submitted staging files as a pending improvement.
+    def _auto_register_workspace_changes(self) -> None:
+        """Auto-commit unsubmitted workspace changes as a pending improvement.
 
-        The AI sometimes writes and ruff-checks files but forgets to call
-        ``submit_improvement``. Scan the session root for changed files
-        (excluding the chat-samples artifact) and register them so the admin
-        can still review and approve them.
-
-        Args:
-            session_root: Absolute path of the session's staging root.
+        The AI sometimes edits the workspace but forgets to call
+        ``submit_improvement``. If the working tree differs from HEAD, commit
+        it so the admin can still review.
 
         Returns:
             None.
         """
         if not self.selfimprove:
             return
-        session_dir = Path(session_root)
-        if not session_dir.is_dir():
+        code, _ = self.selfimprove._git("diff", "--quiet")
+        if code == 0:
             return
-        session_name = session_dir.name
-        already = any(
-            p.get("session") == session_name for p in self.selfimprove.list_pending()
+        commit = self.selfimprove.commit_session(
+            "（AI 未调用 submit_improvement，改动由系统自动提交）"
         )
-        if already:
-            return
-        files = _session_files(session_dir, self.selfimprove.source_dir)
-        if not files:
-            return
-        pid = self.selfimprove.submit(
-            session_name,
-            "（AI 未调用 submit_improvement，改动由系统自动登记）",
-            files,
-        )
-        self.logger.info(f"ChatCore self-improve auto-registered | {pid} | {files}")
+        if commit:
+            self.logger.info(
+                f"ChatCore self-improve auto-committed | {commit[:10]}"
+            )
 
     def _make_source_bash_handler(self, sandbox: SandboxTools):
         """Build a read-only bash handler for the self-improve session.
@@ -4271,7 +4251,7 @@ class Main(Star):
         mutate the source tree (rm/mv/cp/redirect/truncate/install etc.).
 
         Args:
-            sandbox: The read-only source sandbox.
+            sandbox: The workspace sandbox.
 
         Returns:
             The async handler.
@@ -4293,69 +4273,34 @@ class Main(Star):
 
         return handler
 
-    def _make_staging_edit_handler(self, session_root: str):
-        """Build the ``edit_staging`` handler for one session.
-
-        Edits operate on the staging copy: if the file is not staged yet, a
-        snapshot is first copied from the source so the AI only sends the
-        changed snippet instead of the whole file.
+    def _make_workspace_add_handler(self, sandbox: SandboxTools):
+        """Build the ``add_source`` handler for the workspace.
 
         Args:
-            session_root: Absolute path of the session's staging root.
-
-        Returns:
-            The async handler.
-        """
-
-        async def handler(event, path: str, old: str, new: str) -> dict:
-            root = Path(session_root)
-            target = root / path
-            if not target.is_file():
-                src = self.selfimprove.source_dir / path
-                if not src.is_file():
-                    return {"error": f"源码中不存在 {path}，新增文件请用 add_staging"}
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, target)
-            try:
-                text = target.read_text(encoding="utf-8")
-            except OSError as e:
-                return {"error": f"读取失败: {e}"}
-            count = text.count(old)
-            if count != 1:
-                return {
-                    "error": f"old 文本出现 {count} 次（要求恰好 1 次）；请提供更精确的片段"
-                }
-            target.write_text(text.replace(old, new), encoding="utf-8")
-            return {"ok": True, "path": path}
-
-        return handler
-
-    def _make_staging_add_handler(self, session_root: str):
-        """Build the ``add_staging`` handler for one session.
-
-        Appends to an existing staged file or creates a new one. New files
-        are recorded separately so ``apply`` knows it must copy them over.
-
-        Args:
-            session_root: Absolute path of the session's staging root.
+            sandbox: The workspace sandbox (append targets live there).
 
         Returns:
             The async handler.
         """
 
         async def handler(event, path: str, content: str) -> dict:
-            root = Path(session_root)
-            target = root / path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if target.exists() and not target.is_file():
-                return {"error": f"{path} 不是文件"}
-            created = not target.exists()
-            try:
-                with target.open("a", encoding="utf-8") as fh:
-                    fh.write(content or "")
-            except OSError as e:
-                return {"error": f"追加失败: {e}"}
-            return {"ok": True, "path": path, "created": created}
+            return await sandbox.write_files(event, path, content or "")
+
+        return handler
+
+    def _make_workspace_ruff_handler(self):
+        """Build the ``run_ruff`` handler for the workspace.
+
+        Returns:
+            The async handler.
+        """
+
+        async def handler(event, path: str) -> dict:
+            target = self.selfimprove.work_dir / path
+            if not target.is_file():
+                return {"error": f"工作区中不存在 {path}"}
+            ok, out = await ruff_check([str(target)])
+            return {"ok": ok, "output": out[:2000]}
 
         return handler
 
@@ -4373,22 +4318,18 @@ class Main(Star):
         self.logger.info(f"ChatCore self-improve stopped by AI | {note[:100]}")
         return {"ok": True, "message": "本次自我改进会话已结束。"}
 
-    def _make_ruff_handler(self, session_root: str):
-        async def handler(event, path: str) -> dict:
-            staged = Path(session_root) / path
-            if not staged.is_file():
-                return {"error": f"staging 中不存在 {path}"}
-            ok, out = await ruff_check([str(staged)])
-            return {"ok": ok, "output": out[:2000]}
+    def _make_submit_handler(self):
+        """Build the ``submit_improvement`` handler: commit the workspace.
 
-        return handler
+        Returns:
+            The handler (sync; returns the pending id).
+        """
 
-    def _make_submit_handler(self, session_root: str):
-        def handler(event, note: str, files: list) -> dict:
-            pid = self.selfimprove.submit(
-                Path(session_root).name, str(note or ""), [str(f) for f in files]
-            )
-            return {"ok": True, "pending_id": pid}
+        def handler(event, note: str) -> dict:
+            commit = self.selfimprove.commit_session(str(note or ""))
+            if not commit:
+                return {"error": "没有可提交的改动，或提交失败"}
+            return {"ok": True, "commit": commit[:10]}
 
         return handler
 

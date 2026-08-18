@@ -1,17 +1,20 @@
-"""Self-improvement: AI proposes source changes, admin approves.
+"""Self-improvement: the AI improves its own source in a git-backed workdir.
 
-The improvement loop periodically hands the plugin source (read-only) plus
-recent chat samples to the chat model in a special session. The model can
-only write into a staging directory (``selfimprove/staging``); every proposal
-must pass ``ruff`` before it becomes a pending patch. The admin reviews with
-``chatcore view`` and applies with ``chatcore approve <id>``; applying copies
-the changed files back over the plugin source and reloads the plugin.
+The plugin keeps a *work directory* (under plugin data) that mirrors the
+plugin source. The improvement AI reads and writes that workdir directly; a
+git repository there records every change it makes, so successive sessions
+build on each other without conflicts (a later commit contains the earlier
+ones). Approving a commit applies it onto the live plugin directory with
+``git diff <base>..<commit> | git apply``, then the plugin reloads.
+
+The workdir is re-synced from the live plugin source on every plugin load /
+update, so it always starts from the currently running code.
 """
 
 from __future__ import annotations
 
-import difflib
 import json
+import re
 import shutil
 import subprocess
 import time
@@ -23,6 +26,7 @@ _SYSTEM_PROMPT = (
     "你是一个在改进自己源代码的 AI 工程师。"
     "你的目标是找出自己在日常角色扮演中的降智行为、缺失的真人化能力、"
     "插件代码中可以改进的地方，并直接动手改进。\n"
+    "工作目录：你当前的工作区就是插件源码，直接在其中读取和修改。\n"
     "工作流程：\n"
     "1. 先 list_source 了解结构，用 bash_source 的 grep/ls 快速定位，"
     "**不要从头到尾盲读文件**——只读与目标相关的部分（read_source 支持 "
@@ -30,57 +34,339 @@ _SYSTEM_PROMPT = (
     "2. 找出问题后用 edit_staging 做精确片段替换（推荐，只传改动部分即可），"
     "追加或新建文件用 add_staging，只有整体重写才用 write_staging；\n"
     "3. 每改完一个文件用 run_ruff 校验，不通过就修正；\n"
-    "4. 全部改完且 ruff 通过后，调用 submit_improvement 提交（note 说明改动，"
-    "files 列出所有改动的相对路径）。\n"
+    "4. 全部改完且 ruff 通过后，调用 submit_improvement 提交（note 说明改动）。"
+    "提交后你的改动会成为一个待审批的 commit，管理员审批后才会应用到线上；\n"
     "5. 当你认为已经完成（提交了改进，或确认无需改动）时，调用 stop_improvement "
     "主动结束会话。\n"
     "重要约束：\n"
     "- 你**最多只有 12 轮工具调用**，不要浪费在无休止的探索上；"
     "尽早定位、尽早动手。\n"
     "- 不要只分析不行动。哪怕只是小改进（注释、边界处理、提示词措辞），"
-    "也至少完成一项 write_staging/edit_staging + run_ruff + submit_improvement "
-    "并提交；只有在你确认代码完全无需改动时才可以不提交。\n"
-    "- 只能读取插件源码目录（read-only）；只能写 staging 目录；"
-    "不要改动与目标无关的文件，不要提交无法通过 ruff 的代码。\n"
+    "也至少完成一项修改并提交；只有在你确认代码完全无需改动时才可以不提交。\n"
     "- 定位问题时优先 bash_source 的 grep（一次能搜全项目），"
     "而非逐个文件 read_source。"
 )
 
+# 允许出现在源码工作区的文件（与插件源码一致）。
+_LEGIT_NAMES = (
+    ".py", ".json", ".yaml", ".yml", ".md", ".txt", ".gitignore",
+    ".gitattributes", "requirements.txt", "metadata.yaml", "LICENSE",
+)
 
-class SelfImprove:
-    """Pending-improvement store with staging management.
+
+def _is_legit_source_file(rel: str) -> bool:
+    """Whether a relative path is a legitimate plugin source file.
 
     Args:
-        source_dir: Plugin source directory (read-only for the model).
-        work_dir: Directory holding ``staging/`` and ``pending.json``.
+        rel: Relative file path.
+
+    Returns:
+        True when the file belongs to the plugin source tree.
+    """
+    name = Path(str(rel)).name
+    if not str(rel).strip() or ".." in str(rel):
+        return False
+    lowered = name.lower()
+    if lowered.startswith(("ruff_", "probe", "test_", "tmp_", "._", ".git")):
+        return False
+    return name.endswith(_LEGIT_NAMES)
+
+
+class SelfImprove:
+    """Git-backed self-improvement workspace.
+
+    Args:
+        source_dir: Live plugin source directory.
+        work_dir: Workspace directory that mirrors the plugin source and
+            holds the improvement git repository.
     """
 
     def __init__(self, source_dir: str | Path, work_dir: str | Path) -> None:
         self.source_dir = Path(source_dir)
         self.work_dir = Path(work_dir)
-        self.staging_dir = self.work_dir / "staging"
-        self.staging_dir.mkdir(parents=True, exist_ok=True)
+        self.work_dir.mkdir(parents=True, exist_ok=True)
         self.pending_path = self.work_dir / "pending.json"
         self.summary_path = self.work_dir / "improve_summaries.json"
         self._pending: dict[str, dict] = {}
         self._summaries: list[dict] = []
+        self._sync_head: str = ""
         self._load()
         self._git_ensure()
 
+    # ---- git helpers ----
+
+    def _git(self, *args: str, cwd: Path | None = None) -> tuple[int, str]:
+        """Run a git command inside the workspace.
+
+        Args:
+            *args: Git arguments.
+            cwd: Working directory override (defaults to work_dir).
+
+        Returns:
+            ``(returncode, combined_output)``.
+        """
+        try:
+            proc = subprocess.run(
+                ["git", *args],
+                cwd=str(cwd or self.work_dir),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            return proc.returncode, (proc.stdout + proc.stderr).strip()
+        except Exception as e:
+            return 1, str(e)
+
+    def _git_ensure(self) -> None:
+        """Ensure the workspace is a git repository with an initial commit.
+
+        Sets repo-local author identity if the environment lacks one, so
+        commits never fail on machines without global git config.
+
+        Returns:
+            None.
+        """
+        if not (self.work_dir / ".git").exists():
+            self._git("init", "-q")
+        self._git("config", "user.name", "ChatCore")
+        self._git("config", "user.email", "chatcore@local")
+        self._git("add", "-A")
+        self._git(
+            "commit",
+            "-q",
+            "-m",
+            f"chatcore workspace baseline {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            "--allow-empty",
+        )
+
+    # ---- workspace sync ----
+
+    def sync_from_source(self) -> None:
+        """Copy the live plugin source into the workspace and commit.
+
+        Called on plugin load and after plugin updates, so the workspace
+        always starts from the currently running code. Existing workspace
+        files are overwritten; the pre-sync state is committed first so no
+        history is lost.
+
+        Returns:
+            None.
+        """
+        # 先把当前工作区状态留痕（保留未审批的改动在历史里）。
+        self._git("add", "-A")
+        self._git(
+            "commit",
+            "-q",
+            "-m",
+            f"chatcore pre-sync {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            "--allow-empty",
+        )
+        for item in self.source_dir.iterdir():
+            if item.name in (".git", "__pycache__"):
+                continue
+            dest = self.work_dir / item.name
+            if item.is_dir():
+                shutil.rmtree(dest, ignore_errors=True)
+                shutil.copytree(item, dest, ignore=shutil.ignore_patterns("__pycache__"))
+            else:
+                shutil.copy2(item, dest)
+        # 清理工作区里已不存在的文件（保持与插件目录一致）。
+        for item in self.work_dir.iterdir():
+            if item.name in (".git", "pending.json", "improve_summaries.json"):
+                continue
+            if not (self.source_dir / item.name).exists():
+                if item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                else:
+                    item.unlink(missing_ok=True)
+        self._git("add", "-A")
+        self._git(
+            "commit",
+            "-q",
+            "-m",
+            f"chatcore sync from source {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            "--allow-empty",
+        )
+        code, out = self._git("rev-parse", "HEAD")
+        self._sync_head = out.strip() if code == 0 else ""
+
+    # ---- session / commits ----
+
+    def new_session(self) -> str:
+        """Start a new improvement session: record the current baseline.
+
+        Returns:
+            The current HEAD commit hash (baseline for this session).
+        """
+        self._git("add", "-A")
+        self._git(
+            "commit",
+            "-q",
+            "-m",
+            f"chatcore session baseline {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            "--allow-empty",
+        )
+        code, out = self._git("rev-parse", "HEAD")
+        return out.strip() if code == 0 else ""
+
+    def commit_session(self, note: str) -> str:
+        """Commit the AI's current workspace changes as a pending improvement.
+
+        The pending's baseline is the *sync baseline* (the live code as of the
+        last ``sync_from_source``), so approving it applies the cumulative
+        diff from the online code to this commit — a later improvement
+        already contains the earlier ones.
+
+        Args:
+            note: The AI's explanation of the change.
+
+        Returns:
+            The commit hash (or "" when nothing changed).
+        """
+        base = self._sync_head or ""
+        self._git("add", "-A")
+        code, _ = self._git(
+            "commit",
+            "-q",
+            "-m",
+            f"chatcore improve: {note[:80]}",
+            "--allow-empty",
+        )
+        if code != 0:
+            return ""
+        code, out = self._git("rev-parse", "HEAD")
+        commit = out.strip() if code == 0 else ""
+        if commit:
+            pid = uuid.uuid4().hex[:10]
+            self._pending[pid] = {
+                "id": pid,
+                "commit": commit,
+                "base": base,
+                "note": note,
+                "created_at": time.time(),
+            }
+            self._save()
+        return commit
+
+    def list_pending(self) -> list[dict]:
+        """List pending improvements (newest first)."""
+        return sorted(
+            self._pending.values(),
+            key=lambda p: p.get("created_at", 0),
+            reverse=True,
+        )
+
+    def get(self, pid: str) -> dict | None:
+        """Get one pending improvement by its id.
+
+        Args:
+            pid: Pending id (or full/short commit hash).
+
+        Returns:
+            The pending dict, or None.
+        """
+        if pid in self._pending:
+            return self._pending[pid]
+        for p in self._pending.values():
+            commit = str(p.get("commit") or "")
+            if commit.startswith(pid):
+                return p
+        return None
+
+    def diff(self, pid: str) -> str:
+        """Render the diff of a pending commit against its parent.
+
+        Args:
+            pid: Pending id (or commit hash).
+
+        Returns:
+            The unified diff text, or a message when missing.
+        """
+        pending = self.get(pid)
+        if not pending:
+            return f"未找到审批 {pid}"
+        commit = str(pending.get("commit") or "")
+        if not commit:
+            return "缺少 commit 信息"
+        code, out = self._git("show", "--stat", "--format=fuller", commit)
+        if code != 0:
+            return f"commit 不可用: {out}"
+        code2, diff = self._git("show", "--format=", commit)
+        return (out + "\n" + diff) if code2 == 0 else out
+
+    def apply(self, pid: str) -> tuple[bool, str]:
+        """Apply a pending commit onto the live plugin source.
+
+        Uses ``git diff <commit>^ <commit>`` (or the cumulative diff from the
+        baseline when the commit is a session's latest) and applies it with
+        ``git apply`` in the plugin directory.
+
+        Args:
+            pid: Pending id (or commit hash).
+
+        Returns:
+            ``(ok, message)``.
+        """
+        pending = self.get(pid)
+        if not pending:
+            return False, f"未找到审批 {pid}"
+        commit = str(pending.get("commit") or "")
+        if not commit:
+            return False, "缺少 commit 信息"
+        # 生成从基线到该 commit 的累积 diff：包含此前所有改进。
+        base = str(pending.get("base") or f"{commit}^")
+        code, diff = self._git("diff", base, commit)
+        if code != 0 or not diff.strip():
+            return False, f"无法生成 diff: {diff[:200]}"
+        # _git 会 strip 输出，补回 diff 末尾换行，否则 git apply 报损坏。
+        if not diff.endswith("\n"):
+            diff += "\n"
+        # 应用到插件目录。
+        try:
+            proc = subprocess.run(
+                ["git", "apply", "-"],
+                cwd=str(self.source_dir),
+                input=diff,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except FileNotFoundError:
+            return False, "git 不可用"
+        if proc.returncode != 0:
+            return False, f"应用失败: {(proc.stderr or proc.stdout)[:300]}"
+        # 删除不再存在的文件（diff 里的删除操作 git apply 已处理）。
+        self._pending.pop(pending["id"], None)
+        self._save()
+        return True, f"已应用 {pending['id']} ({commit[:10]}): {pending.get('note', '')[:60]}"
+
+    def reject(self, pid: str) -> bool:
+        """Reject (remove) a pending improvement.
+
+        Args:
+            pid: Pending id.
+
+        Returns:
+            True when removed.
+        """
+        pending = self.get(pid)
+        if not pending:
+            return False
+        self._pending.pop(pending["id"], None)
+        self._save()
+        return True
+
+    # ---- summaries (chat-shared reflections) ----
+
     def add_session_summary(self, summary: str) -> None:
         """Store a self-improve session summary for later chat injection.
-
-        Keeps the most recent few summaries so the chat persona can recall
-        what the engineer-self has been working on.
 
         Args:
             summary: The detailed session summary text.
         """
         if not (summary or "").strip():
             return
-        self._summaries.append(
-            {"ts": time.time(), "text": summary.strip()}
-        )
+        self._summaries.append({"ts": time.time(), "text": summary.strip()})
         self._summaries = self._summaries[-5:]
         try:
             self.summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -103,101 +389,16 @@ class SelfImprove:
             return self._summaries[-1]["text"]
         return ""
 
-    def _git(self, *args: str) -> tuple[int, str]:
-        """Run a git command inside the source directory.
+    # ---- persistence ----
 
-        Args:
-            *args: Git arguments.
-
-        Returns:
-            ``(returncode, combined_output)``.
-        """
-        try:
-            proc = subprocess.run(
-                ["git", *args],
-                cwd=str(self.source_dir),
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            return proc.returncode, (proc.stdout + proc.stderr).strip()
-        except Exception as e:
-            return 1, str(e)
-
-    def _git_ensure(self) -> None:
-        """Initialize a git repository on the plugin source, if missing.
-
-        The repo makes every improvement session auditable: each session
-        commits a baseline, and proposals are reviewed as git diffs against
-        that baseline. Failures are non-fatal (diffing falls back to the
-        plain-text comparison).
-
-        Every plugin load snapshots the source state unconditionally: the
-        current on-disk files (including automatic-update replacements) are
-        committed so history always reflects what was actually running.
-
-        Returns:
-            None.
-        """
-        git_dir = self.source_dir / ".git"
-        if not git_dir.exists():
-            self._git("init", "-q")
-        self._git("add", "-A")
-        self._git(
-            "commit",
-            "-q",
-            "-m",
-            f"chatcore sync baseline {time.strftime('%Y-%m-%d %H:%M:%S')}",
-            "--allow-empty",
+    def _save(self) -> None:
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        tmp = self.pending_path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(self._pending, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
-
-    def baseline_commit(self) -> str:
-        """Create (or reuse) the baseline commit for a new session.
-
-        Staging the current source and committing it gives the session a
-        stable reference point; proposals diff against it.
-
-        Returns:
-            The baseline commit hash (or empty on failure).
-        """
-        self._git("add", "-A")
-        code, out = self._git(
-            "commit", "-q", "-m", "chatcore session baseline", "--allow-empty"
-        )
-        if code != 0:
-            return ""
-        return out.splitlines()[-1] if out else ""
-
-    def commit_apply(self, pid: str, note: str) -> None:
-        """Commit an applied improvement into the source git history.
-
-        Args:
-            pid: The applied pending id.
-            note: The improvement note.
-
-        Returns:
-            None.
-        """
-        self._git("add", "-A")
-        self._git(
-            "commit", "-q", "-m", f"chatcore apply {pid}: {note[:60]}", "--allow-empty"
-        )
-
-    def file_changed_since_baseline(self, rel: str) -> bool:
-        """Whether a source file differs from the last committed baseline.
-
-        Used as a conflict hint before applying: if the file already changed
-        after the session's baseline (e.g. by a previous apply), applying an
-        older snapshot may clobber newer work.
-
-        Args:
-            rel: Relative file path.
-
-        Returns:
-            True when git reports the file as modified vs HEAD.
-        """
-        code, _ = self._git("diff", "--quiet", "HEAD", "--", rel)
-        return code != 0
+        tmp.replace(self.pending_path)
 
     def _load(self) -> None:
         try:
@@ -216,312 +417,3 @@ class SelfImprove:
                 ][-5:]
         except (OSError, json.JSONDecodeError):
             self._summaries = []
-
-    def register_orphan_sessions(self) -> list[str]:
-        """Register staging sessions that have files but no pending record.
-
-        Sessions whose AI wrote files but never called ``submit_improvement``
-        (e.g. after a crash or a missed submission) are registered so the
-        admin can review them. Called once at startup.
-
-        Returns:
-            List of newly registered pending ids.
-        """
-        registered: list[str] = []
-        known = {p.get("session") for p in self._pending.values()}
-        if not self.staging_dir.is_dir():
-            return registered
-        sessions = [
-            d
-            for d in self.staging_dir.iterdir()
-            if d.is_dir() and d.name not in known
-        ]
-        # 只登记最新一个有文件的孤儿 session：更早的是失败残留，
-        # 全部登记会制造互相冲突的 pending。
-        sessions.sort(
-            key=lambda d: d.stat().st_mtime, reverse=True
-        )
-        for session_dir in sessions:
-            files = _session_files(session_dir, self.source_dir)
-            if not files:
-                continue
-            pid = self.submit(
-                session_dir.name,
-                "（孤儿 staging：AI 未提交，启动时自动登记）",
-                files,
-            )
-            if pid:
-                registered.append(pid)
-            break
-        return registered
-
-    def _save(self) -> None:
-        self.work_dir.mkdir(parents=True, exist_ok=True)
-        tmp = self.pending_path.with_suffix(".tmp")
-        tmp.write_text(
-            json.dumps(self._pending, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        tmp.replace(self.pending_path)
-
-    def new_staging_root(self) -> str:
-        """Allocate a fresh staging root for one improvement session.
-
-        Returns:
-            Absolute path of the new staging root.
-        """
-        root = self.staging_dir / f"session_{int(time.time())}"
-        root.mkdir(parents=True, exist_ok=True)
-        return str(root)
-
-    def submit(
-        self, session_id: str, note: str, files: list[str]
-    ) -> str:
-        """Register a pending improvement from a session's staging files.
-
-        Files that are not legitimate source files (probes, temp files,
-        path traversal) are filtered out; if nothing remains, no pending
-        record is created.
-
-        Args:
-            session_id: Staging root folder name.
-            note: Model's explanation of the change.
-            files: Relative file paths changed within the session.
-
-        Returns:
-            The new pending id, or an empty string when nothing valid.
-        """
-        valid = [
-            rel
-            for rel in files
-            if _is_legit_source_file(self.source_dir, rel)
-        ]
-        if not valid:
-            return ""
-        pid = uuid.uuid4().hex[:10]
-        self._pending[pid] = {
-            "id": pid,
-            "session": session_id,
-            "note": note,
-            "files": valid,
-            "created_at": time.time(),
-        }
-        self._save()
-        return pid
-
-    def list_pending(self) -> list[dict]:
-        """List pending improvements (newest first)."""
-        return sorted(
-            self._pending.values(),
-            key=lambda p: p.get("created_at", 0),
-            reverse=True,
-        )
-
-    def get(self, pid: str) -> dict | None:
-        """Get one pending improvement."""
-        return self._pending.get(pid)
-
-    def diff(self, pid: str) -> str:
-        """Render the diff of a pending improvement against its git baseline.
-
-        The baseline is the source as committed when the session started
-        (``HEAD`` at session time). Staging copies are compared to that
-        version, so the diff shows exactly what the AI changed even if the
-        live source has since moved on. Falls back to comparing against the
-        live source when git is unavailable.
-
-        Args:
-            pid: Pending id.
-
-        Returns:
-            The diff text, or a message when missing.
-        """
-        pending = self._pending.get(pid)
-        if not pending:
-            return f"未找到审批 {pid}"
-        session = self.staging_dir / str(pending["session"])
-        if not session.is_dir():
-            return "staging 目录已不存在"
-        parts: list[str] = []
-        for rel in pending.get("files", []):
-            staged = session / rel
-            if not staged.is_file():
-                continue
-            new_text = staged.read_text(encoding="utf-8", errors="replace")
-            code, out = self._git("show", f"HEAD:{rel}")
-            old_text = out if code == 0 else ""
-            if code != 0:
-                # 基线里没有该文件（可能是源码目录无 git 或新文件）。
-                original = self.source_dir / rel
-                if original.is_file():
-                    old_text = original.read_text(
-                        encoding="utf-8", errors="replace"
-                    )
-            parts.append(
-                "".join(
-                    difflib.unified_diff(
-                        old_text.splitlines(keepends=True),
-                        new_text.splitlines(keepends=True),
-                        fromfile=f"a/{rel}",
-                        tofile=f"b/{rel}",
-                    )
-                )
-            )
-        return "\n".join(parts) or "(空 diff)"
-
-    def apply(self, pid: str) -> tuple[bool, str]:
-        """Apply a pending improvement onto the source directory.
-
-        A file can only be applied from its newest pending record: if another
-        pending (newer than this one) touches the same file, applying this
-        record would overwrite newer work with an older snapshot, so it is
-        rejected with a hint.
-
-        Args:
-            pid: Pending id.
-
-        Returns:
-            ``(ok, message)``.
-        """
-        pending = self._pending.get(pid)
-        if not pending:
-            return False, f"未找到审批 {pid}"
-        pending_files = set(pending.get("files", []))
-        newer_conflicts = []
-        for other in self._pending.values():
-            if other["id"] == pid:
-                continue
-            if other.get("created_at", 0) > pending.get("created_at", 0):
-                overlap = pending_files & set(other.get("files", []))
-                if overlap:
-                    newer_conflicts.append((other["id"], sorted(overlap)))
-        if newer_conflicts:
-            detail = "；".join(
-                f"{oid}（文件: {', '.join(files)}）" for oid, files in newer_conflicts
-            )
-            return (
-                False,
-                f"存在更新的待审批改动包含相同文件，先处理它们以避免覆盖：{detail}",
-            )
-        session = self.staging_dir / str(pending["session"])
-        if not session.is_dir():
-            return False, "staging 目录已不存在"
-        applied = []
-        for rel in pending.get("files", []):
-            staged = session / rel
-            if not staged.is_file():
-                continue
-            target = self.source_dir / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(staged, target)
-            applied.append(rel)
-        self._pending.pop(pid, None)
-        self._save()
-        # 应用结果提交进 git 历史，保证每次变更可审计、可回滚。
-        self.commit_apply(pid, str(pending.get("note", "")))
-        # 清理 session 目录，避免重载后 register_orphan_sessions 重复登记。
-        shutil.rmtree(session, ignore_errors=True)
-        return True, f"已应用 {len(applied)} 个文件: {', '.join(applied)}"
-
-    def reject(self, pid: str) -> bool:
-        """Reject (remove) a pending improvement.
-
-        Args:
-            pid: Pending id.
-
-        Returns:
-            True when removed.
-        """
-        pending = self._pending.get(pid)
-        if not pending:
-            return False
-        session = self.staging_dir / str(pending.get("session", ""))
-        self._pending.pop(pid, None)
-        self._save()
-        shutil.rmtree(session, ignore_errors=True)
-        return True
-
-
-def _session_files(session_dir: Path, source_dir: Path) -> list[str]:
-    """List a staging session's changed source files (excluding artifacts).
-
-    Recursively walks the session root so nested files (e.g. new modules
-    under ``pages/``) are registered too; artifacts like the chat-samples
-    file are skipped.
-
-    Args:
-        session_dir: The session's staging root directory.
-        source_dir: Plugin source directory (for legitimacy checks).
-
-    Returns:
-        Sorted relative file paths.
-    """
-    if not session_dir.is_dir():
-        return []
-    files: list[str] = []
-    for path in sorted(session_dir.rglob("*")):
-        if not path.is_file():
-            continue
-        if path.name == "chat_samples.txt":
-            continue
-        rel = str(path.relative_to(session_dir))
-        if _is_legit_source_file(source_dir, rel):
-            files.append(rel)
-    return files
-
-
-def _is_legit_source_file(source_dir: Path, rel: str) -> bool:
-    """Whether a relative path is a legitimate plugin source file.
-
-    Existing source files are always fine. New files must be plausible
-    plugin files (python modules, schema, metadata) and must not look like
-    temporary probes (``ruff_probe``, ``test_`` probes, ``tmp_`` etc.).
-
-    Args:
-        source_dir: Plugin source directory.
-        rel: Relative file path.
-
-    Returns:
-        True when the file is legitimate.
-    """
-    name = Path(str(rel)).name
-    if not str(rel).strip() or ".." in str(rel):
-        return False
-    if (source_dir / rel).is_file():
-        return True
-    lowered = name.lower()
-    if lowered.startswith(("ruff_", "probe", "test_", "tmp_", "._")):
-        return False
-    if name.endswith((".py", ".json", ".yaml", ".md", ".txt")):
-        return True
-    return False
-
-
-async def ruff_check(paths: list[str]) -> tuple[bool, str]:
-    """Run ``ruff check`` on the given paths.
-
-    Args:
-        paths: Absolute file paths to check.
-
-    Returns:
-        ``(ok, message)``.
-    """
-    import asyncio
-
-    if not paths:
-        return True, ""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "ruff",
-            "check",
-            *paths,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-    except FileNotFoundError:
-        return False, "ruff 未安装（pip install ruff）"
-    except asyncio.TimeoutError:
-        return False, "ruff 超时"
-    out = (stdout + stderr).decode("utf-8", errors="replace")
-    return proc.returncode == 0, out
