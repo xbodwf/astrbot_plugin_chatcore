@@ -155,3 +155,14 @@ class AffinityManager:
         self._values.pop(user_id, None)
         self._last_ts.pop(user_id, None)
         self._save()
+
+    def set(self, user_id: str, value: float) -> None:
+        """Set a user's affinity to an absolute value.
+
+        Args:
+            user_id: Platform user id.
+            value: Target affinity in ``[0, 100]``.
+        """
+        self._values[user_id] = max(0.0, min(100.0, value))
+        self._last_ts[user_id] = time.time()
+        self._save()

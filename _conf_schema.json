@@ -563,19 +563,19 @@
         "default": "",
         "hint": "用于描述并分类表情包的视觉模型 provider id；留空则复用对话模型"
       },
-"collect_probability": {
-   "description": "收集概率",
-   "type": "float",
-   "default": 1.0,
-   "hint": "兼容旧配置；当前默认收集所有图片，是否使用由 AI 根据来源语境决定"
-  },
-  "auto_probability": {
-   "description": "自动配图概率",
-   "type": "float",
-   "default": 0.5,
-   "hint": "AI 没有主动写 [[emoji:...]] 时，由副模型判断回复情绪并自动配图的基础概率（0~1），避免每条回复都带图"
-  }
- }
+      "collect_probability": {
+        "description": "收集概率",
+        "type": "float",
+        "default": 1.0,
+        "hint": "兼容旧配置；当前默认收集所有图片，是否使用由 AI 根据来源语境决定"
+      },
+      "auto_probability": {
+        "description": "自动配图概率",
+        "type": "float",
+        "default": 0.5,
+        "hint": "AI 没有主动写 [[emoji:...]] 时，由副模型判断回复情绪并自动配图的基础概率（0~1），避免每条回复都带图"
+      }
+    }
   },
   "sandbox": {
     "description": "Agent 沙箱工具",
@@ -740,6 +740,30 @@
         "type": "float",
         "default": 2,
         "hint": "无互动时每天衰减的好感度"
+      }
+    }
+  },
+  "relations": {
+    "description": "人际关系与社交审批",
+    "type": "object",
+    "items": {
+      "level": {
+        "description": "审批级别",
+        "type": "str",
+        "default": "ask_admin",
+        "hint": "auto=AI自主审批；ask_admin=AI起草内容转交管理员决定；notify=仅通知不处理"
+      },
+      "manage_group_id": {
+        "description": "管理群号",
+        "type": "str",
+        "default": "",
+        "hint": "社交申请的审批通知发往该群并@管理员；留空则私聊第一位管理员"
+      },
+      "notify": {
+        "description": "通知开关",
+        "type": "bool",
+        "default": true,
+        "hint": "收到好友申请/入群邀请时是否通知管理员"
       }
     }
   }

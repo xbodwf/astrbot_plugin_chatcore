@@ -16,6 +16,7 @@ import shutil
 import time
 import uuid
 from pathlib import Path
+from collections import deque
 from typing import Any
 
 from astrbot.api import AstrBotConfig
@@ -208,6 +209,9 @@ class Main(Star):
         self.active_tasks: dict[str, GenerationTask] = {}
         self._interrupted: dict[str, float] = {}
         self._last_reply: dict[str, tuple[str, float]] = {}
+        self._sent_messages: dict[str, deque] = {}
+        self._pending_requests: dict[str, dict] = {}
+        self._last_request_bot: Any = None
         self._analysis_task: asyncio.Task | None = None
         self._expression_task: asyncio.Task | None = None
         self._scheduled_jobs: dict[str, dict] = {}
@@ -524,6 +528,11 @@ class Main(Star):
                 decay_per_day=float(affinity_cfg.get("decay_per_day", 2.0)),
             )
 
+        relations_cfg = config.get("relations", {})
+        self.relation_level = relations_cfg.get("level", "ask_admin")
+        self.manage_group_id = str(relations_cfg.get("manage_group_id", "") or "")
+        self.relation_notify = relations_cfg.get("notify", True)
+
         implicit_cfg = config.get("implicit", {})
         self.implicit_enabled = implicit_cfg.get("enabled", True)
         self.implicit_interval = max(
@@ -762,6 +771,115 @@ class Main(Star):
         asyncio.create_task(
             self._run_conversation(task, event, conv_id, poke_text, []),
         )
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    async def on_relation_request(self, event: AstrMessageEvent) -> None:
+        """Handle OneBot friend/group requests through the configured level.
+
+        Friend requests (``request_type=friend``) and group invitations
+        (``sub_type=invite``) arrive as ``request`` events. Depending on
+        ``relations.level`` the agent either approves on its own (auto),
+        notifies admins and waits for their word (ask_admin), or only notifies
+        (notify). The notification is driven through the normal conversation
+        pipeline so the agent writes the wording itself.
+
+        Args:
+            event: The request event.
+        """
+        raw = getattr(event.message_obj, "raw_message", None)
+        if self._raw_get(raw, "post_type") != "request":
+            return
+        request_type = self._raw_get(raw, "request_type", "")
+        flag = str(self._raw_get(raw, "flag") or "")
+        if not flag or request_type not in ("friend", "group"):
+            return
+        self._last_request_bot = getattr(event, "bot", None)
+        user_id = str(self._raw_get(raw, "user_id") or "")
+        comment = str(self._raw_get(raw, "comment") or "")
+        sub_type = str(self._raw_get(raw, "sub_type") or "")
+        if flag in self._pending_requests:
+            return
+        self._pending_requests[flag] = {
+            "request_type": request_type,
+            "user_id": user_id,
+            "comment": comment,
+            "sub_type": sub_type,
+        }
+        if self.relation_level == "notify" and not self.relation_notify:
+            return
+        note = (
+            f"（社交申请）有用户{user_id or '未知'}想添加你为好友"
+            if request_type == "friend"
+            else f"（社交申请）用户{user_id or '未知'}申请加入群，"
+            f"备注：{comment or '无'}"
+        )
+        note += f"\n申请标识 flag={flag}，你可以在工具里用这个 flag 审批。"
+        event.stop_event()
+        asyncio.create_task(self._route_relation_notice(event, note))
+        self.logger.info(
+            f"ChatCore relation request | {request_type} | flag={flag} "
+            f"| user={user_id} | level={self.relation_level}"
+        )
+
+    async def _route_relation_notice(self, event, note: str) -> None:
+        """Deliver a relation request notice to the manage group or owner DM.
+
+        The notice goes through ``_run_conversation`` so the agent writes its
+        own wording, targeting the configured manage group, or the owner's DM
+        when no manage group is set.
+
+        Args:
+            event: The original request event.
+            note: The system note describing the pending request.
+        """
+        from astrbot.core.cron.events import CronMessageEvent
+        from astrbot.core.platform.message_session import MessageSession
+        from astrbot.core.platform.message_type import MessageType
+
+        platform_id = event.get_platform_id() or "aiocqhttp"
+        target_conv = ""
+        message_type = MessageType.GROUP_MESSAGE
+        if self.manage_group_id:
+            target_conv = (
+                f"{platform_id}:{MessageType.GROUP_MESSAGE.value}:"
+                f"{self.manage_group_id}"
+            )
+        else:
+            admins = self._owner_ids()
+            if not admins:
+                return
+            target_conv = (
+                f"{platform_id}:{MessageType.FRIEND_MESSAGE.value}:{admins[0]}"
+            )
+            message_type = MessageType.FRIEND_MESSAGE
+        session = MessageSession.from_str(target_conv)
+        cron_event = CronMessageEvent(
+            context=self.context,
+            session=session,
+            message=note,
+            message_type=message_type,
+        )
+        self.context_mgr.record(target_conv, "user", "系统", note)
+        task = GenerationTask(target_conv, "")
+        self.active_tasks[target_conv] = task
+        await self._run_conversation(
+            task, cron_event, target_conv, note, []
+        )
+
+    def _owner_ids(self) -> list[str]:
+        """Resolve owner/admin user ids from the global config.
+
+        Returns:
+            List of admin user id strings.
+        """
+        try:
+            global_cfg = self.context.get_config(None)
+            admins = global_cfg.get("admins_id", [])
+            if isinstance(admins, str):
+                admins = [admins]
+            return [str(uid) for uid in admins if str(uid).isdigit()]
+        except Exception:
+            return []
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
@@ -1100,9 +1218,8 @@ class Main(Star):
                             self._last_reply[conv_id] = (segment, time.time())
                             chain = await self._decorate_segment(event, segment)
                             if chain:
-                                await self.context.send_message(
-                                    conv_id,
-                                    MessageChain(chain=chain),
+                                await self._send_and_track(
+                                    event, conv_id, chain, segment
                                 )
                         task.request_cancel()
                         return
@@ -1130,9 +1247,8 @@ class Main(Star):
                     self._last_reply[conv_id] = (segment, time.time())
                     poke_chain, chain = self._split_poke_chain(chain)
                     if chain:
-                        await self.context.send_message(
-                            conv_id,
-                            MessageChain(chain=chain),
+                        await self._send_and_track(
+                            event, conv_id, chain, segment
                         )
                     if poke_chain:
                         await self._send_poke_actions(event, poke_chain)
@@ -1255,9 +1371,8 @@ class Main(Star):
                             self._schedule_summary(conv_id)
                         self.logger.info(f"ChatCore send | {conv_id} | bot: {trailing}")
                         self._last_reply[conv_id] = (trailing, time.time())
-                        await self.context.send_message(
-                            conv_id,
-                            MessageChain(chain=chain),
+                        await self._send_and_track(
+                            event, conv_id, chain, trailing
                         )
                 if cancelled:
                     if emoji_search_query:
@@ -1376,7 +1491,9 @@ class Main(Star):
                 "`[[at:]]` 可以单独一段。"
                 "也可以使用 `[[poke:userID]]` 戳任何人（如 `[[poke:3505269587]]`），"
                 "想戳自己用 `[[poke:yourself]]`，但有 98% 的情况下不要戳自己，"
-                "这很奇怪；poke 标记必须单独占一行或单独一个分段，一段内只能有一个 poke；"
+                "这很奇怪；想戳谁、一次戳几下都由你随性决定，"
+                "多个 poke 标记可以连在一起（如 `[[poke:A]][[poke:B]]`），"
+                "但对同一目标连续猛戳会被平台限频，注意节奏；"
                 "想原样输出这类标记时前面加 `" + self.segment_escape + "`。"
             )
         if self.tools_enabled:
@@ -1452,6 +1569,30 @@ class Main(Star):
             rules += self.emotion_mgr.inject_text(conv_id)
         if self.affinity_mgr and sender_id:
             rules += self.affinity_mgr.inject_text(sender_id)
+            if self.profile_store:
+                label = self.profile_store.get_relationship(sender_id)
+                if label:
+                    rules += (
+                        f"\n\n【关系标签】你与对方的关系：{label}。"
+                        "按这个关系自然地把握相处方式，不要提及这条说明。"
+                    )
+        if self._pending_requests:
+            req = next(iter(self._pending_requests.values()))
+            rtype = "好友申请" if req.get("request_type") == "friend" else "入群申请"
+            req_flag = next(iter(self._pending_requests))
+            rules += (
+                f"\n\n【待办社交申请】当前有1条{rtype}等待处理"
+                "（来自用户"
+                + (req.get("user_id") or "未知")
+                + f"，flag={req_flag}），按审批级别处理："
+                + (
+                    "你可自主决定是否通过，调用审批工具执行。"
+                    if self.relation_level == "auto"
+                    else "需要先向管理员征求意见，管理员同意后再调用审批工具执行。"
+                    if self.relation_level == "ask_admin"
+                    else "只通报，不处理。"
+                )
+            )
         if self.selflearn:
             # 只注入与当前对话场景匹配的规则，提高命中率、减小 prompt。
             scene_context = self.context_mgr.summary_text(conv_id, max_chars=300)
@@ -1809,11 +1950,175 @@ class Main(Star):
             )
             self._add_sandbox_tools(ts, FunctionTool, direct_only=True)
             self._add_schedule_tools(ts, FunctionTool)
+            self._add_relation_tools(ts, FunctionTool)
             self._tool_set = ts if not ts.empty() else None
         except Exception as e:
             self.logger.warning(f"ChatCore: tool set build failed: {e}")
             self._tool_set = None
         return self._tool_set
+
+    def _add_relation_tools(self, ts: ToolSet, FunctionTool) -> None:
+        """Register relationship management tools on the main tool set.
+
+        The agent manages its interpersonal relations: it can read/write
+        affinity, set relationship labels, recall its own recent messages and
+        (in auto level) approve QQ friend/group requests directly.
+
+        Args:
+            ts: The ToolSet to populate.
+            FunctionTool: The FunctionTool class to instantiate.
+        """
+        ts.add_tool(
+            FunctionTool(
+                name="get_relationship",
+                description=(
+                    "查看与某人的当前关系：好感度等级、关系标签、画像要点。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "user_id": {
+                            "type": "string",
+                            "description": "对方的用户ID（QQ号）。",
+                        }
+                    },
+                    "required": ["user_id"],
+                },
+                handler=self._get_relationship_handler,
+            )
+        )
+        ts.add_tool(
+            FunctionTool(
+                name="set_affinity",
+                description=(
+                    "直接把某人的好感度设为指定数值(0-100)，用于你对TA的态度调整。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "user_id": {"type": "string", "description": "对方的用户ID。"},
+                        "value": {"type": "number", "description": "目标好感度 0-100。"},
+                    },
+                    "required": ["user_id", "value"],
+                },
+                handler=self._set_affinity_handler,
+            )
+        )
+        ts.add_tool(
+            FunctionTool(
+                name="adjust_affinity",
+                description=(
+                    "在某人的好感度上增减一个数值(可为负数)，用于对TA态度的微调。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "user_id": {"type": "string", "description": "对方的用户ID。"},
+                        "delta": {"type": "number", "description": "好感度增减量。"},
+                    },
+                    "required": ["user_id", "delta"],
+                },
+                handler=self._adjust_affinity_handler,
+            )
+        )
+        ts.add_tool(
+            FunctionTool(
+                name="set_relationship_label",
+                description=(
+                    "记录你与某人的关系标签，如“死党”“点头之交”“欢喜冤家”，"
+                    "用于长期记住这段关系。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "user_id": {"type": "string", "description": "对方的用户ID。"},
+                        "label": {
+                            "type": "string",
+                            "description": "关系标签，传空字符串则清除。",
+                        },
+                    },
+                    "required": ["user_id", "label"],
+                },
+                handler=self._set_relationship_label_handler,
+            )
+        )
+        ts.add_tool(
+            FunctionTool(
+                name="list_relationships",
+                description=(
+                    "列出你与所有人的关系概览：用户ID、好感度、关系标签。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+                handler=self._list_relationships_handler,
+            )
+        )
+        ts.add_tool(
+            FunctionTool(
+                name="recall_last_message",
+                description=(
+                    "撤回你自己在本会话中最近发出的消息（默认最近一条，"
+                    "也可指定序号，1=最新）。只能撤回自己30分钟内发的消息。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "index": {
+                            "type": "integer",
+                            "description": "可选：从最新开始数的序号，默认1。",
+                        }
+                    },
+                    "required": [],
+                },
+                handler=self._recall_last_message_handler,
+            )
+        )
+        if self.relation_level == "auto":
+            level_hint = (
+                "你自主决定是否通过，无需询问任何人。"
+            )
+        elif self.relation_level == "notify":
+            level_hint = "你只负责通报情况，不要执行审批。"
+        else:
+            level_hint = "你需要先向管理员征求意见，管理员明确同意后才能执行审批。"
+        ts.add_tool(
+            FunctionTool(
+                name="approve_friend_request",
+                description=(
+                    "审批一条QQ好友申请。" + level_hint
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "flag": {"type": "string", "description": "申请标识 flag。"},
+                        "approve": {"type": "boolean", "description": "是否通过。"},
+                    },
+                    "required": ["flag", "approve"],
+                },
+                handler=self._approve_friend_request_handler,
+            )
+        )
+        ts.add_tool(
+            FunctionTool(
+                name="approve_group_invite",
+                description=(
+                    "审批一条入群申请。" + level_hint
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "flag": {"type": "string", "description": "申请标识 flag。"},
+                        "sub_type": {"type": "string", "description": "申请子类型。"},
+                        "approve": {"type": "boolean", "description": "是否同意。"},
+                    },
+                    "required": ["flag", "approve"],
+                },
+                handler=self._approve_group_invite_handler,
+            )
+        )
 
     def _add_schedule_tools(self, ts: ToolSet, FunctionTool) -> None:
         """Register the agent's self-schedule tools on the main tool set.
@@ -1898,6 +2203,218 @@ class Main(Star):
                 handler=self._schedule_list_handler,
             )
         )
+
+    async def _get_relationship_handler(self, event, user_id: str) -> dict:
+        """Handler for ``get_relationship``.
+
+        Args:
+            event: The message event.
+            user_id: The target user id.
+
+        Returns:
+            Relationship overview (affinity, tier, label, profile summary).
+        """
+        profile_text = ""
+        if self.profile_store:
+            profile_text = self.profile_store.render(user_id) or ""
+        label = ""
+        if self.profile_store:
+            label = self.profile_store.get_relationship(user_id)
+        if self.affinity_mgr:
+            value = round(self.affinity_mgr.get(user_id))
+            tier, desc = self.affinity_mgr.tier(user_id)
+            affinity = f"好感度 {value}（{tier}）：{desc}"
+        else:
+            affinity = "好感度系统未启用"
+        return {
+            "user_id": user_id,
+            "affinity": affinity,
+            "relationship_label": label or "未记录",
+            "profile": profile_text or "无画像",
+        }
+
+    async def _set_affinity_handler(self, event, user_id: str, value: float) -> dict:
+        """Handler for ``set_affinity``.
+
+        Args:
+            event: The message event.
+            user_id: The target user id.
+            value: Target affinity 0-100.
+
+        Returns:
+            Confirmation with the new value.
+        """
+        if not self.affinity_mgr:
+            return {"error": "好感度系统未启用"}
+        self.affinity_mgr.set(user_id, float(value))
+        self.logger.info(f"ChatCore relation set | {user_id} | affinity={value}")
+        return {"ok": True, "user_id": user_id, "affinity": round(float(value))}
+
+    async def _adjust_affinity_handler(self, event, user_id: str, delta: float) -> dict:
+        """Handler for ``adjust_affinity``.
+
+        Args:
+            event: The message event.
+            user_id: The target user id.
+            delta: Affinity delta (can be negative).
+
+        Returns:
+            Confirmation with the new value.
+        """
+        if not self.affinity_mgr:
+            return {"error": "好感度系统未启用"}
+        self.affinity_mgr.interact(user_id, float(delta))
+        new_value = round(self.affinity_mgr.get(user_id))
+        self.logger.info(f"ChatCore relation adj | {user_id} | delta={delta}")
+        return {"ok": True, "user_id": user_id, "affinity": new_value}
+
+    async def _set_relationship_label_handler(
+        self, event, user_id: str, label: str
+    ) -> dict:
+        """Handler for ``set_relationship_label``.
+
+        Args:
+            event: The message event.
+            user_id: The target user id.
+            label: The relationship label; empty clears it.
+
+        Returns:
+            Confirmation.
+        """
+        if not self.profile_store:
+            return {"error": "画像系统未启用"}
+        self.profile_store.set_relationship(user_id, label)
+        self.logger.info(f"ChatCore relation label | {user_id} | {label or '(cleared)'}")
+        return {"ok": True, "user_id": user_id, "label": label or "(无)"}
+
+    async def _list_relationships_handler(self, event) -> dict:
+        """Handler for ``list_relationships``.
+
+        Args:
+            event: The message event.
+
+        Returns:
+            Overview of all known relationships.
+        """
+        rows = []
+        ids: set[str] = set()
+        if self.affinity_mgr:
+            ids.update(item["user_id"] for item in self.affinity_mgr.snapshot())
+        if self.profile_store:
+            ids.update(
+                profile.get("person_id", "")
+                for profile in self.profile_store.all()
+                if profile.get("person_id")
+            )
+        for uid in sorted(ids):
+            affinity = ""
+            if self.affinity_mgr:
+                affinity = f"{round(self.affinity_mgr.get(uid))}（{self.affinity_mgr.tier(uid)[0]}）"
+            label = ""
+            if self.profile_store:
+                label = self.profile_store.get_relationship(uid)
+            rows.append({"user_id": uid, "affinity": affinity, "label": label})
+        return {"relationships": rows, "count": len(rows)}
+
+    async def _recall_last_message_handler(self, event, index: int = 1) -> dict:
+        """Handler for ``recall_last_message``.
+
+        Recalls the agent's own recent message in this conversation. Only
+        messages sent by the agent within the last 30 minutes can be recalled.
+
+        Args:
+            event: The message event.
+            index: Message index counting from the latest (1 = newest).
+
+        Returns:
+            Confirmation or an error.
+        """
+        conv_id = event.unified_msg_origin
+        records = self._sent_messages.get(conv_id) or []
+        if not records:
+            return {"error": "本会话暂无我可撤回的消息"}
+        idx = int(index) - 1
+        if idx < 0 or idx >= len(records):
+            return {"error": f"序号无效，最近共 {len(records)} 条"}
+        msg_id, segment, ts = records[idx]
+        if time.time() - ts > 1800:
+            return {"error": "该消息已超过30分钟，无法撤回"}
+        bot = getattr(event, "bot", None)
+        if bot is None:
+            return {"error": "当前平台不支持撤回"}
+        try:
+            await bot.call_action("delete_msg", message_id=int(msg_id))
+        except Exception as e:
+            self.logger.warning(f"ChatCore recall failed: {e}")
+            return {"error": f"撤回失败: {e}"}
+        del records[idx]
+        self.context_mgr.record(conv_id, "assistant", "bot", "（已撤回上一条消息）")
+        self.logger.info(f"ChatCore recall | {conv_id} | id={msg_id}")
+        return {"ok": True, "recalled": segment[:40]}
+
+    async def _approve_friend_request_handler(
+        self, event, flag: str, approve: bool
+    ) -> dict:
+        """Handler for ``approve_friend_request`` (auto level).
+
+        Args:
+            event: The message event.
+            flag: The request flag.
+            approve: Whether to approve.
+
+        Returns:
+            Confirmation.
+        """
+        bot = getattr(event, "bot", None) or self._last_request_bot
+        if bot is None:
+            return {"error": "当前平台不支持审批"}
+        if self.relation_level == "notify":
+            return {"error": "当前为仅通知模式，不执行审批"}
+        try:
+            await bot.call_action(
+                "set_friend_add_request", flag=flag, approve=approve
+            )
+        except Exception as e:
+            return {"error": f"审批失败: {e}"}
+        self._pending_requests.pop(flag, None)
+        self.logger.info(
+            f"ChatCore approve friend | {flag} | approve={approve}"
+        )
+        return {"ok": True, "approved": approve}
+
+    async def _approve_group_invite_handler(
+        self, event, flag: str, sub_type: str = "", approve: bool = True
+    ) -> dict:
+        """Handler for ``approve_group_invite`` (auto level).
+
+        Args:
+            event: The message event.
+            flag: The request flag.
+            sub_type: The request sub type (invite/add).
+            approve: Whether to approve.
+
+        Returns:
+            Confirmation.
+        """
+        bot = getattr(event, "bot", None) or self._last_request_bot
+        if bot is None:
+            return {"error": "当前平台不支持审批"}
+        if self.relation_level == "notify":
+            return {"error": "当前为仅通知模式，不执行审批"}
+        try:
+            await bot.call_action(
+                "set_group_add_request",
+                flag=flag,
+                sub_type=sub_type or "invite",
+                approve=approve,
+            )
+        except Exception as e:
+            return {"error": f"审批失败: {e}"}
+        self._pending_requests.pop(flag, None)
+        self.logger.info(
+            f"ChatCore approve group | {flag} | sub={sub_type} | approve={approve}"
+        )
+        return {"ok": True, "approved": approve}
 
     async def _schedule_set_handler(
         self, event, state: str, level: int, minutes: float = 0, cron: str = "", priority: int = 0
@@ -2595,10 +3112,18 @@ class Main(Star):
         if bot is None or not pokes:
             return
         group_id = event.get_group_id()
+        last_target = None
+        last_sent = 0.0
         for poke in pokes:
             target = poke.target_id()
             if not target:
                 continue
+            # NapCat 对同一目标约 1 秒频率限制，不同目标也需轻微间隔，
+            # 否则连戳会被平台风控丢弃（表现为"戳了几次就停"）。
+            now = time.monotonic()
+            gap = 1.0 if target == last_target else 0.3
+            if last_sent and now - last_sent < gap:
+                await asyncio.sleep(gap - (now - last_sent))
             try:
                 if group_id:
                     await bot.call_action(
@@ -2610,6 +3135,23 @@ class Main(Star):
                     await bot.call_action("friend_poke", user_id=int(target))
             except Exception as e:
                 self.logger.warning(f"ChatCore poke action failed: {e}")
+                # 一次失败重试（可能只是瞬时限频）。
+                try:
+                    await asyncio.sleep(0.3)
+                    if group_id:
+                        await bot.call_action(
+                            "group_poke",
+                            group_id=int(group_id),
+                            user_id=int(target),
+                        )
+                    else:
+                        await bot.call_action("friend_poke", user_id=int(target))
+                except Exception as e2:
+                    self.logger.warning(
+                        f"ChatCore poke retry failed: {target} | {e2}"
+                    )
+            last_target = target
+            last_sent = time.monotonic()
 
     async def _segment_with_emoji(
         self,
@@ -2868,6 +3410,80 @@ class Main(Star):
             return list(result.chain) if result and result.chain else []
         finally:
             event.clear_result()
+
+    async def _send_and_track(
+        self,
+        event: AstrMessageEvent,
+        conv_id: str,
+        chain: list,
+        segment: str,
+    ) -> None:
+        """Send a message chain, capturing the real message id when possible.
+
+        ``context.send_message`` returns only a bool and the aiocqhttp adapter
+        swaps the real message id for a uuid, so recall needs the raw OneBot
+        id. Sending via ``bot.call_action("send_group_msg"/"send_private_msg")``
+        returns the id; falls back to ``context.send_message`` (untracked)
+        when the platform or chain cannot be sent that way.
+
+        Args:
+            event: The message event driving this reply.
+            conv_id: Conversation identifier.
+            chain: The message chain components to send.
+            segment: The text segment (for the recall log).
+        """
+        sent_id: str = ""
+        sent_ok = False
+        bot = getattr(event, "bot", None)
+        if bot is not None:
+            try:
+                from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+                    AiocqhttpMessageEvent,
+                )
+                from astrbot.core.platform.message_type import MessageType
+
+                payload = await AiocqhttpMessageEvent._parse_onebot_json(
+                    MessageChain(chain=chain)
+                )
+                if not payload:
+                    raise ValueError("empty onebot payload")
+                group_id = event.get_group_id()
+                params = {}
+                self_id = event.get_self_id() or ""
+                if self_id:
+                    params["self_id"] = self_id
+                if group_id:
+                    resp = await bot.send_group_msg(
+                        group_id=int(group_id),
+                        message=payload,
+                        **params,
+                    )
+                else:
+                    sender_id = event.get_sender_id()
+                    if sender_id:
+                        resp = await bot.send_private_msg(
+                            user_id=int(sender_id),
+                            message=payload,
+                            **params,
+                        )
+                if isinstance(resp, dict):
+                    sent_id = str(resp.get("message_id") or "")
+                sent_ok = True
+            except Exception as e:
+                self.logger.debug(
+                    f"ChatCore send_and_track fallback: {e}"
+                )
+        if sent_ok:
+            record = self._sent_messages.setdefault(conv_id, deque(maxlen=20))
+            record.append((sent_id, segment, time.time()))
+            self.logger.info(
+                f"ChatCore send tracked | {conv_id} | id={sent_id or '(none)'}"
+            )
+            return
+        # No bot, or the tracked send failed: use the standard send path.
+        await self.context.send_message(
+            conv_id, MessageChain(chain=chain)
+        )
 
     async def _describe_images(self, images: list[Image]) -> list[str]:
         """Describe attached images.
@@ -3494,6 +4110,9 @@ class Main(Star):
         if len(parts) > 1 and parts[1].lower() == "affinity":
             yield self._chatcore_affinity(event, parts)
             return
+        if len(parts) > 1 and parts[1].lower() == "relations":
+            yield self._chatcore_relations(event)
+            return
         if len(parts) > 1 and parts[1].lower() == "reset":
             yield await self._chatcore_reset(event)
             return
@@ -3546,7 +4165,8 @@ class Main(Star):
         """Resolve the ``chatcore affinity`` sub-command.
 
         ``chatcore affinity`` shows the caller's own affinity; admins may
-        append a user id to query another user's affinity.
+        append a user id to query another user's affinity, or append a value
+        to set it directly.
 
         Args:
             event: Current platform message event.
@@ -3557,6 +4177,19 @@ class Main(Star):
         """
         if not self.affinity_mgr:
             return event.plain_result("好感度系统未启用。")
+        if len(parts) > 3:
+            if not event.is_admin():
+                return event.plain_result("只有管理员可以设置好感度。")
+            target_id = parts[2].strip()
+            try:
+                value = float(parts[3].strip())
+            except ValueError:
+                return event.plain_result("好感度数值无效。")
+            self.affinity_mgr.set(target_id, value)
+            self.logger.info(
+                f"ChatCore admin set affinity | {target_id} | {value}"
+            )
+            return self._format_affinity(event, target_id)
         if len(parts) > 2:
             target_id = parts[2].strip()
             if target_id == str(event.get_sender_id()):
@@ -3565,6 +4198,46 @@ class Main(Star):
                 return event.plain_result("只有管理员可以查询其他用户的好感度。")
             return self._format_affinity(event, target_id)
         return self._format_affinity(event, str(event.get_sender_id()))
+
+    def _chatcore_relations(self, event: AstrMessageEvent) -> MessageEventResult:
+        """Resolve the ``chatcore relations`` sub-command (admin only).
+
+        Lists every known relationship: user id, affinity tier and label.
+
+        Args:
+            event: Current platform message event.
+
+        Returns:
+            The plain result to send.
+        """
+        if not event.is_admin():
+            return event.plain_result("只有管理员可以查看关系列表。")
+        rows = []
+        ids: set[str] = set()
+        if self.affinity_mgr:
+            ids.update(item["user_id"] for item in self.affinity_mgr.snapshot())
+        if self.profile_store:
+            ids.update(
+                profile.get("person_id", "")
+                for profile in self.profile_store.all()
+                if profile.get("person_id")
+            )
+        if not ids:
+            return event.plain_result("暂无任何关系记录。")
+        for uid in sorted(ids):
+            if self.affinity_mgr:
+                value = round(self.affinity_mgr.get(uid))
+                tier = self.affinity_mgr.tier(uid)[0]
+                affinity = f"{value}（{tier}）"
+            else:
+                affinity = "-"
+            label = (
+                self.profile_store.get_relationship(uid)
+                if self.profile_store
+                else ""
+            )
+            rows.append(f"- {uid}: 好感度 {affinity}" + (f"，关系 {label}" if label else ""))
+        return event.plain_result("人际关系列表：\n" + "\n".join(rows))
 
     def _format_affinity(
         self, event: AstrMessageEvent, user_id: str

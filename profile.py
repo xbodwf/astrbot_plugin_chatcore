@@ -165,6 +165,33 @@ class ProfileStore:
             return True
         return False
 
+    def set_relationship(self, person_id: str, label: str) -> None:
+        """Set a free-form relationship label for a person.
+
+        Args:
+            person_id: Stable platform id of the person.
+            label: Relationship label, e.g. "死党" or "点头之交".
+        """
+        profile = self._profiles.setdefault(person_id, {})
+        label = label.strip()
+        if label:
+            profile["relationship"] = label
+        else:
+            profile.pop("relationship", None)
+        self._save()
+
+    def get_relationship(self, person_id: str) -> str:
+        """Get a person's relationship label.
+
+        Args:
+            person_id: Stable platform id of the person.
+
+        Returns:
+            The label or an empty string.
+        """
+        profile = self._profiles.get(person_id)
+        return (profile or {}).get("relationship", "") if profile else ""
+
     def merge(
         self,
         person_id: str,
@@ -249,6 +276,9 @@ class ProfileStore:
             return None
         nickname = profile.get("nickname", "") or person_id
         parts = [f"该用户昵称: {nickname}"]
+        relationship = profile.get("relationship", "")
+        if relationship:
+            parts.append(f"你与TA的关系: {relationship}")
         for item in facts:
             fact = item.get("fact", "") if isinstance(item, dict) else str(item)
             evidence = item.get("evidence", "") if isinstance(item, dict) else ""
