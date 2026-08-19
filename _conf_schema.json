@@ -773,13 +773,13 @@
       },
       "level": {
         "description": "审批级别",
-        "type": "str",
+        "type": "string",
         "default": "ask_admin",
         "hint": "auto=AI自主审批；ask_admin=AI起草内容转交管理员决定；notify=仅通知不处理"
       },
       "manage_group_id": {
         "description": "管理群号",
-        "type": "str",
+        "type": "string",
         "default": "",
         "hint": "社交申请的审批通知发往该群并@管理员；留空则私聊第一位管理员"
       },
