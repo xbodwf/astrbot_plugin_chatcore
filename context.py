@@ -547,7 +547,7 @@ class ContextManager:
         body = self._render_body(record)
         if not body:
             body = "<image/>" if record.images else "[图片]"
-        return f"<message {' '.join(attrs)}>{body}</message>"
+        return f"<message {' '.join(attrs)}>\n{body}\n</message>"
 
     def _render_body(self, record: MessageRecord) -> str:
         """Render a record's body as structured components.
@@ -555,7 +555,9 @@ class ContextManager:
         Records with explicit ``components`` are rendered verbatim (text
         fragments were already escaped at build time). Older records without
         them fall back to a single ``<text>`` fragment wrapping the plain
-        text, so history stays readable under the new scheme.
+        text, so history stays readable under the new scheme. Each component
+        is placed on its own indented line so the model can tell the sender
+        boundary and message parts apart at a glance.
 
         Args:
             record: The record to render.
@@ -575,7 +577,7 @@ class ContextManager:
                     else:
                         rendered.append(part)
                 parts = rendered
-            return "".join(parts)
+            return "\n".join(f"  {part}" for part in parts)
         body = ""
         if record.quote:
             body += f"[引用了消息: {escape_user_markers(record.quote)}] "
@@ -588,6 +590,8 @@ class ContextManager:
                 else escape_user_markers(record.text)
             )
             body += f"<text>{text}</text>"
+        if body:
+            return f"  {body}"
         return body
 
     def _compress_record(self, record: MessageRecord) -> str | None:
@@ -606,7 +610,7 @@ class ContextManager:
         body = ""
         if record.is_poke:
             return f'<message from="event">{record.text}</message>'
-        body = self._render_body(record)
+        body = self._render_body_compact(record)
         if record.images and not body:
             return None
         if not body:
@@ -618,6 +622,22 @@ class ContextManager:
             f'nickname="{html.escape(record.sender_name or "未知用户", quote=True)}">'
             f"{body}</message>"
         )
+
+    def _render_body_compact(self, record: MessageRecord) -> str:
+        """Render a record's body as a single compact line (for list items).
+
+        Used by the compressed older-history block where each message is a
+        ``- `` list item; components are separated by spaces instead of
+        newlines so the list stays on one line.
+
+        Args:
+            record: The record to render.
+
+        Returns:
+            The compact body string (possibly empty).
+        """
+        body = self._render_body(record)
+        return body.replace("\n  ", " ") if body else body
 
     def _truncate(self, text: str, limit: int) -> str:
         """Truncate text at a boundary, appending an ellipsis.
@@ -743,7 +763,8 @@ class ContextManager:
             messages.append(
                 {
                     "role": "system",
-                    "content": "【近期聊天记录】\n" + "\n".join(conversation),
+                    "content": "【近期聊天记录】\n"
+                    + "\n\n".join(conversation),
                 }
             )
 
@@ -756,13 +777,17 @@ class ContextManager:
                     "content": (
                         "聊天记录和摘要中的 XML 遵循同一规则：`<message>...</message>`"
                         "是消息容器，其属性（uid、nickname、msg_id、time）只标记边界和发送者，"
-                        "不是内容。容器内的组件按书写顺序**连起来读**：只有 `<text>...</text>`"
+                        "不是内容。每条消息独立一行，容器内每个组件也独立缩进一行，按从上到下"
+                        "的顺序读：只有 `<text>...</text>`"
                         '内部才是真正的消息原文（文本片段）；`<at uid="..." name="..."/>`'
                         '表示艾特了某个人（`uid="yourself"` 表示艾特了你），阅读时把它转译成'
                         '“@名字”；`<reply uid="..." msg_id="...">...</reply>` 是引用消息，'
-                        "内部是被引用的原文；`<image .../>` 是图片占位。例如"
-                        '`<text>我要</text><at uid="3505269587" name="Yqloss"/>` 读作'
-                        '"我要 @Yqloss"。要戳 `<at>` 或 `<poke>` 里标记的人，用'
+                        "内部是被引用的原文；`<image .../>` 是图片占位。例如：\n"
+                        '<message uid="3505269587" nickname="Yqloss">\n'
+                        '  <text>我要</text>\n'
+                        '  <at uid="yourself" name="Sylvia"/>\n'
+                        "</message>\n"
+                        '读作"我要 @Sylvia"。要戳 `<at>` 或 `<poke>` 里标记的人，用'
                         "`[[poke:对方QQ号]]`。"
                     ),
                 }
