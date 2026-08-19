@@ -787,8 +787,8 @@ class ContextManager:
                         '  <text>我要</text>\n'
                         '  <at uid="yourself" name="Sylvia"/>\n'
                         "</message>\n"
-                        '读作"我要 @Sylvia"。要戳 `<at>` 或 `<poke>` 里标记的人，用'
-                        "`[[poke:对方QQ号]]`。"
+                        '读作"我要 @Sylvia" 要戳 `<at>` 或 `<poke>` 里标记的人，用'
+                        "`[[poke:对方QQ号]]`"
                     ),
                 }
             )

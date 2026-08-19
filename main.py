@@ -417,6 +417,10 @@ class Main(Star):
         emoji_cfg = config.get("emoji", {})
         self.emoji_store = None
         self.emoji_vision_client = None
+        self.emoji_auto_probability = float(
+            emoji_cfg.get("auto_probability", 0.5)
+        )
+        self._auto_emoji_cache: dict[str, str] = {}
         self.emoji_collect_probability = float(
             emoji_cfg.get("collect_probability", 1.0)
         )
@@ -1105,7 +1109,15 @@ class Main(Star):
                     if reply_decision and not reply_decision_applied:
                         reply_decision_applied = True
                         chain = await self._decorate_segment(
-                            event, segment, default_actions=reply_decision
+                            event,
+                            segment,
+                            default_actions=reply_decision,
+                            allow_auto_emoji=True,
+                        )
+                    elif not reply_decision_applied:
+                        reply_decision_applied = True
+                        chain = await self._decorate_segment(
+                            event, segment, allow_auto_emoji=True
                         )
                     else:
                         chain = await self._decorate_segment(event, segment)
@@ -2796,6 +2808,7 @@ class Main(Star):
         event: AstrMessageEvent,
         segment: str,
         default_actions: dict[str, str] | None = None,
+        allow_auto_emoji: bool = False,
     ) -> list:
         """Replay AstrBot's pre-send decoration hooks on one streamed segment.
 
@@ -2807,16 +2820,31 @@ class Main(Star):
 
         Emoji markers (``[[emoji:意图或编号]]``) are resolved first: the
         cleaned text becomes the message chain and each chosen emoji is sent as
-        an image component.
+        an image component. When the segment carries no emoji marker and
+        ``allow_auto_emoji`` is set, a secondary LLM may pick an emoji that
+        matches the reply's emotion and append it (subject to probability and
+        an empty-match gate).
 
         Args:
             event: The message event that triggered this conversation.
             segment: The generated segment text.
+            default_actions: Optional reply/at actions resolved beforehand.
+            allow_auto_emoji: Whether a secondary-LLM emoji pick is permitted.
 
         Returns:
             The final message chain to send, or an empty list when suppressed.
         """
         chain = await self._segment_with_emoji(event, segment, default_actions)
+        if (
+            allow_auto_emoji
+            and self.emoji_store
+            and self.emoji_auto_probability > 0
+            and "[[emoji:" not in segment
+            and "[[search_emoji:" not in segment
+        ):
+            auto_emoji = await self._auto_emoji_pick(event, segment)
+            if auto_emoji:
+                chain.append(Image.fromFileSystem(auto_emoji))
         result = MessageEventResult(chain=chain)
         result.set_result_content_type(ResultContentType.STREAMING_FINISH)
         event.set_result(result)
@@ -3229,6 +3257,82 @@ class Main(Star):
                 tags = by_cat[cat][:3]
                 parts.append(f"{cat}({'/'.join(tags) if tags else '若干'})")
         return "；".join(parts)
+
+    async def _auto_emoji_pick(
+        self, event: AstrMessageEvent, segment: str
+    ) -> str | None:
+        """Let a secondary LLM match an emoji to the reply's emotion.
+
+        Used when the main agent did not write an emoji marker itself: a light
+        model reads the reply text, returns one usage category from the store,
+        and the store's search finds a fitting image. Probability and caching
+        keep the extra call cheap; failures degrade silently.
+
+        Args:
+            event: The message event that triggered this conversation.
+            segment: The generated segment text (stripped of markers).
+
+        Returns:
+            A local emoji file path, or None when nothing matched.
+        """
+        text = (segment or "").strip()
+        if not text or not self.emoji_store:
+            return None
+        if random.random() >= self.emoji_auto_probability:
+            return None
+        key = text[:80]
+        if key in self._auto_emoji_cache:
+            return self._auto_emoji_cache[key]
+        if len(self._auto_emoji_cache) > 500:
+            keys = list(self._auto_emoji_cache)
+            for k in keys[: len(keys) // 2]:
+                self._auto_emoji_cache.pop(k, None)
+        categories = "".join(
+            sorted({r.get("category", "") for r in self.emoji_store.all()})
+        )
+        if not categories.strip():
+            return None
+        prompt = (
+            "分析下面这条机器人回复的情绪，从以下分类选一个最匹配的："
+            f"{categories.strip()}\n"
+            "只回复分类名，不要解释。\n"
+            f"回复：{text}"
+        )
+        try:
+            raw = await self.summary_client.chat(
+                [
+                    {
+                        "role": "system",
+                        "content": "你是情绪分类助手，只回复一个分类名。",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                log_name="latest_emoji_auto",
+            )
+        except Exception as e:
+            self.logger.debug(f"ChatCore auto-emoji analyze failed: {e}")
+            return None
+        emotion = (raw or "").strip().strip("。，！？[]")
+        if not emotion:
+            return None
+        records = await self.emoji_store.search(emotion, top_k=3)
+        if not records:
+            records = self.emoji_store.all()
+        if not records:
+            return None
+        pool = [r for r in records if r.get("file") and Path(r["file"]).is_file()]
+        if not pool:
+            return None
+        pool.sort(key=lambda r: r.get("usage_count", 0))
+        chosen = random.choice(pool[: max(1, min(3, len(pool)))])
+        path = chosen.get("file")
+        self.emoji_store.mark_used(chosen["emoji_id"])
+        self._auto_emoji_cache[key] = path
+        self.logger.info(
+            f"ChatCore auto-emoji | {emotion} -> {chosen['emoji_id']} | {text[:30]}"
+        )
+        return path
 
     async def _resolve_emoji_query(self, conv_id: str, query: str) -> str | None:
         """Resolve an emoji intent or id to a concrete emoji id.
