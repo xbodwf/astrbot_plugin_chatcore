@@ -38,12 +38,15 @@ class AffinityManager:
         path: str | Path,
         initial: float = _INITIAL,
         decay_per_day: float = _DECAY_PER_DAY,
+        cooldown_seconds: float = 60.0,
     ) -> None:
         self.path = Path(path)
         self.initial = float(initial)
         self.decay_per_day = float(decay_per_day)
+        self.cooldown_seconds = float(cooldown_seconds)
         self._values: dict[str, float] = {}
         self._last_ts: dict[str, float] = {}
+        self._last_add_ts: dict[str, float] = {}
         self._load()
 
     def _load(self) -> None:
@@ -51,11 +54,14 @@ class AffinityManager:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
             values = raw.get("values", {}) if isinstance(raw, dict) else {}
             last = raw.get("last_ts", {}) if isinstance(raw, dict) else {}
+            last_add = raw.get("last_add_ts", {}) if isinstance(raw, dict) else {}
             self._values = {str(k): float(v) for k, v in values.items()}
             self._last_ts = {str(k): float(v) for k, v in last.items()}
+            self._last_add_ts = {str(k): float(v) for k, v in last_add.items()}
         except (OSError, json.JSONDecodeError, ValueError, TypeError):
             self._values = {}
             self._last_ts = {}
+            self._last_add_ts = {}
 
     def _save(self) -> None:
         try:
@@ -63,7 +69,11 @@ class AffinityManager:
             tmp = self.path.with_suffix(".tmp")
             tmp.write_text(
                 json.dumps(
-                    {"values": self._values, "last_ts": self._last_ts},
+                    {
+                        "values": self._values,
+                        "last_ts": self._last_ts,
+                        "last_add_ts": self._last_add_ts,
+                    },
                     ensure_ascii=False,
                 ),
                 encoding="utf-8",
@@ -75,13 +85,21 @@ class AffinityManager:
     def interact(self, user_id: str, amount: float = 1.0) -> None:
         """Bump a user's affinity and refresh the last-interaction time.
 
+        Repeated interactions within ``cooldown_seconds`` only refresh the
+        interaction time (so idle decay does not trigger) without adding
+        affinity again, keeping rapid spam from inflating the score.
+
         Args:
             user_id: Platform user id.
             amount: Affinity delta (positive for friendly interaction).
         """
+        now = time.time()
+        self._last_ts[user_id] = now
+        if now - self._last_add_ts.get(user_id, 0.0) < self.cooldown_seconds:
+            return
         current = self.get(user_id)
         self._values[user_id] = max(0.0, min(100.0, current + amount))
-        self._last_ts[user_id] = time.time()
+        self._last_add_ts[user_id] = now
         self._save()
 
     def get(self, user_id: str) -> float:

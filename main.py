@@ -526,9 +526,15 @@ class Main(Star):
                 / "affinity.json",
                 initial=float(affinity_cfg.get("initial", 50)),
                 decay_per_day=float(affinity_cfg.get("decay_per_day", 2.0)),
+                cooldown_seconds=float(
+                    affinity_cfg.get("cooldown_seconds", 60)
+                ),
             )
 
         relations_cfg = config.get("relations", {})
+        self.relation_enabled = relations_cfg.get("enabled", True)
+        self.relation_tools_enabled = relations_cfg.get("relation_tools_enabled", True)
+        self.recall_tool_enabled = relations_cfg.get("recall_enabled", True)
         self.relation_level = relations_cfg.get("level", "ask_admin")
         self.manage_group_id = str(relations_cfg.get("manage_group_id", "") or "")
         self.relation_notify = relations_cfg.get("notify", True)
@@ -667,11 +673,11 @@ class Main(Star):
             sender_id = event.get_sender_id()
             if sender_id:
                 if is_private:
-                    self.affinity_mgr.interact(sender_id, 3.0)
+                    self.affinity_mgr.interact(sender_id, 0.5)
                 elif hard:
-                    self.affinity_mgr.interact(sender_id, 2.0)
+                    self.affinity_mgr.interact(sender_id, 0.4)
                 else:
-                    self.affinity_mgr.interact(sender_id, 1.0)
+                    self.affinity_mgr.interact(sender_id, 0.2)
 
         if self.emoji_store and images:
             asyncio.create_task(
@@ -748,7 +754,7 @@ class Main(Star):
             is_poke=True,
         )
         if self.affinity_mgr and sender_id:
-            self.affinity_mgr.interact(sender_id, 2.0)
+            self.affinity_mgr.interact(sender_id, 0.3)
         task = self.active_tasks.get(conv_id)
         if task:
             # 已有回复在进行中：连戳不再开新对话。把这次 poke 并入 debounce
@@ -788,6 +794,8 @@ class Main(Star):
         """
         raw = getattr(event.message_obj, "raw_message", None)
         if self._raw_get(raw, "post_type") != "request":
+            return
+        if not self.relation_enabled:
             return
         request_type = self._raw_get(raw, "request_type", "")
         flag = str(self._raw_get(raw, "flag") or "")
@@ -1576,7 +1584,7 @@ class Main(Star):
                         f"\n\n【关系标签】你与对方的关系：{label}。"
                         "按这个关系自然地把握相处方式，不要提及这条说明。"
                     )
-        if self._pending_requests:
+        if self.relation_enabled and self._pending_requests:
             req = next(iter(self._pending_requests.values()))
             rtype = "好友申请" if req.get("request_type") == "friend" else "入群申请"
             req_flag = next(iter(self._pending_requests))
@@ -1968,158 +1976,160 @@ class Main(Star):
             ts: The ToolSet to populate.
             FunctionTool: The FunctionTool class to instantiate.
         """
-        ts.add_tool(
-            FunctionTool(
-                name="get_relationship",
-                description=(
-                    "查看与某人的当前关系：好感度等级、关系标签、画像要点。"
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "user_id": {
-                            "type": "string",
-                            "description": "对方的用户ID（QQ号）。",
-                        }
-                    },
-                    "required": ["user_id"],
-                },
-                handler=self._get_relationship_handler,
-            )
-        )
-        ts.add_tool(
-            FunctionTool(
-                name="set_affinity",
-                description=(
-                    "直接把某人的好感度设为指定数值(0-100)，用于你对TA的态度调整。"
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "user_id": {"type": "string", "description": "对方的用户ID。"},
-                        "value": {"type": "number", "description": "目标好感度 0-100。"},
-                    },
-                    "required": ["user_id", "value"],
-                },
-                handler=self._set_affinity_handler,
-            )
-        )
-        ts.add_tool(
-            FunctionTool(
-                name="adjust_affinity",
-                description=(
-                    "在某人的好感度上增减一个数值(可为负数)，用于对TA态度的微调。"
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "user_id": {"type": "string", "description": "对方的用户ID。"},
-                        "delta": {"type": "number", "description": "好感度增减量。"},
-                    },
-                    "required": ["user_id", "delta"],
-                },
-                handler=self._adjust_affinity_handler,
-            )
-        )
-        ts.add_tool(
-            FunctionTool(
-                name="set_relationship_label",
-                description=(
-                    "记录你与某人的关系标签，如“死党”“点头之交”“欢喜冤家”，"
-                    "用于长期记住这段关系。"
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "user_id": {"type": "string", "description": "对方的用户ID。"},
-                        "label": {
-                            "type": "string",
-                            "description": "关系标签，传空字符串则清除。",
+        if self.relation_tools_enabled:
+            ts.add_tool(
+                FunctionTool(
+                    name="get_relationship",
+                    description=(
+                        "查看与某人的当前关系：好感度等级、关系标签、画像要点。"
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "user_id": {
+                                "type": "string",
+                                "description": "对方的用户ID（QQ号）。",
+                            }
                         },
+                        "required": ["user_id"],
                     },
-                    "required": ["user_id", "label"],
-                },
-                handler=self._set_relationship_label_handler,
+                    handler=self._get_relationship_handler,
+                )
             )
-        )
-        ts.add_tool(
-            FunctionTool(
-                name="list_relationships",
-                description=(
-                    "列出你与所有人的关系概览：用户ID、好感度、关系标签。"
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {},
-                    "required": [],
-                },
-                handler=self._list_relationships_handler,
-            )
-        )
-        ts.add_tool(
-            FunctionTool(
-                name="recall_last_message",
-                description=(
-                    "撤回你自己在本会话中最近发出的消息（默认最近一条，"
-                    "也可指定序号，1=最新）。只能撤回自己30分钟内发的消息。"
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "index": {
-                            "type": "integer",
-                            "description": "可选：从最新开始数的序号，默认1。",
-                        }
+            ts.add_tool(
+                FunctionTool(
+                    name="set_affinity",
+                    description=(
+                        "直接把某人的好感度设为指定数值(0-100)，用于你对TA的态度调整。"
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "user_id": {"type": "string", "description": "对方的用户ID。"},
+                            "value": {"type": "number", "description": "目标好感度 0-100。"},
+                        },
+                        "required": ["user_id", "value"],
                     },
-                    "required": [],
-                },
-                handler=self._recall_last_message_handler,
+                    handler=self._set_affinity_handler,
+                )
             )
-        )
-        if self.relation_level == "auto":
-            level_hint = (
-                "你自主决定是否通过，无需询问任何人。"
-            )
-        elif self.relation_level == "notify":
-            level_hint = "你只负责通报情况，不要执行审批。"
-        else:
-            level_hint = "你需要先向管理员征求意见，管理员明确同意后才能执行审批。"
-        ts.add_tool(
-            FunctionTool(
-                name="approve_friend_request",
-                description=(
-                    "审批一条QQ好友申请。" + level_hint
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "flag": {"type": "string", "description": "申请标识 flag。"},
-                        "approve": {"type": "boolean", "description": "是否通过。"},
+            ts.add_tool(
+                FunctionTool(
+                    name="adjust_affinity",
+                    description=(
+                        "在某人的好感度上增减一个数值(可为负数)，用于对TA态度的微调。"
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "user_id": {"type": "string", "description": "对方的用户ID。"},
+                            "delta": {"type": "number", "description": "好感度增减量。"},
+                        },
+                        "required": ["user_id", "delta"],
                     },
-                    "required": ["flag", "approve"],
-                },
-                handler=self._approve_friend_request_handler,
+                    handler=self._adjust_affinity_handler,
+                )
             )
-        )
-        ts.add_tool(
-            FunctionTool(
-                name="approve_group_invite",
-                description=(
-                    "审批一条入群申请。" + level_hint
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "flag": {"type": "string", "description": "申请标识 flag。"},
-                        "sub_type": {"type": "string", "description": "申请子类型。"},
-                        "approve": {"type": "boolean", "description": "是否同意。"},
+            ts.add_tool(
+                FunctionTool(
+                    name="set_relationship_label",
+                    description=(
+                        "记录你与某人的关系标签，如“死党”“点头之交”“欢喜冤家”，"
+                        "用于长期记住这段关系。"
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "user_id": {"type": "string", "description": "对方的用户ID。"},
+                            "label": {
+                                "type": "string",
+                                "description": "关系标签，传空字符串则清除。",
+                            },
+                        },
+                        "required": ["user_id", "label"],
                     },
-                    "required": ["flag", "approve"],
-                },
-                handler=self._approve_group_invite_handler,
+                    handler=self._set_relationship_label_handler,
+                )
             )
-        )
-
+            ts.add_tool(
+                FunctionTool(
+                    name="list_relationships",
+                    description=(
+                        "列出你与所有人的关系概览：用户ID、好感度、关系标签。"
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                    },
+                    handler=self._list_relationships_handler,
+                )
+            )
+        if self.recall_tool_enabled:
+            ts.add_tool(
+                FunctionTool(
+                    name="recall_last_message",
+                    description=(
+                        "撤回你自己在本会话中最近发出的消息（默认最近一条，"
+                        "也可指定序号，1=最新）。只能撤回自己30分钟内发的消息。"
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "index": {
+                                "type": "integer",
+                                "description": "可选：从最新开始数的序号，默认1。",
+                            }
+                        },
+                        "required": [],
+                    },
+                    handler=self._recall_last_message_handler,
+                )
+            )
+        if self.relation_enabled:
+            if self.relation_level == "auto":
+                level_hint = (
+                    "你自主决定是否通过，无需询问任何人。"
+                )
+            elif self.relation_level == "notify":
+                level_hint = "你只负责通报情况，不要执行审批。"
+            else:
+                level_hint = "你需要先向管理员征求意见，管理员明确同意后才能执行审批。"
+            ts.add_tool(
+                FunctionTool(
+                    name="approve_friend_request",
+                    description=(
+                        "审批一条QQ好友申请。" + level_hint
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "flag": {"type": "string", "description": "申请标识 flag。"},
+                            "approve": {"type": "boolean", "description": "是否通过。"},
+                        },
+                        "required": ["flag", "approve"],
+                    },
+                    handler=self._approve_friend_request_handler,
+                )
+            )
+            ts.add_tool(
+                FunctionTool(
+                    name="approve_group_invite",
+                    description=(
+                        "审批一条入群申请。" + level_hint
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "flag": {"type": "string", "description": "申请标识 flag。"},
+                            "sub_type": {"type": "string", "description": "申请子类型。"},
+                            "approve": {"type": "boolean", "description": "是否同意。"},
+                        },
+                        "required": ["flag", "approve"],
+                    },
+                    handler=self._approve_group_invite_handler,
+                )
+            )
     def _add_schedule_tools(self, ts: ToolSet, FunctionTool) -> None:
         """Register the agent's self-schedule tools on the main tool set.
 
@@ -2263,10 +2273,10 @@ class Main(Star):
         """
         if not self.affinity_mgr:
             return {"error": "好感度系统未启用"}
-        self.affinity_mgr.interact(user_id, float(delta))
-        new_value = round(self.affinity_mgr.get(user_id))
+        new_value = self.affinity_mgr.get(user_id) + float(delta)
+        self.affinity_mgr.set(user_id, new_value)
         self.logger.info(f"ChatCore relation adj | {user_id} | delta={delta}")
-        return {"ok": True, "user_id": user_id, "affinity": new_value}
+        return {"ok": True, "user_id": user_id, "affinity": round(self.affinity_mgr.get(user_id))}
 
     async def _set_relationship_label_handler(
         self, event, user_id: str, label: str
@@ -4160,6 +4170,20 @@ class Main(Star):
             f"- 正在进行的对话: {len(self.active_tasks)}",
         ]
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("affinity", alias={"好感度", "好感", "关系"})
+    async def affinity(self, event: AstrMessageEvent):
+        """Show or set affinity, same behavior as ``chatcore affinity``.
+
+        ``/affinity`` shows the caller's own affinity; admins may append a
+        user id to query another user's affinity, or append a value to set it
+        directly. Aliases: ``好感度`` / ``好感`` / ``关系``.
+
+        Args:
+            event: Current platform message event.
+        """
+        parts = event.get_message_str().strip().split()
+        yield self._chatcore_affinity(event, parts)
 
     def _chatcore_affinity(self, event: AstrMessageEvent, parts: list[str]):
         """Resolve the ``chatcore affinity`` sub-command.

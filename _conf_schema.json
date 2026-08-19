@@ -740,6 +740,12 @@
         "type": "float",
         "default": 2,
         "hint": "无互动时每天衰减的好感度"
+      },
+      "cooldown_seconds": {
+        "description": "加分冷却(秒)",
+        "type": "int",
+        "default": 60,
+        "hint": "同一用户在此时间内的重复互动只刷新互动时间、不重复加分，防止刷屏涨好感过快"
       }
     }
   },
@@ -747,6 +753,24 @@
     "description": "人际关系与社交审批",
     "type": "object",
     "items": {
+      "enabled": {
+        "description": "社交审批总开关",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后不监听好友/入群申请，也不注册审批工具"
+      },
+      "relation_tools_enabled": {
+        "description": "关系管理工具开关",
+        "type": "bool",
+        "default": true,
+        "hint": "AI 可查看/调整好感度、设置关系标签的工具"
+      },
+      "recall_enabled": {
+        "description": "撤回消息工具开关",
+        "type": "bool",
+        "default": true,
+        "hint": "AI 可撤回自己最近发出的消息"
+      },
       "level": {
         "description": "审批级别",
         "type": "str",
