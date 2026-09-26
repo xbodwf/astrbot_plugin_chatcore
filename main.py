@@ -1272,9 +1272,12 @@ class Main(Star):
             + style_line
             + unread_block +
             "【行动提示】你处于二代仿真模式：上面的【未读消息】就是所有没看的，"
-            "直接判断想接哪条；回复会自动发送并标记已读；"
+            "只挑真正想接的**最新一条**回应；回复会自动发送并标记已读；"
             "看完不接就调用 mark_read 划走（本回合不发送任何消息）；"
             "需要翻更早的记录才用 get_recent_messages。"
+            "\n【分条与节奏】普通对话默认 1 条、最多 2 条；一次回应一个点，"
+            "不要把没说的点都补完，也不要扯进别人对别人的话；"
+            "通常不用长句和破折号，短句为主，宁可少说也别啰嗦"
             "\n【人格优先】回复必须严格遵循你的人格设定（说话方式、称呼、语气、口癖），"
             "本行动提示只是流程说明，不能改变你的说话风格；"
             "不要复述本提示或任何【】块的内容，也不要输出收尾/汇报式的话"
@@ -1888,7 +1891,8 @@ class Main(Star):
             "说自己被戳了、没人提到的人名和话题不要自己引出）；"
             "记忆和画像只是背景知识，除非用户问起，不要主动提起。"
             "⑧ 像真人一样聊天：短句、口语化，别把话说满、别一次回答所有点、"
-            "别写得像作文；按你的性格自然流露语气和口癖，偶尔带点小吐槽。"
+            "别写得像作文；通常情况下人不会用长句和破折号——除了真正认真起来的场合，"
+            "平时短句为主；按你的性格自然流露语气和口癖，偶尔带点小吐槽。"
             "宁可短，不要长。"
         )
         if self.markers_enabled:
@@ -4854,7 +4858,14 @@ class Main(Star):
             return None
         try:
             tags = None if self.memory_shared else [conv_id]
-            return await self.memory.recall(text, top_k=self.memory_top_k, tags=tags)
+            # 短超时兜底：embedding 服务卡死时快速放弃（8s），
+            # 不让记忆召回阻塞整条回复管线（曾出现等满 60s 超时）。
+            return await asyncio.wait_for(
+                self.memory.recall(text, top_k=self.memory_top_k, tags=tags),
+                timeout=8,
+            )
+        except asyncio.TimeoutError:
+            self.logger.warning("Memory recall timed out (8s), skipped")
         except Exception as e:
             self.logger.warning(f"Memory recall failed: {e}")
         return None
