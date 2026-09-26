@@ -417,6 +417,12 @@
         "type": "float",
         "default": 0.4,
         "hint": "越高越严格，避免无关记忆进入上下文"
+      },
+      "recall_timeout": {
+        "description": "嵌入召回超时(秒)",
+        "type": "float",
+        "default": 8,
+        "hint": "记忆召回（embedding）的最长等待时间，超时快速放弃不阻塞回复；embedding 服务慢时可调大"
       }
     }
   },

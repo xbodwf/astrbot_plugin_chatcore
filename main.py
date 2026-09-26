@@ -408,6 +408,9 @@ class Main(Star):
         memory_cfg = config.get("memory", {})
         self.memory_shared = memory_cfg.get("shared_across_groups", True)
         self.memory_top_k = memory_cfg.get("max_recall", 5)
+        self.memory_recall_timeout = max(
+            1.0, float(memory_cfg.get("recall_timeout", 8))
+        )
         self.memory = None
         emb_cfg = providers.get("embedding", {})
         self._embed_fn = None
@@ -4923,14 +4926,16 @@ class Main(Star):
             return None
         try:
             tags = None if self.memory_shared else [conv_id]
-            # 短超时兜底：embedding 服务卡死时快速放弃（8s），
+            # 短超时兜底：embedding 服务卡死时快速放弃，
             # 不让记忆召回阻塞整条回复管线（曾出现等满 60s 超时）。
             return await asyncio.wait_for(
                 self.memory.recall(text, top_k=self.memory_top_k, tags=tags),
-                timeout=8,
+                timeout=self.memory_recall_timeout,
             )
         except asyncio.TimeoutError:
-            self.logger.warning("Memory recall timed out (8s), skipped")
+            self.logger.warning(
+                f"Memory recall timed out ({self.memory_recall_timeout}s), skipped"
+            )
         except Exception as e:
             self.logger.warning(f"Memory recall failed: {e}")
         return None
