@@ -225,6 +225,7 @@ class SocialV2Store:
         quote_target_is_self: bool = False,
         is_self: bool = False,
         kind: str = "",
+        images: list[str] | None = None,
     ) -> dict:
         """Append an incoming (or self-sent) message to unread + recent.
 
@@ -241,6 +242,7 @@ class SocialV2Store:
             quote_target_is_self: Whether a quote targets the bot itself.
             is_self: Whether this message was sent by the bot.
             kind: Optional kind tag (``poke`` for poke events).
+            images: Optional image URLs contained in the message.
 
         Returns:
             The appended message dict.
@@ -256,6 +258,7 @@ class SocialV2Store:
             "quote_target_is_self": bool(quote_target_is_self),
             "is_self": bool(is_self),
             "kind": kind,
+            "images": list(images or [])[:5],
             "time": time.time(),
         }
         st["last_unread_seq"] = msg["seq"]
@@ -282,6 +285,78 @@ class SocialV2Store:
             )
         st["last_ai_reply_at"] = time.time()
         self._save()
+
+    def record_wake(self, conv_id: str) -> None:
+        """Record a wake event for rate limiting.
+
+        Keeps the last 200 wake timestamps per conversation, mirroring
+        qq-bridge's ``st.wakeTimes``.
+
+        Args:
+            conv_id: Conversation identifier.
+        """
+        st = self.get_state(conv_id)
+        times = st.get("wake_times") or []
+        times.append(time.time())
+        st["wake_times"] = times[-200:]
+        st["last_wake_at"] = times[-1]
+        self._save()
+
+    def wake_rate_exceeded(self, conv_id: str, per_minute: int, per_hour: int) -> bool:
+        """Whether waking this conversation now would exceed the rate limit.
+
+        Args:
+            conv_id: Conversation identifier.
+            per_minute: Max wakes per minute (0 = unlimited).
+            per_hour: Max wakes per hour (0 = unlimited).
+
+        Returns:
+            True when the limit is reached and the wake should be skipped.
+        """
+        st = self._conversations.get(conv_id)
+        if not st:
+            return False
+        now = time.time()
+        times = [t for t in (st.get("wake_times") or []) if now - t < 3600]
+        if per_minute > 0 and sum(1 for t in times if now - t < 60) >= per_minute:
+            return True
+        if per_hour > 0 and len(times) >= per_hour:
+            return True
+        return False
+
+    def bump_no_action(self, conv_id: str, acted: bool, limit: int = 3) -> bool:
+        """Track no-action turns and reset the wake config at the limit.
+
+        Mirrors qq-bridge: a wake turn with neither a send nor mark_read /
+        set_wake_config increments ``no_action_count``; reaching the limit
+        resets the wake config to the default so the agent cannot get stuck.
+
+        Args:
+            conv_id: Conversation identifier.
+            acted: Whether the turn took a real action (sent or tool call).
+            limit: Consecutive no-action turns allowed.
+
+        Returns:
+            True when the wake config was reset.
+        """
+        st = self.get_state(conv_id)
+        wc = st.get("wake_config") or {}
+        if acted:
+            wc["no_action_count"] = 0
+            st["wake_config"] = wc
+            self._save()
+            return False
+        count = int(wc.get("no_action_count", 0)) + 1
+        if count >= max(1, limit):
+            wc = default_wake_config()
+            wc["no_action_count"] = 0
+            st["wake_config"] = wc
+            self._save()
+            return True
+        wc["no_action_count"] = count
+        st["wake_config"] = wc
+        self._save()
+        return False
 
     def mark_read(self, conv_id: str) -> int:
         """Clear the unread queue (the agent has seen the messages).

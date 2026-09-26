@@ -812,6 +812,99 @@
         "type": "int",
         "default": 30,
         "hint": "每会话保留的未读消息条数，超出丢最旧"
+      },
+      "wake": {
+        "description": "唤醒限制与无行动兜底",
+        "type": "object",
+        "items": {
+          "max_wake_per_minute": {
+            "description": "每会话每分钟最多唤醒次数（0=不限）",
+            "type": "int",
+            "default": 1
+          },
+          "max_wake_per_hour": {
+            "description": "每会话每小时最多唤醒次数（0=不限）",
+            "type": "int",
+            "default": 12
+          },
+          "no_action_limit": {
+            "description": "连续多少次唤醒无行动后重置唤醒配置",
+            "type": "int",
+            "default": 3
+          }
+        }
+      },
+      "send": {
+        "description": "发送拟真（连发间隔/限速）",
+        "type": "object",
+        "items": {
+          "burst_interval_min": {
+            "description": "条间随机间隔下限（秒）",
+            "type": "float",
+            "default": 1.0
+          },
+          "burst_interval_max": {
+            "description": "条间随机间隔上限（秒）",
+            "type": "float",
+            "default": 3.0
+          },
+          "long_gap_probability": {
+            "description": "长间隔概率（0-1）",
+            "type": "float",
+            "default": 0.2
+          },
+          "long_gap_min": {
+            "description": "长间隔下限（秒）",
+            "type": "float",
+            "default": 5.0
+          },
+          "long_gap_max": {
+            "description": "长间隔上限（秒）",
+            "type": "float",
+            "default": 10.0
+          },
+          "max_send_per_minute": {
+            "description": "每分钟最多发送条数（0=不限）",
+            "type": "int",
+            "default": 8
+          },
+          "max_send_per_hour": {
+            "description": "每小时最多发送条数（0=不限）",
+            "type": "int",
+            "default": 60
+          }
+        }
+      },
+      "proactive": {
+        "description": "主动冒泡（空闲后小概率主动开口）",
+        "type": "object",
+        "items": {
+          "enabled": {
+            "description": "主动冒泡总开关",
+            "type": "bool",
+            "default": true
+          },
+          "check_interval_min": {
+            "description": "主动检查间隔下限（秒）",
+            "type": "int",
+            "default": 1800
+          },
+          "check_interval_max": {
+            "description": "主动检查间隔上限（秒）",
+            "type": "int",
+            "default": 5400
+          },
+          "idle_threshold": {
+            "description": "会话安静多久才算空闲（秒）",
+            "type": "int",
+            "default": 900
+          },
+          "probability": {
+            "description": "每次检查的开口概率（0-1）",
+            "type": "float",
+            "default": 0.3
+          }
+        }
       }
     }
   }

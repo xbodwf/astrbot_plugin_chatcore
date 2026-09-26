@@ -608,6 +608,14 @@ class Main(Star):
         self._v2_reminder_counts: dict[str, int] = {}
         self._v2_marked_read: set[str] = set()
         self._v2_wake_configured: set[str] = set()
+        # 二代仿真唤醒相关配置（唤醒限流 / 无行动兜底）。
+        self._v2_wake_cfg: dict = dict(v2_cfg.get("wake", {}))
+        self._v2_no_action_limit = int(self._v2_wake_cfg.get("no_action_limit", 3))
+        # 二代仿真的发送拟真（burst 连发间隔 / 长间隔概率 / 发送限速）。
+        self._v2_send_cfg: dict = dict(v2_cfg.get("send", {}))
+        self._v2_send_times: deque = deque(maxlen=120)
+        # 二代仿真的主动冒泡（空闲阈值 + 概率 + 检查间隔）。
+        self._v2_proactive_cfg: dict = dict(v2_cfg.get("proactive", {}))
 
         implicit_cfg = config.get("implicit", {})
         self.implicit_enabled = implicit_cfg.get("enabled", True)
@@ -708,6 +716,11 @@ class Main(Star):
                     == str(event.get_self_id() or "")
                     for comp in event.get_messages()
                 )
+                v2_images = [
+                    comp.url
+                    for comp in event.get_messages()
+                    if isinstance(comp, Image) and getattr(comp, "url", "")
+                ]
                 self.social_v2.append_message(
                     conv_id,
                     event.get_sender_name(),
@@ -715,11 +728,24 @@ class Main(Star):
                     text or "[图片]",
                     message_id=msg_id,
                     quote_target_is_self=quote_target_is_self,
+                    images=v2_images,
                 )
                 reason = self._v2_evaluate_trigger(event, conv_id, is_private, text)
                 if reason and schedule_level != LEVEL_OFFLINE:
+                    v2_wake = self._v2_wake_cfg
+                    if self.social_v2.wake_rate_exceeded(
+                        conv_id,
+                        int(v2_wake.get("max_wake_per_minute", 1)),
+                        int(v2_wake.get("max_wake_per_hour", 12)),
+                    ):
+                        self.logger.info(
+                            f"ChatCore v2 wake rate limit | {conv_id} | skip {reason}"
+                        )
+                        reason = None
+                if reason and schedule_level != LEVEL_OFFLINE:
                     should_reply = True
                     v2_reason = reason
+                    self.social_v2.record_wake(conv_id)
             elif is_private:
                 should_reply = chat_cfg.get("private_force_reply", True)
                 if schedule_level == LEVEL_OFFLINE:
@@ -1475,15 +1501,24 @@ class Main(Star):
                         self.context_mgr.record(conv_id, "assistant", "bot", segment)
                         self._schedule_summary(conv_id)
                     self.logger.info(f"ChatCore send | {conv_id} | bot: {segment}")
-                    if fresh_v2 and conv_id in self._v2_marked_read:
-                        # AI 已 mark_read 收尾：本回合不再继续发送，
-                        # 避免收尾后又冒出下一段消息。
-                        self.logger.info(
-                            f"ChatCore v2 post-read suppress | {conv_id} | "
-                            f"skip segment: {segment[:40]}"
-                        )
-                        task.request_cancel()
-                        return
+                    if fresh_v2:
+                        if not self._v2_send_rate_ok():
+                            self.logger.info(
+                                f"ChatCore v2 send rate limit | {conv_id} | "
+                                f"skip segment: {segment[:40]}"
+                            )
+                            return
+                        if conv_id in self._v2_marked_read:
+                            # AI 已 mark_read 收尾：本回合不再继续发送，
+                            # 避免收尾后又冒出下一段消息。
+                            self.logger.info(
+                                f"ChatCore v2 post-read suppress | {conv_id} | "
+                                f"skip segment: {segment[:40]}"
+                            )
+                            task.request_cancel()
+                            return
+                        # 拟真延迟：burst 随机间隔（含长间隔概率）+ 字符 pacing。
+                        await asyncio.sleep(self._v2_send_delay(segment))
                     self._last_reply[conv_id] = (segment, time.time())
                     poke_chain, chain = self._split_poke_chain(chain)
                     if chain:
@@ -1670,6 +1705,27 @@ class Main(Star):
                 pass
         finally:
             self.active_tasks.pop(conv_id, None)
+            # 二代仿真无行动兜底：本回合既没发消息也没 mark_read /
+            # set_wake_config，累计 no_action_count；达限重置唤醒配置，
+            # 避免 AI 卡死。
+            if self.social_v2:
+                acted = (
+                    getattr(task, "v2_sent", False)
+                    or conv_id in self._v2_marked_read
+                    or conv_id in self._v2_wake_configured
+                )
+                try:
+                    if self.social_v2.bump_no_action(
+                        conv_id, acted, self._v2_no_action_limit
+                    ):
+                        self.logger.warning(
+                            f"ChatCore v2 no-action reset | {conv_id} | "
+                            f"{self._v2_no_action_limit} turns without action"
+                        )
+                except Exception as e:
+                    self.logger.debug(f"ChatCore v2 no-action check failed: {e}")
+                self._v2_marked_read.discard(conv_id)
+                self._v2_wake_configured.discard(conv_id)
 
     async def _build_system_prompt(
         self,
@@ -2322,6 +2378,305 @@ class Main(Star):
                 handler=self._v2_wait_handler,
             )
         )
+
+        ts.add_tool(
+            FunctionTool(
+                name="get_my_recent_messages",
+                description="看你最近自己发过的消息（避免重复、接续自己说过的话）",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "description": "可选：最多返回几条，默认10",
+                        }
+                    },
+                    "required": [],
+                },
+                handler=self._v2_get_my_recent_handler,
+            )
+        )
+        ts.add_tool(
+            FunctionTool(
+                name="get_message_detail",
+                description="按 seq 或 message_id 查一条消息的详情（谁发的、原文）",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "message_id": {
+                            "type": "string",
+                            "description": "消息的 seq 或 message_id",
+                        }
+                    },
+                    "required": ["message_id"],
+                },
+                handler=self._v2_get_message_detail_handler,
+            )
+        )
+        ts.add_tool(
+            FunctionTool(
+                name="get_active_members",
+                description="看本会话最近谁在活跃（按发言数排序，带最后发言时间）",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "description": "可选：最多返回几人，默认10",
+                        }
+                    },
+                    "required": [],
+                },
+                handler=self._v2_get_active_members_handler,
+            )
+        )
+        ts.add_tool(
+            FunctionTool(
+                name="get_images",
+                description="看某条消息里的图片 URL（配合 get_message_detail 的 images 字段）",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "message_id": {
+                            "type": "string",
+                            "description": "消息的 seq 或 message_id",
+                        }
+                    },
+                    "required": ["message_id"],
+                },
+                handler=self._v2_get_images_handler,
+            )
+        )
+        ts.add_tool(
+            FunctionTool(
+                name="get_forward_msg",
+                description="查看合并转发的具体内容（需要转发消息的 forward id）",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "forward_id": {
+                            "type": "string",
+                            "description": "合并转发消息的 id",
+                        }
+                    },
+                    "required": ["forward_id"],
+                },
+                handler=self._v2_get_forward_msg_handler,
+            )
+        )
+        ts.add_tool(
+            FunctionTool(
+                name="feedback",
+                description=(
+                    "给开发者提交使用反馈/问题报告（不发给聊天对象，"
+                    "写入插件日志供管理员查看）"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "反馈内容（最多500字）",
+                        }
+                    },
+                    "required": ["content"],
+                },
+                handler=self._v2_feedback_handler,
+            )
+        )
+
+    async def _v2_get_my_recent_handler(self, event, limit: int = 10) -> dict:
+        """Handler for ``get_my_recent_messages``.
+
+        Args:
+            event: The message event driving the tool call.
+            limit: Optional max messages to return.
+
+        Returns:
+            The agent's own recent messages.
+        """
+        conv_id = event.unified_msg_origin
+        if not self.social_v2:
+            return {"error": "二代仿真模式未启用"}
+        st = self.social_v2.get_state(conv_id)
+        mine = [m for m in (st.get("recent_messages") or []) if m.get("is_self")]
+        msgs = mine if int(limit) <= 0 else mine[-int(limit):]
+        return {
+            "messages": [
+                {"seq": m.get("seq"), "text": m.get("text"), "time": m.get("time")}
+                for m in msgs
+            ]
+        }
+
+    async def _v2_get_message_detail_handler(self, event, message_id: str) -> dict:
+        """Handler for ``get_message_detail``.
+
+        Looks up a message by seq or platform message id in the recent
+        window (mirrors qq-bridge's local-first lookup).
+
+        Args:
+            event: The message event driving the tool call.
+            message_id: The seq or platform message id.
+
+        Returns:
+            The message detail, or an error when not found.
+        """
+        conv_id = event.unified_msg_origin
+        if not self.social_v2:
+            return {"error": "二代仿真模式未启用"}
+        target = str(message_id or "").strip()
+        if not target:
+            return {"error": "message_id 不能为空"}
+        st = self.social_v2.get_state(conv_id)
+        for m in reversed(st.get("recent_messages") or []):
+            if str(m.get("seq")) == target or (
+                m.get("message_id") and str(m.get("message_id")) == target
+            ):
+                return {
+                    "seq": m.get("seq"),
+                    "sender": m.get("sender"),
+                    "user_id": m.get("user_id"),
+                    "text": m.get("text"),
+                    "message_id": m.get("message_id"),
+                    "is_self": m.get("is_self", False),
+                    "kind": m.get("kind", ""),
+                    "images": m.get("images") or [],
+                    "time": m.get("time"),
+                }
+        return {"error": f"消息 {target} 不在最近记录里（只保留最近 {len(st.get('recent_messages') or [])} 条）"}
+
+    async def _v2_get_active_members_handler(self, event, limit: int = 10) -> dict:
+        """Handler for ``get_active_members``.
+
+        Aggregates recent (non-self) messages per speaker, sorted by count.
+
+        Args:
+            event: The message event driving the tool call.
+            limit: Optional max members to return.
+
+        Returns:
+            Active members with message counts and last-seen time.
+        """
+        conv_id = event.unified_msg_origin
+        if not self.social_v2:
+            return {"error": "二代仿真模式未启用"}
+        st = self.social_v2.get_state(conv_id)
+        stats: dict[str, dict] = {}
+        for m in st.get("recent_messages") or []:
+            if not m or m.get("is_self"):
+                continue
+            uid = str(m.get("user_id") or "")
+            key = uid or str(m.get("sender") or "未知")
+            cur = stats.setdefault(
+                key,
+                {
+                    "sender": m.get("sender") or key,
+                    "user_id": uid,
+                    "count": 0,
+                    "last_time": 0,
+                },
+            )
+            cur["count"] += 1
+            if (m.get("time") or 0) > cur["last_time"]:
+                cur["last_time"] = m.get("time")
+        members = sorted(
+            stats.values(),
+            key=lambda x: (-x["count"], -x["last_time"]),
+        )
+        if int(limit) > 0:
+            members = members[: int(limit)]
+        return {"members": members}
+
+    async def _v2_get_images_handler(self, event, message_id: str) -> dict:
+        """Handler for ``get_images``.
+
+        Args:
+            event: The message event driving the tool call.
+            message_id: The seq or platform message id.
+
+        Returns:
+            The image URLs contained in that message.
+        """
+        detail = await self._v2_get_message_detail_handler(event, message_id)
+        if "error" in detail:
+            return detail
+        return {"message_id": detail.get("message_id"), "images": detail.get("images") or []}
+
+    async def _v2_get_forward_msg_handler(self, event, forward_id: str) -> dict:
+        """Handler for ``get_forward_msg``.
+
+        Fetches a merged-forward message via OneBot, but only when the id
+        was actually seen in this conversation's messages (same safety
+        boundary as qq-bridge: no arbitrary probing).
+
+        Args:
+            event: The message event driving the tool call.
+            forward_id: The forward message id.
+
+        Returns:
+            The formatted forward content, or an error.
+        """
+        conv_id = event.unified_msg_origin
+        if not self.social_v2:
+            return {"error": "二代仿真模式未启用"}
+        fid = str(forward_id or "").strip()
+        if not fid:
+            return {"error": "forward_id 不能为空"}
+        st = self.social_v2.get_state(conv_id)
+        all_msgs = list(st.get("recent_messages") or []) + list(st.get("unread") or [])
+        if not any(fid in (m.get("images") or []) or fid == str(m.get("message_id") or "") for m in all_msgs):
+            return {"error": "该转发消息 id 不在当前会话可见范围内，拒绝读取"}
+        bot = getattr(event, "bot", None)
+        if bot is None:
+            return {"error": "当前平台不支持查看合并转发"}
+        try:
+            data = await bot.call_action("get_forward_msg", {"id": fid})
+        except Exception as e:
+            return {"error": f"获取合并转发失败：{e}"}
+        messages = (data or {}).get("messages") if isinstance(data, dict) else None
+
+        def _fmt(node: dict) -> dict:
+            sender = (node.get("sender") or {})
+            content = node.get("content") or []
+            texts = "".join(
+                seg.get("data", {}).get("text", "")
+                for seg in content if isinstance(seg, dict) and seg.get("type") == "text"
+            )
+            imgs = [
+                seg.get("data", {}).get("url", "")
+                for seg in content if isinstance(seg, dict) and seg.get("type") == "image"
+            ]
+            return {
+                "sender": sender.get("nickname") or sender.get("user_id") or "未知",
+                "text": texts[:200],
+                "images": [u for u in imgs if u][:5],
+            }
+
+        if isinstance(messages, list):
+            return {"messages": [_fmt(n) for n in messages if isinstance(n, dict)][:50]}
+        return {"raw": str(data)[:2000]}
+
+    async def _v2_feedback_handler(self, event, content: str) -> dict:
+        """Handler for ``feedback``.
+
+        Writes the agent's feedback to the plugin log for the owner to review
+        (mirrors qq-bridge's feedback.json, simplified to a log record).
+
+        Args:
+            event: The message event driving the tool call.
+            content: The feedback text (max 500 chars).
+
+        Returns:
+            A confirmation dict.
+        """
+        text = str(content or "").strip()[:500]
+        if not text:
+            return {"error": "反馈内容不能为空"}
+        conv_id = event.unified_msg_origin
+        self.logger.info(
+            f"ChatCore v2 feedback | {conv_id} | {text}"
+        )
+        return {"ok": True, "note": "反馈已记录，管理员会在日志里看到"}
 
     def _add_relation_tools(self, ts: ToolSet, FunctionTool) -> None:
         """Register relationship management tools on the main tool set.
@@ -2980,6 +3335,56 @@ class Main(Star):
             ),
         }
 
+    def _v2_send_delay(self, segment: str) -> float:
+        """Compute the human-like pause before sending a v2 segment.
+
+        Mirrors qq-bridge's send pacing: a random burst interval with a
+        probability of a much longer gap, scaled a little by message length.
+
+        Args:
+            segment: The text about to be sent.
+
+        Returns:
+            The delay in seconds.
+        """
+        cfg = self._v2_send_cfg
+        base_min = float(cfg.get("burst_interval_min", 1.0))
+        base_max = float(cfg.get("burst_interval_max", 3.0))
+        long_prob = float(cfg.get("long_gap_probability", 0.2))
+        long_min = float(cfg.get("long_gap_min", 5.0))
+        long_max = float(cfg.get("long_gap_max", 10.0))
+        if long_prob > 0 and random.random() < long_prob:
+            delay = random.uniform(max(0.0, long_min), max(0.0, long_max))
+        else:
+            delay = random.uniform(max(0.0, base_min), max(0.0, base_max))
+        # 字符 pacing：长消息再多等一点（每 10 字 +0.1s，封顶 2s）。
+        delay += min(2.0, max(0, len(segment)) * 0.01)
+        return delay
+
+    def _v2_send_rate_ok(self) -> bool:
+        """Whether a v2 send is allowed under the rate limit.
+
+        Mirrors qq-bridge's ``maxSendPerMinute`` / ``maxSendPerHour``.
+
+        Returns:
+            True when under the limit (or limit disabled).
+        """
+        cfg = self._v2_send_cfg
+        per_minute = int(cfg.get("max_send_per_minute", 8))
+        per_hour = int(cfg.get("max_send_per_hour", 60))
+        if per_minute <= 0 and per_hour <= 0:
+            return True
+        now = time.time()
+        recent = [t for t in self._v2_send_times if now - t < 3600]
+        self._v2_send_times.clear()
+        self._v2_send_times.extend(recent)
+        if per_minute > 0 and sum(1 for t in recent if now - t < 60) >= per_minute:
+            return False
+        if per_hour > 0 and len(recent) >= per_hour:
+            return False
+        self._v2_send_times.append(now)
+        return True
+
     def _v2_after_send(
         self, event: AstrMessageEvent, conv_id: str, segment: str
     ) -> None:
@@ -2999,6 +3404,10 @@ class Main(Star):
             return
         try:
             self.social_v2.record_sent(conv_id, [segment])
+            # 标记本回合有真实发送动作（noAction 兜底判定用）。
+            active = self.active_tasks.get(conv_id)
+            if active is not None:
+                active.v2_sent = True
         except Exception as e:
             self.logger.debug(f"ChatCore v2 record_sent failed: {e}")
         self._schedule_v2_closing_check(event, conv_id)
@@ -5141,28 +5550,55 @@ class Main(Star):
             self._v2_bubble_task = asyncio.create_task(self._v2_bubble_loop())
 
     async def _v2_bubble_loop(self) -> None:
-        """Periodically check sleeping conversations for proactive wake-ups.
+        """Periodically check conversations for proactive wake-ups.
 
-        Mirrors qq-bridge's bubble check: a conversation whose wake time has
-        arrived (finite sleep expired, or active mode with unread messages)
-        gets a soft-trigger conversation so the agent can decide to speak.
+        Two paths, mirroring qq-bridge:
+        - should_wake: a finite sleep expired (deterministic, checked every
+          30s).
+        - proactive: the conversation has been quiet for longer than the
+          idle threshold and has unread messages; the agent gets a
+          soft-trigger conversation with probability ``probability`` (checked
+          every 30-90 min with jitter).
         """
+        cfg = dict(getattr(self, "_v2_proactive_cfg", {}))
+        next_proactive_at = time.time() + random.uniform(
+            float(cfg.get("check_interval_min", 1800)),
+            float(cfg.get("check_interval_max", 5400)),
+        )
         while True:
             try:
                 await asyncio.sleep(30)
-                for conv_id, st in list(self.social_v2.snapshot().items()):
+                now = time.time()
+                proactive_due = now >= next_proactive_at
+                if proactive_due:
+                    next_proactive_at = now + random.uniform(
+                        float(cfg.get("check_interval_min", 1800)),
+                        float(cfg.get("check_interval_max", 5400)),
+                    )
+                for conv_id in list(self.social_v2.snapshot().keys()):
                     if conv_id in self.active_tasks:
-                        continue
-                    if not self.social_v2.should_wake(conv_id):
                         continue
                     full = self.social_v2.get_state(conv_id)
                     wc = full.get("wake_config") or {}
                     unread = len(full.get("unread") or [])
-                    if wc.get("mode") != "active" and not unread:
-                        # 潜水中且没有新消息：不冒泡。
-                        continue
-                    if wc.get("mode") == "active" and not unread:
-                        # 活跃模式没有未读也不空转。
+                    if self.social_v2.should_wake(conv_id):
+                        pass  # 到点唤醒：有限潜水到期
+                    elif (
+                        cfg.get("enabled", True)
+                        and proactive_due
+                        and unread
+                        and not wc.get("mode") == "active"
+                    ):
+                        # proactive：群安静超阈值后小概率主动开口。
+                        last_incoming = float(full.get("last_incoming_at") or 0)
+                        idle_ms = float(cfg.get("idle_threshold", 900))
+                        if now - last_incoming < idle_ms:
+                            continue
+                        if random.random() > float(
+                            cfg.get("probability", 0.3)
+                        ):
+                            continue
+                    else:
                         continue
                     self.logger.info(
                         f"ChatCore v2 bubble | {conv_id} | unread={unread}"
