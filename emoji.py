@@ -453,6 +453,34 @@ class EmojiStore:
         record = self._records.get(emoji_id)
         return record.get("file") if record else None
 
+    def gif_path(self, emoji_id: str) -> str | None:
+        """Sendable path of an emoji as a ``.gif`` copy.
+
+        QQ renders images sent with a gif extension at sticker size, which
+        keeps mixed-format stickers (jpg/png/extensionless) visually uniform.
+        The copy is made once per emoji into the images/tmp directory and
+        reused afterwards.
+
+        Args:
+            emoji_id: The emoji id.
+
+        Returns:
+            The ``.gif`` copy path, or None when the emoji file is missing.
+        """
+        src = self.file_path(emoji_id)
+        if not src or not Path(src).is_file():
+            return None
+        if Path(src).suffix.lower() == ".gif":
+            return src
+        dst = Path(src).parent / "tmp" / f"{Path(src).stem}.gif"
+        if not dst.is_file():
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, dst)
+            except OSError:
+                return src
+        return str(dst)
+
     def mark_used(self, emoji_id: str) -> None:
         """Increment usage count.
 

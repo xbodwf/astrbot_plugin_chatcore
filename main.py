@@ -1211,6 +1211,17 @@ class Main(Star):
         tr = wc.get("triggers") or {}
         unread = st.get("unread") or []
         bits = [f"未读 {len(unread)} 条"]
+        # 未读摘要直接注入（最多 15 条，每条截 100 字）：AI 不用先调工具
+        # 就能看到未读，省一轮工具往返；想翻更多仍可用 get_recent_messages。
+        unread_lines = [
+            f"{m.get('sender', '未知')}({m.get('user_id', '')}): {str(m.get('text') or '')[:100]}"
+            for m in unread[-15:]
+        ]
+        unread_block = (
+            "【未读消息】\n" + "\n".join(unread_lines) + "\n"
+            if unread_lines
+            else ""
+        )
         last_msg = next(
             (m for m in reversed(st.get("recent_messages") or []) if not m.get("is_self")),
             None,
@@ -1258,11 +1269,12 @@ class Main(Star):
             f"【此刻状态】{'；'.join(bits)}\n"
             f"【当前唤醒】{wc_mode}{'；触发：' + '/'.join(wc_triggers) if wc_triggers else ''}\n"
             f"【唤醒原因】{reason}\n"
-            + style_line +
-            "【行动提示】你处于二代仿真模式：聊天记录不会自动进入上下文，"
-            "用 get_unread_messages 主动看未读消息（不够再用 get_recent_messages 往前翻），"
-            "然后自行决定：想接就正常回复（回复会自动发送并标记已读），"
-            "看完不接就调用 mark_read 划走（本回合不发送任何消息）。"
+            + style_line
+            + unread_block +
+            "【行动提示】你处于二代仿真模式：上面的【未读消息】就是所有没看的，"
+            "直接判断想接哪条；回复会自动发送并标记已读；"
+            "看完不接就调用 mark_read 划走（本回合不发送任何消息）；"
+            "需要翻更早的记录才用 get_recent_messages。"
             "\n【人格优先】回复必须严格遵循你的人格设定（说话方式、称呼、语气、口癖），"
             "本行动提示只是流程说明，不能改变你的说话风格；"
             "不要复述本提示或任何【】块的内容，也不要输出收尾/汇报式的话"
@@ -3457,6 +3469,8 @@ class Main(Star):
             return
         try:
             self.social_v2.record_sent(conv_id, [segment])
+            # 回复即看完：未读自动标已读，不积压到下一回合。
+            self.social_v2.mark_read(conv_id)
             # 标记本回合有真实发送动作（noAction 兜底判定用）。
             active = self.active_tasks.get(conv_id)
             if active is not None:
@@ -4334,7 +4348,7 @@ class Main(Star):
                 )
                 if not emoji_id:
                     continue
-                path = self.emoji_store.file_path(emoji_id)
+                path = self.emoji_store.gif_path(emoji_id)
                 if not path or not Path(path).is_file():
                     continue
                 self.emoji_store.mark_used(emoji_id)
@@ -5160,7 +5174,7 @@ class Main(Star):
             return None
         pool.sort(key=lambda r: r.get("usage_count", 0))
         chosen = random.choice(pool[: max(1, min(3, len(pool)))])
-        path = chosen.get("file")
+        path = self.emoji_store.gif_path(chosen["emoji_id"])
         self.emoji_store.mark_used(chosen["emoji_id"])
         self._auto_emoji_cache[key] = path
         self._auto_emoji_last_at = time.time()
