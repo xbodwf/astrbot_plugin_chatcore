@@ -220,7 +220,7 @@ class ProfileStore:
             self._profiles[person_id] = profile
         profile["nickname"] = nickname or profile.get("nickname", "")
         existing = profile.get("facts", []) or []
-        added = []
+        added: list = []
         for item in facts:
             fact = item.get("fact", "") if isinstance(item, dict) else str(item)
             if not fact:
@@ -242,28 +242,57 @@ class ProfileStore:
                 ]
                 if item.get("action") == "remove":
                     continue
-            # 近似去重: LLM 措辞变体（"小明是大学生" vs "小明在读大学"）不重复累积
-            if any(
-                difflib.SequenceMatcher(
-                    None,
-                    fact,
-                    old.get("fact", "") if isinstance(old, dict) else old,
-                ).ratio()
-                > 0.65
-                for old in existing + added
-            ):
+            # 近似去重: LLM 措辞变体（"小明是大学生" vs "小明在读大学"）不重复累积，
+            # 而是命中已有条目时给它的 count +1（反复出现的事实更可信）。
+            # 旧数据里的事实可能是纯字符串：命中时升级为带权重的 dict。
+            matched = False
+            for idx, old in enumerate(list(existing) + added):
+                old_fact = old.get("fact", "") if isinstance(old, dict) else old
+                if difflib.SequenceMatcher(None, fact, old_fact).ratio() > 0.65:
+                    if isinstance(old, dict):
+                        old["count"] = int(old.get("count", 1)) + 1
+                        old["last_seen"] = now
+                    else:
+                        upgraded = {
+                            "fact": old_fact,
+                            "evidence": "",
+                            "count": 2,
+                            "last_seen": now,
+                        }
+                        if idx < len(existing):
+                            existing[idx] = upgraded
+                        else:
+                            added[idx - len(existing)] = upgraded
+                    matched = True
+                    break
+            if matched:
                 continue
-            added.append(item if isinstance(item, dict) else fact)
-        if added:
+            if isinstance(item, dict):
+                entry = dict(item)
+                entry.setdefault("count", 1)
+                entry["last_seen"] = now
+                added.append(entry)
+            else:
+                added.append({"fact": fact, "count": 1, "last_seen": now})
+        if added or any(
+            isinstance(old, dict) and int(old.get("count", 1)) > 1
+            for old in existing
+        ):
+            # count 命中的已有条目也要落盘。
             profile["facts"] = (existing + added)[-_MAX_FACTS:]
             profile["updated_at"] = now
             self._save()
 
-    def render(self, person_id: str) -> str | None:
+    def render(self, person_id: str, max_facts: int = 8) -> str | None:
         """Render a person's profile as an injection block.
+
+        Only the highest-weight facts are rendered (sorted by count, then
+        recency) so a long tail of one-off out-of-context lines never
+        dominates the persona context.
 
         Args:
             person_id: Stable platform id of the person.
+            max_facts: Max facts to render.
 
         Returns:
             A compact profile text, or None when absent.
@@ -274,12 +303,19 @@ class ProfileStore:
         facts = profile.get("facts", []) or []
         if not facts:
             return None
+
+        def _weight(item: Any) -> tuple[int, float]:
+            if isinstance(item, dict):
+                return (int(item.get("count", 1)), float(item.get("last_seen", 0)))
+            return (1, 0.0)
+
+        ranked = sorted(facts, key=_weight, reverse=True)[:max_facts]
         nickname = profile.get("nickname", "") or person_id
         parts = [f"该用户昵称: {nickname}"]
         relationship = profile.get("relationship", "")
         if relationship:
             parts.append(f"你与TA的关系: {relationship}")
-        for item in facts:
+        for item in ranked:
             fact = item.get("fact", "") if isinstance(item, dict) else str(item)
             evidence = item.get("evidence", "") if isinstance(item, dict) else ""
             parts.append(f"- {fact}" + (f"（依据: {evidence}）" if evidence else ""))

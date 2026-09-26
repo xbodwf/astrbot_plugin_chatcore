@@ -480,6 +480,13 @@ class Main(Star):
             emoji_cfg.get("auto_probability", 0.5)
         )
         self._auto_emoji_cache: dict[str, str] = {}
+        # 人物画像累积式提取：攒够条数才跑 LLM 提取，防止断章取义。
+        self._PROFILE_FIRST_EXTRACT = 20
+        self._PROFILE_EXTRACT_STEP = 15
+        self._PROFILE_RECALC_EVERY = 40
+        self._profile_msg_counts: dict[str, int] = {}
+        self._profile_last_extract: dict[str, int] = {}
+        self._profile_last_recalc: dict[str, int] = {}
         self.emoji_collect_probability = float(
             emoji_cfg.get("collect_probability", 1.0)
         )
@@ -4788,10 +4795,12 @@ class Main(Star):
     ) -> None:
         """Schedule an async person-fact extraction for a replied message.
 
-        Fire-and-forget: the summary model extracts stable facts about the
-        sender and merges them into their profile. The sender's recent
-        messages in this conversation are bundled into the extraction input so
-        profiles grow richer than a single message. Failures are logged only.
+        Cumulative: facts are only extracted once the person has accumulated
+        ``_PROFILE_FIRST_EXTRACT`` real messages (then every
+        ``_PROFILE_EXTRACT_STEP`` more). This avoids building a profile from
+        one or two out-of-context lines. The sender's recent messages in this
+        conversation are bundled into the extraction input. Failures are
+        logged only.
 
         Args:
             conv_id: Conversation identifier.
@@ -4802,7 +4811,9 @@ class Main(Star):
 
         async def _run() -> None:
             try:
-                recent = self.context_mgr.recent_user_texts(conv_id, sender_id, limit=5)
+                recent = self.context_mgr.recent_user_texts(
+                    conv_id, sender_id, limit=20
+                )
                 if text not in recent:
                     recent.insert(0, text)
                 material = "\n".join(recent)
@@ -4818,17 +4829,103 @@ class Main(Star):
                 if facts:
                     self.profile_store.merge(sender_id, nickname, facts)
                     self.logger.info(
-                        f"ChatCore profile | {sender_id} +{len(facts)} facts"
+                        f"ChatCore profile | {sender_id} +{len(facts)} facts "
+                        f"(from {len(recent)} msgs)"
                     )
             except Exception as e:
                 self.logger.warning(f"Profile writeback failed: {e}")
 
-        if self.profile_store and text:
-            stripped = text.strip()
-            if stripped.startswith("<poke") or stripped.startswith("（定时任务提醒）"):
-                # 戳一戳/定时任务不是真实发言，不参与人物画像提取，避免污染画像。
-                return
+        if not (self.profile_store and text):
+            return
+        stripped = text.strip()
+        if stripped.startswith("<poke") or stripped.startswith("（定时任务提醒）"):
+            # 戳一戳/定时任务不是真实发言，不参与人物画像提取，避免污染画像。
+            return
+        # 累积式提取门槛：攒够真实发言才提取，防止一两条消息就生成断章取义的画像。
+        count = self._profile_msg_counts.get(sender_id, 0) + 1
+        self._profile_msg_counts[sender_id] = count
+        last = self._profile_last_extract.get(sender_id, 0)
+        # 定期重算：每满 _PROFILE_RECALC_EVERY 条用更大的窗口重算一遍，
+        # 修正早期断章取义的事实（低权重旧事实会被完整记录覆盖/纠偏）。
+        recalc = (
+            last != 0
+            and count >= self._profile_last_recalc.get(sender_id, 0)
+            + self._PROFILE_RECALC_EVERY
+        )
+        threshold = (
+            self._PROFILE_FIRST_EXTRACT if last == 0 else last + self._PROFILE_EXTRACT_STEP
+        )
+        if count < threshold and not recalc:
+            return
+        self._profile_last_extract[sender_id] = count
+        if recalc:
+            self._profile_last_recalc[sender_id] = count
+        self.logger.info(
+            f"ChatCore profile extract due | {sender_id} | {count} msgs"
+            f"{' (recalc)' if recalc else ''}"
+        )
+        if recalc:
+            asyncio.create_task(self._recalc_profile(conv_id, sender_id, nickname))
+        else:
             asyncio.create_task(_run())
+
+    async def _recalc_profile(
+        self, conv_id: str, sender_id: str, nickname: str
+    ) -> None:
+        """Rebuild a person's profile from a large message window.
+
+        Unlike the incremental writeback, this uses many more of the person's
+        messages and asks the model to also drop facts that the fuller record
+        contradicts — correcting early out-of-context conclusions.
+
+        Args:
+            conv_id: Conversation identifier.
+            sender_id: Stable platform id of the person.
+            nickname: Display name of the person.
+        """
+        try:
+            recent = self.context_mgr.recent_user_texts(
+                conv_id, sender_id, limit=60
+            )
+            if not recent:
+                return
+            profile = self.profile_store.get(sender_id) or {}
+            existing_facts = profile.get("facts", [])
+            facts = await self.profile_store.extract_facts(
+                self.summary_client,
+                nickname,
+                "\n".join(recent),
+                existing_facts=existing_facts,
+                log_name="latest_profile_recalc",
+            )
+            if not facts:
+                return
+            # 重算允许修正：先取出与旧事实近似冲突的 remove/replace 项已由
+            # merge 处理；这里额外丢弃新窗口里不再出现且 count=1 的低权重旧事实。
+            new_texts = [
+                f.get("fact", "") if isinstance(f, dict) else str(f) for f in facts
+            ]
+            import difflib as _dl
+
+            kept = []
+            for old in existing_facts:
+                old_fact = old.get("fact", "") if isinstance(old, dict) else old
+                old_count = old.get("count", 1) if isinstance(old, dict) else 1
+                similar = any(
+                    _dl.SequenceMatcher(None, old_fact, nt).ratio() > 0.5
+                    for nt in new_texts
+                )
+                if old_count <= 1 and not similar:
+                    continue  # 低权重且重算中未再出现：丢弃
+                kept.append(old)
+            profile["facts"] = kept
+            self.profile_store.merge(sender_id, nickname, facts)
+            self.logger.info(
+                f"ChatCore profile recalc | {sender_id} | kept={len(kept)} "
+                f"+{len(facts)} facts (from {len(recent)} msgs)"
+            )
+        except Exception as e:
+            self.logger.warning(f"Profile recalc failed: {e}")
 
     async def _collect_emoji(
         self,
@@ -4937,6 +5034,10 @@ class Main(Star):
             return None
         if random.random() >= self.emoji_auto_probability:
             return None
+        # 冷却：自动表情最多每 10 分钟一次，避免每次回复都追加表情图刷屏。
+        now = time.time()
+        if now - getattr(self, "_auto_emoji_last_at", 0) < 600:
+            return None
         key = text[:80]
         if key in self._auto_emoji_cache:
             return self._auto_emoji_cache[key]
@@ -4986,10 +5087,34 @@ class Main(Star):
         path = chosen.get("file")
         self.emoji_store.mark_used(chosen["emoji_id"])
         self._auto_emoji_cache[key] = path
+        self._auto_emoji_last_at = time.time()
         self.logger.info(
             f"ChatCore auto-emoji | {emotion} -> {chosen['emoji_id']} | {text[:30]}"
         )
         return path
+
+    def _v2_recent_context(self, conv_id: str, max_chars: int = 300) -> str:
+        """Recent-conversation context for secondary-LLM helpers.
+
+        In social v2 mode the compressed summary is stale (history is not
+        injected), so helpers read the last few recent messages instead.
+
+        Args:
+            conv_id: Conversation identifier.
+            max_chars: Max characters to return.
+
+        Returns:
+            A short recent-conversation text.
+        """
+        if self.social_v2:
+            st = self.social_v2.get_state(conv_id)
+            lines = [
+                f"{m.get('sender') or '我'}: {m.get('text') or ''}"
+                for m in (st.get("recent_messages") or [])[-6:]
+                if m and not m.get("kind")
+            ]
+            return "\n".join(lines)[-max_chars:]
+        return self.context_mgr.summary_text(conv_id, max_chars=max_chars)
 
     async def _resolve_emoji_query(self, conv_id: str, query: str) -> str | None:
         """Resolve an emoji intent or id to a concrete emoji id.
@@ -5009,13 +5134,13 @@ class Main(Star):
         if not self.emoji_store:
             return None
         query = query.strip()
+        if not query:
+            return None
         if self.emoji_store.get(query):
             return query
         records = await self.emoji_store.search(query, top_k=3)
         if not records:
             return None
-        if len(records) == 1:
-            return records[0]["emoji_id"]
         # 候选分类与意图明确匹配时直接取 top1，省去一次选择 LLM 调用。
         top = records[0]
         cat = (top.get("category") or "").strip()
@@ -5024,10 +5149,10 @@ class Main(Star):
                            "敷衍": "敷衍", "可爱": "可爱", "疑问": "疑问"}
         if cat and cat in intent_keywords:
             intent_key = intent_keywords[cat]
-            if query and (intent_key in query or query in cat):
+            if intent_key in query or query == cat:
                 return top["emoji_id"]
         candidates = self.emoji_store.render_candidates(records)
-        recent = self.context_mgr.summary_text(conv_id, max_chars=300)
+        recent = self._v2_recent_context(conv_id)
         try:
             raw = await self.summary_client.chat(
                 [
@@ -5047,7 +5172,8 @@ class Main(Star):
             )
         except Exception as e:
             self.logger.warning(f"Emoji pick failed: {e}")
-            return records[0]["emoji_id"]
+            # 选择失败时保守起见不发表情（宁缺毋滥），而不是硬塞 top1。
+            return None
         match = re.search(r"\[\[emoji:([^\]]+)\]\]", raw)
         if match:
             pick = match.group(1).strip()
@@ -5055,7 +5181,8 @@ class Main(Star):
                 return pick
             if pick.startswith("emoji_") and self.emoji_store.get(pick):
                 return pick
-        return records[0]["emoji_id"]
+        # 模型明确说「不用」或回复无法解析：尊重判断，不发表情。
+        return None
 
     def _schedule_summary(self, conv_id: str) -> None:
         """Kick off an LLM summary of a conversation's older history.
