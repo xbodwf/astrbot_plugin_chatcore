@@ -888,6 +888,37 @@ class Main(Star):
             task.enqueue(poke_text, "")
             event.stop_event()
             return
+        # 二代仿真：poke 入库未读，唤醒由 wake_config 的 poke 触发决定
+        # （开了拍一拍触发必回，否则不回）；作息睡觉一律静默。
+        if self.social_v2:
+            self.social_v2.append_message(
+                conv_id,
+                sender_name,
+                sender_id,
+                f"[拍一拍] {sender_name} 拍了拍你",
+                kind="poke",
+            )
+            schedule_level = LEVEL_ACTIVE
+            if self.schedule:
+                schedule_level = self.schedule.effective_level()
+            st = self.social_v2.get_state(conv_id)
+            wc = st.get("wake_config") or {}
+            tr = wc.get("triggers") or {}
+            if (
+                schedule_level == LEVEL_OFFLINE
+                or not (tr.get("poke") or wc.get("mode") == "active")
+            ):
+                event.stop_event()
+                return
+            task = GenerationTask(conv_id, "")
+            task.v2_wake_reason = "poke"
+            self.active_tasks[conv_id] = task
+            event.stop_event()
+            self.logger.info(f"ChatCore poke v2 | {conv_id} | {sender_name}")
+            asyncio.create_task(
+                self._run_conversation(task, event, conv_id, poke_text, []),
+            )
+            return
         # 概率触发：poke 专属概率（戳前=聊天概率，戳后按次数/间隔累积，连戳才必回）。
         if self.attention:
             self.attention.record_poke(conv_id)
@@ -1196,6 +1227,17 @@ class Main(Star):
             mins = max(0, int((time.time() - last_ai) / 60))
             bits.append(f"你上次发言 {mins} 分钟前")
         reason = getattr(task, "v2_wake_reason", "") or "消息触发"
+        style_bits = [
+            str(m.get("text") or "")
+            for m in reversed(st.get("recent_messages") or [])
+            if m.get("is_self") and str(m.get("text") or "")
+        ][:2]
+        style_line = (
+            ("【你最近的说话方式】" + " / ".join(f"「{s[:40]}」" for s in style_bits)
+             + "\n回复必须延续这种风格和人格设定\n")
+            if style_bits
+            else ""
+        )
         wc_mode = "活跃" if wc.get("mode") == "active" else "潜水"
         wc_triggers = []
         if tr.get("at_mention"):
@@ -1216,10 +1258,14 @@ class Main(Star):
             f"【此刻状态】{'；'.join(bits)}\n"
             f"【当前唤醒】{wc_mode}{'；触发：' + '/'.join(wc_triggers) if wc_triggers else ''}\n"
             f"【唤醒原因】{reason}\n"
+            + style_line +
             "【行动提示】你处于二代仿真模式：聊天记录不会自动进入上下文，"
             "用 get_unread_messages 主动看未读消息（不够再用 get_recent_messages 往前翻），"
             "然后自行决定：想接就正常回复（回复会自动发送并标记已读），"
-            "看完不接就调用 mark_read 划走（本回合不发送任何消息）"
+            "看完不接就调用 mark_read 划走（本回合不发送任何消息）。"
+            "\n【人格优先】回复必须严格遵循你的人格设定（说话方式、称呼、语气、口癖），"
+            "本行动提示只是流程说明，不能改变你的说话风格；"
+            "不要复述本提示或任何【】块的内容，也不要输出收尾/汇报式的话"
         )
 
     def _addresses_other_user(self, event: AstrMessageEvent) -> bool:
@@ -3448,20 +3494,50 @@ class Main(Star):
                         self.logger.info(
                             f"ChatCore v2 closing reminder | {conv_id}"
                         )
-                        await self.context.send_message(
-                            conv_id,
-                            MessageChain().message(
-                                "【系统】你还有未处理完的对话（未读消息未标已读）。"
-                                "如果已经聊完，请调用 mark_read 收尾；"
-                                "如果还要继续，请回复对方。"
-                            ),
+                        # 提醒走 AI 管线（不是直接发 QQ）：作为 user 消息进
+                        # 上下文，AI 用正常人格据此收尾，避免系统提示词泄漏。
+                        note = (
+                            "【收尾提醒】你还有未处理完的对话（未读消息未标已读）。"
+                            "如果已经聊完，请调用 mark_read 收尾；"
+                            "如果还要继续，请回复对方。"
                         )
+                        await self._v2_system_note_turn(conv_id, note)
             except Exception as e:
                 self.logger.debug(f"ChatCore v2 closing check failed: {e}")
             finally:
                 self._v2_reminder_counts.pop(conv_id, None)
 
         asyncio.create_task(_check())
+
+    async def _v2_system_note_turn(self, conv_id: str, note: str) -> None:
+        """Deliver a system note to the agent through the conversation pipeline.
+
+        The note is recorded as a user message and drives a fresh reply round,
+        so the agent acts on it with its normal persona instead of the note
+        leaking into QQ as a sent message.
+
+        Args:
+            conv_id: Conversation identifier.
+            note: The system note text.
+        """
+        try:
+            from astrbot.core.cron.events import CronMessageEvent
+            from astrbot.core.platform.message_session import MessageSession
+
+            session = MessageSession.from_str(conv_id)
+            cron_event = CronMessageEvent(
+                context=self.context,
+                session=session,
+                message=note,
+                message_type=session.message_type,
+            )
+            self.context_mgr.record(conv_id, "user", "系统", note)
+            task = GenerationTask(conv_id, "")
+            task.v2_wake_reason = "收尾提醒"
+            self.active_tasks[conv_id] = task
+            await self._run_conversation(task, cron_event, conv_id, note, [])
+        except Exception as e:
+            self.logger.warning(f"ChatCore v2 system note turn failed: {e}")
 
     async def _schedule_set_handler(
         self, event, state: str, level: int, minutes: float = 0, cron: str = "", priority: int = 0
