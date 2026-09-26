@@ -52,6 +52,11 @@ from astrbot.core.utils.astrbot_path import (
 from .actions import parse_actions, parse_reply_decision
 from .affinity import AffinityManager
 from .attention import AttentionManager
+from .social_v2 import (
+    SocialV2Store,
+    looks_like_unfinished,
+    UNFINISHED_PROMPT_REPLIES,
+)
 from .context import ContextManager
 from .emoji import EmojiStore, classify_emoji
 from .emotion import EmotionManager
@@ -85,6 +90,54 @@ DEFAULT_IMPLICIT_PROMPT = (
 FALLBACK_SYSTEM_PROMPT = (
     "你是一个友善、自然的聊天机器人，请像真人一样聊天，回复不要机械化。"
 )
+
+# 二代仿真：指向 AI 的提问/催促判断（移植自 qq-bridge isDirectedAtAi）。
+_AI_MENTION_RE = re.compile(
+    r"deepseek|claude|chatgpt|gpt|大肥鱼|小鲸鱼|鲸鱼|d指导|d老师|d师傅|深度求索|"
+    r"\bds\b|ai|人工智障|机器人|模型",
+    re.IGNORECASE,
+)
+_AI_CHALLENGE_RE = re.compile(
+    r"强|弱|行不行|能不能|会不会|是不是|一半|水平|垃圾|废物|白嫖|菜|不如|厉害|赢|输"
+)
+_AI_QUESTION_RE = re.compile(r"[?？吗呢吧]|怎么|为什么|哪|谁")
+_YOU_ASK_RE = re.compile(
+    r"(你|您).{0,10}(吗|呢|？|\?|怎么|是不是|能不能|行不行|有没有|有|没有|比|"
+    r"不如|强|弱|一半|厉害|垃圾|菜|赢|输)"
+)
+_YOU_START_RE = re.compile(r"^(你|您)(是不是|行不行|能不能|会不会|觉得|有|没有)")
+_YOU_OR_RE = re.compile(r"(你|您)是[^？?。！!]{0,14}(还是|或者|吗|么|？|\?)")
+_URGE_RE = re.compile(
+    r"怎么不说话|人呢|回我|说话啊|理我|别装死|在不在|装死|说话"
+)
+
+
+def directed_at_ai(text: str) -> bool:
+    """Whether a group message is a question/challenge directed at the AI.
+
+    Mirrors qq-bridge's ``isDirectedAtAi``: AI mention + question/challenge,
+    or "you" + question forms, or real-person urging when the AI went silent.
+
+    Args:
+        text: The plain message text.
+
+    Returns:
+        True when the message directly asks the AI.
+    """
+    lower = str(text or "").lower()
+    if _AI_MENTION_RE.search(lower) and (
+        _AI_QUESTION_RE.search(lower) or _AI_CHALLENGE_RE.search(lower)
+    ):
+        return True
+    if _YOU_ASK_RE.search(lower):
+        return True
+    if _YOU_START_RE.search(lower):
+        return True
+    if _YOU_OR_RE.search(lower):
+        return True
+    if _URGE_RE.search(lower):
+        return True
+    return False
 
 # 默认作息规则：深夜压低发言概率（可在 attention.time_rules 覆盖；留空数组则关闭）。
 DEFAULT_TIME_RULES = [
@@ -147,6 +200,7 @@ class GenerationTask:
         self.cancel_requested = False
         self.suppress_record = False
         self.soft_trigger = False
+        self.v2_wake_reason = ""
         self._pending: str | None = None
 
     def enqueue(self, text: str, message_id: str = "") -> None:
@@ -216,6 +270,7 @@ class Main(Star):
         self._expression_task: asyncio.Task | None = None
         self._scheduled_jobs: dict[str, dict] = {}
         self._scheduler_task: asyncio.Task | None = None
+        self._v2_bubble_task: asyncio.Task | None = None
         self._load_scheduled_jobs()
         ChatCoreWebUI(self).register_routes()
         if self.tools_enabled:
@@ -539,6 +594,21 @@ class Main(Star):
         self.manage_group_id = str(relations_cfg.get("manage_group_id", "") or "")
         self.relation_notify = relations_cfg.get("notify", True)
 
+        v2_cfg = config.get("social_v2", {})
+        self.social_v2 = None
+        if v2_cfg.get("enabled", True):
+            self.social_v2 = SocialV2Store(
+                Path(get_astrbot_plugin_data_path())
+                / "astrbot_plugin_chatcore"
+                / "social_v2.json",
+                recent_limit=int(v2_cfg.get("recent_limit", 100)),
+                unread_limit=int(v2_cfg.get("unread_limit", 30)),
+            )
+        self._v2_wait_tasks: dict[str, asyncio.Event] = {}
+        self._v2_reminder_counts: dict[str, int] = {}
+        self._v2_marked_read: set[str] = set()
+        self._v2_wake_configured: set[str] = set()
+
         implicit_cfg = config.get("implicit", {})
         self.implicit_enabled = implicit_cfg.get("enabled", True)
         self.implicit_interval = max(
@@ -621,6 +691,7 @@ class Main(Star):
 
         should_reply = False
         soft_hit = False
+        v2_reason = ""
         # 作息感知级别：0 睡觉（静默，连 @ 也累积）、1 专注（只回 @/回复）、
         # 2 活跃（正常）。切换低→高会触发补读。
         schedule_level = LEVEL_ACTIVE
@@ -628,7 +699,28 @@ class Main(Star):
             schedule_level = self.schedule.effective_level()
         if conv_id not in self.llm_blacklist:
             # 黑名单会话完全禁用 LLM：消息照常记录，但任何触发都不回复。
-            if is_private:
+            if self.social_v2:
+                # 二代仿真：消息入库未读队列；唤醒触发由 wake_config 决定
+                # （@/名字/提问/关键词/概率），作息级别叠加（睡觉一律静默）。
+                quote_target_is_self = any(
+                    isinstance(comp, Reply)
+                    and str(getattr(comp, "sender_id", ""))
+                    == str(event.get_self_id() or "")
+                    for comp in event.get_messages()
+                )
+                self.social_v2.append_message(
+                    conv_id,
+                    event.get_sender_name(),
+                    event.get_sender_id(),
+                    text or "[图片]",
+                    message_id=msg_id,
+                    quote_target_is_self=quote_target_is_self,
+                )
+                reason = self._v2_evaluate_trigger(event, conv_id, is_private, text)
+                if reason and schedule_level != LEVEL_OFFLINE:
+                    should_reply = True
+                    v2_reason = reason
+            elif is_private:
                 should_reply = chat_cfg.get("private_force_reply", True)
                 if schedule_level == LEVEL_OFFLINE:
                     should_reply = False
@@ -702,6 +794,7 @@ class Main(Star):
 
         task = GenerationTask(conv_id, msg_id)
         task.soft_trigger = soft_hit
+        task.v2_wake_reason = v2_reason
         self.active_tasks[conv_id] = task
         event.stop_event()
         asyncio.create_task(
@@ -980,6 +1073,122 @@ class Main(Star):
         lowered = text.lower()
         return any(w and lowered.startswith(w) for w in self.wake_prefix)
 
+    def _v2_evaluate_trigger(
+        self, event: AstrMessageEvent, conv_id: str, is_private: bool, text: str
+    ) -> str | None:
+        """Evaluate the v2 wake trigger for an incoming message.
+
+        Mirrors qq-bridge's ``evaluateWakeTriggerV2``: private always wakes;
+        group messages wake on the agent's own wake_config triggers
+        (@/mention/question/keywords/speakerIds/anyMessage/probability), by
+        priority order.
+
+        Args:
+            event: The incoming message event.
+            conv_id: Conversation identifier.
+            is_private: Whether this is a private chat.
+            text: Plain message text.
+
+        Returns:
+            The wake reason string, or None when not triggered.
+        """
+        st = self.social_v2.get_state(conv_id)
+        wc = st.get("wake_config") or {}
+        tr = wc.get("triggers") or {}
+        if is_private:
+            return "private"
+        if wc.get("mode") == "active" or tr.get("any_message"):
+            return "any_message"
+        if tr.get("at_mention") and self._is_hard_trigger(event, text):
+            return "at_mention"
+        lower = str(text or "").lower()
+        if _AI_MENTION_RE.search(lower):
+            return "name_mention"
+        keywords = tr.get("keywords") or []
+        for kw in keywords:
+            kw_str = str(kw or "").lower()
+            if not kw_str:
+                continue
+            # 短英文/数字关键词用词边界匹配，避免 ADS/BDSM/DSL 误触发。
+            if re.fullmatch(r"[a-z0-9]{1,4}", kw_str):
+                if re.search(rf"\b{re.escape(kw_str)}\b", lower):
+                    return f"keyword:{kw}"
+            elif kw_str in lower:
+                return f"keyword:{kw}"
+        if tr.get("question") and directed_at_ai(text):
+            return "question"
+        speaker_ids = tr.get("speaker_ids") or []
+        speaker_id = str(event.get_sender_id() or "")
+        if speaker_ids and speaker_id and speaker_id in speaker_ids:
+            return f"speaker:{event.get_sender_name()}"
+        prob = float(tr.get("probability", 0) or 0)
+        if prob > 0 and random.random() < prob:
+            return "probability"
+        return None
+
+    def _build_v2_wake_block(self, conv_id: str, task) -> str:
+        """Build the v2 wake block injected into a fresh conversation.
+
+        Contains the current status (unread count, last message, wake reason)
+        and action guidance: the agent reads messages through the unread tool
+        and decides whether to reply (normal pipeline) or mark_read (silent).
+
+        Args:
+            conv_id: Conversation identifier.
+            task: The generation task (holds the wake reason).
+
+        Returns:
+            The wake block text, or an empty string.
+        """
+        if not self.social_v2:
+            return ""
+        st = self.social_v2.get_state(conv_id)
+        wc = st.get("wake_config") or {}
+        tr = wc.get("triggers") or {}
+        unread = st.get("unread") or []
+        bits = [f"未读 {len(unread)} 条"]
+        last_msg = next(
+            (m for m in reversed(st.get("recent_messages") or []) if not m.get("is_self")),
+            None,
+        )
+        if last_msg:
+            bits.append(
+                f"最近一条来自 {last_msg.get('sender', '未知')}："
+                f"{str(last_msg.get('text') or '')[:30]}"
+            )
+            if looks_like_unfinished(str(last_msg.get("text") or "")):
+                bits.append("对方可能没说完")
+        last_ai = st.get("last_ai_reply_at") or 0
+        if last_ai:
+            mins = max(0, int((time.time() - last_ai) / 60))
+            bits.append(f"你上次发言 {mins} 分钟前")
+        reason = getattr(task, "v2_wake_reason", "") or "消息触发"
+        wc_mode = "活跃" if wc.get("mode") == "active" else "潜水"
+        wc_triggers = []
+        if tr.get("at_mention"):
+            wc_triggers.append("@")
+        if tr.get("name_mention"):
+            wc_triggers.append("名字")
+        if tr.get("question"):
+            wc_triggers.append("提问")
+        if tr.get("poke"):
+            wc_triggers.append("拍一拍")
+        if tr.get("any_message"):
+            wc_triggers.append("任意消息")
+        if tr.get("keywords"):
+            wc_triggers.append("关键词")
+        if float(tr.get("probability", 0) or 0) > 0:
+            wc_triggers.append(f"概率{tr.get('probability')}")
+        return (
+            f"【此刻状态】{'；'.join(bits)}\n"
+            f"【当前唤醒】{wc_mode}{'；触发：' + '/'.join(wc_triggers) if wc_triggers else ''}\n"
+            f"【唤醒原因】{reason}\n"
+            "【行动提示】你处于二代仿真模式：聊天记录不会自动进入上下文，"
+            "用 get_unread_messages 主动看未读消息（不够再用 get_recent_messages 往前翻），"
+            "然后自行决定：想接就正常回复（回复会自动发送并标记已读），"
+            "看完不接就调用 mark_read 划走（本回合不发送任何消息）"
+        )
+
     def _addresses_other_user(self, event: AstrMessageEvent) -> bool:
         """Whether the message @-mentions a specific user other than the bot.
 
@@ -1044,7 +1253,13 @@ class Main(Star):
                 if not tool_round:
                     t_ctx_start = time.monotonic()
                     task.suppress_record = False
-                    history_blocks = await self._inject_history_blocks(event, conv_id)
+                    fresh_v2 = self.social_v2 is not None
+                    # 社会二代模式：不注入聊天历史（AI 用未读工具主动读），
+                    # 只保留固定大小的提示（中断补完/防重复）。
+                    history_blocks = (
+                        [] if fresh_v2
+                        else await self._inject_history_blocks(event, conv_id)
+                    )
                     interrupted = self._interrupted.pop(conv_id, None)
                     if interrupted is not None and time.time() - interrupted < 3600:
                         history_blocks = list(history_blocks) + [
@@ -1081,7 +1296,15 @@ class Main(Star):
                         memory_texts=await self._recall(conv_id, current_text),
                         history_texts=history_blocks,
                         profile_texts=await self._inject_profile(event),
+                        fresh=fresh_v2,
                     )
+                    if fresh_v2:
+                        # 二代仿真唤醒块：此刻状态 + 唤醒原因 + 行动提示。
+                        v2_block = self._build_v2_wake_block(conv_id, task)
+                        if v2_block:
+                            messages.append(
+                                {"role": "system", "content": v2_block}
+                            )
                     if self.schedule:
                         rose, from_lv, to_lv = self.schedule.transition()
                         if rose:
@@ -1252,6 +1475,15 @@ class Main(Star):
                         self.context_mgr.record(conv_id, "assistant", "bot", segment)
                         self._schedule_summary(conv_id)
                     self.logger.info(f"ChatCore send | {conv_id} | bot: {segment}")
+                    if fresh_v2 and conv_id in self._v2_marked_read:
+                        # AI 已 mark_read 收尾：本回合不再继续发送，
+                        # 避免收尾后又冒出下一段消息。
+                        self.logger.info(
+                            f"ChatCore v2 post-read suppress | {conv_id} | "
+                            f"skip segment: {segment[:40]}"
+                        )
+                        task.request_cancel()
+                        return
                     self._last_reply[conv_id] = (segment, time.time())
                     poke_chain, chain = self._split_poke_chain(chain)
                     if chain:
@@ -1959,11 +2191,137 @@ class Main(Star):
             self._add_sandbox_tools(ts, FunctionTool, direct_only=True)
             self._add_schedule_tools(ts, FunctionTool)
             self._add_relation_tools(ts, FunctionTool)
+            self._add_v2_tools(ts, FunctionTool)
             self._tool_set = ts if not ts.empty() else None
         except Exception as e:
             self.logger.warning(f"ChatCore: tool set build failed: {e}")
             self._tool_set = None
         return self._tool_set
+
+    def _add_v2_tools(self, ts: ToolSet, FunctionTool) -> None:
+        """Register social v2 (unread/wake) tools on the main tool set.
+
+        Mirrors qq-bridge's reserved2 tool set: the agent reads messages
+        through the unread/recent tools, marks read, sets its own wake
+        config and waits for replies.
+
+        Args:
+            ts: The ToolSet to populate.
+            FunctionTool: The FunctionTool class to instantiate.
+        """
+        if not self.social_v2:
+            return
+        ts.add_tool(
+            FunctionTool(
+                name="get_unread_messages",
+                description="看还没读的新消息（二代仿真：主动看消息而不是被动接收）",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "description": "可选：最多返回几条，默认全部未读",
+                        }
+                    },
+                    "required": [],
+                },
+                handler=self._v2_get_unread_handler,
+            )
+        )
+        ts.add_tool(
+            FunctionTool(
+                name="get_recent_messages",
+                description="往前翻更多消息（含你自己发的），未读不够时用",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "description": "可选：最多返回几条，默认30",
+                        }
+                    },
+                    "required": [],
+                },
+                handler=self._v2_get_recent_handler,
+            )
+        )
+        ts.add_tool(
+            FunctionTool(
+                name="mark_read",
+                description=(
+                    "看过但决定不接时标记已读（等于划走）；"
+                    "调用后本回合不再发送任何消息"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+                handler=self._v2_mark_read_handler,
+            )
+        )
+        ts.add_tool(
+            FunctionTool(
+                name="set_wake_config",
+                description=(
+                    "设置你下次什么时候被唤醒：活跃(any_message)或潜水+触发条件"
+                    "（@/名字/提问/拍一拍/关键词/概率/指定成员）；"
+                    "无限期潜水必须至少保留一个触发条件"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "mode": {
+                            "type": "string",
+                            "description": "active=活跃 / diving=潜水",
+                        },
+                        "infinite": {
+                            "type": "boolean",
+                            "description": "是否无限期潜水（潜水时用）",
+                        },
+                        "sleep_minutes": {
+                            "type": "number",
+                            "description": "有限潜水时长（分钟，不填无限）",
+                        },
+                        "triggers": {
+                            "type": "object",
+                            "description": (
+                                "触发条件：at_mention/name_mention/question/poke/"
+                                "any_message(布尔)、probability(0-1)、keywords(数组)、"
+                                "speaker_ids(QQ号数组)"
+                            ),
+                        },
+                    },
+                    "required": [],
+                },
+                handler=self._v2_set_wake_config_handler,
+            )
+        )
+        ts.add_tool(
+            FunctionTool(
+                name="wait_for_messages",
+                description=(
+                    "等群友说话/判断对方说没说完（quietMs 等 10-15 秒看有没有下一条）；"
+                    "timeout=true 表示这段时间没人说话，不是错误；"
+                    "设置潜水前必须先用本工具完成一次沉睡前观察（timeout=110000）"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "timeout": {
+                            "type": "integer",
+                            "description": "最长等待毫秒（默认30000，最大110000）",
+                        },
+                        "quiet_ms": {
+                            "type": "integer",
+                            "description": "安静多久算说完（毫秒，默认10000）",
+                        },
+                    },
+                    "required": [],
+                },
+                handler=self._v2_wait_handler,
+            )
+        )
 
     def _add_relation_tools(self, ts: ToolSet, FunctionTool) -> None:
         """Register relationship management tools on the main tool set.
@@ -2425,6 +2783,269 @@ class Main(Star):
             f"ChatCore approve group | {flag} | sub={sub_type} | approve={approve}"
         )
         return {"ok": True, "approved": approve}
+
+    async def _v2_get_unread_handler(self, event, limit: int = 0) -> dict:
+        """Handler for ``get_unread_messages``.
+
+        Args:
+            event: The message event driving the tool call.
+            limit: Optional max messages to return.
+
+        Returns:
+            Unread messages with sender/text/seq info.
+        """
+        if not self.social_v2:
+            return {"error": "二代仿真未启用"}
+        conv_id = event.unified_msg_origin
+        st = self.social_v2.get_state(conv_id)
+        unread = st.get("unread") or []
+        msgs = unread if int(limit) <= 0 else unread[-int(limit):]
+        return {
+            "unreadCount": len(unread),
+            "messages": [
+                {
+                    "seq": m.get("seq"),
+                    "sender": m.get("sender"),
+                    "user_id": m.get("user_id"),
+                    "text": m.get("text"),
+                    "quote_target_is_self": m.get("quote_target_is_self", False),
+                    "time": m.get("time"),
+                }
+                for m in msgs
+            ],
+        }
+
+    async def _v2_get_recent_handler(self, event, limit: int = 30) -> dict:
+        """Handler for ``get_recent_messages``.
+
+        Args:
+            event: The message event driving the tool call.
+            limit: Optional max messages to return.
+
+        Returns:
+            Recent messages (including the agent's own).
+        """
+        if not self.social_v2:
+            return {"error": "二代仿真未启用"}
+        conv_id = event.unified_msg_origin
+        st = self.social_v2.get_state(conv_id)
+        recent = st.get("recent_messages") or []
+        msgs = recent if int(limit) <= 0 else recent[-int(limit):]
+        return {
+            "messages": [
+                {
+                    "seq": m.get("seq"),
+                    "sender": m.get("sender"),
+                    "user_id": m.get("user_id"),
+                    "text": m.get("text"),
+                    "is_self": m.get("is_self", False),
+                    "time": m.get("time"),
+                }
+                for m in msgs
+            ]
+        }
+
+    async def _v2_mark_read_handler(self, event) -> dict:
+        """Handler for ``mark_read``.
+
+        Marks the conversation's unread queue as read. The reply loop checks
+        this flag and suppresses any further message sending this round.
+
+        Args:
+            event: The message event driving the tool call.
+
+        Returns:
+            Confirmation with the marked count.
+        """
+        if not self.social_v2:
+            return {"error": "二代仿真未启用"}
+        conv_id = event.unified_msg_origin
+        count = self.social_v2.mark_read(conv_id)
+        self._v2_marked_read.add(conv_id)
+        self.logger.info(f"ChatCore v2 mark_read | {conv_id} | {count} 条")
+        return {"ok": True, "markedCount": count}
+
+    async def _v2_set_wake_config_handler(
+        self, event, mode: str = "", infinite: bool | None = None,
+        sleep_minutes: float = 0, triggers: dict | None = None,
+    ) -> dict:
+        """Handler for ``set_wake_config``.
+
+        Args:
+            event: The message event driving the tool call.
+            mode: "active" or "diving".
+            infinite: Whether to dive indefinitely.
+            sleep_minutes: Finite sleep duration in minutes.
+            triggers: Trigger conditions (partial update).
+
+        Returns:
+            The updated wake config.
+        """
+        if not self.social_v2:
+            return {"error": "二代仿真未启用"}
+        conv_id = event.unified_msg_origin
+        config: dict = {}
+        if mode:
+            config["mode"] = mode
+        if infinite is not None:
+            config["infinite"] = bool(infinite)
+        if sleep_minutes and float(sleep_minutes) > 0:
+            config["sleep_minutes"] = float(sleep_minutes)
+        if isinstance(triggers, dict) and triggers:
+            config["triggers"] = triggers
+        try:
+            wc = self.social_v2.set_wake_config(conv_id, config)
+        except ValueError as e:
+            return {"error": str(e)}
+        self._v2_wake_configured.add(conv_id)
+        self.logger.info(
+            f"ChatCore v2 set_wake_config | {conv_id} | mode={wc.get('mode')}"
+        )
+        return {"ok": True, "wake_config": wc}
+
+    async def _v2_wait_handler(
+        self, event, timeout: int = 30000, quiet_ms: int = 10000
+    ) -> dict:
+        """Handler for ``wait_for_messages``.
+
+        Waits for new messages (unread growth). ``timeout=true`` means nobody
+        spoke during the window - not an error. Also used as the pre-sleep
+        observation: a full quiet window satisfies the pre-sleep requirement.
+
+        Args:
+            event: The message event driving the tool call.
+            timeout: Max wait in ms (default 30000, max 110000 - tool call
+                timeout budget).
+            quiet_ms: Quiet period in ms that counts as "finished".
+
+        Returns:
+            Wait result with any new messages.
+        """
+        if not self.social_v2:
+            return {"error": "二代仿真未启用"}
+        conv_id = event.unified_msg_origin
+        timeout = min(110000, max(1000, int(timeout)))
+        quiet = min(60000, max(1000, int(quiet_ms)))
+        st = self.social_v2.get_state(conv_id)
+        start_seq = int(st.get("last_unread_seq", 0))
+        start_time = time.time()
+        deadline = start_time + timeout / 1000
+        waited_new: list[dict] = []
+        last_incoming = start_time
+        while time.time() < deadline:
+            await asyncio.sleep(0.5)
+            st = self.social_v2.get_state(conv_id)
+            new = [
+                m for m in (st.get("unread") or [])
+                if int(m.get("seq", 0)) > start_seq
+            ]
+            if new:
+                waited_new = new
+                last_incoming = time.time()
+                start_seq = int(st.get("last_unread_seq", 0))
+            elif time.time() - last_incoming >= quiet / 1000 and waited_new:
+                # 收到过新消息且已安静 quiet 时间：返回（对方可能说完了）。
+                break
+        st = self.social_v2.get_state(conv_id)
+        timed_out = not waited_new
+        full_window = time.time() - start_time >= timeout / 1000 - 0.5
+        if timed_out and full_window:
+            # 完整观察窗口无人说话：沉睡前观察满足。
+            self.social_v2.set_pre_sleep(conv_id, satisfied=True, observed=True)
+        elif waited_new:
+            self.social_v2.set_pre_sleep(conv_id, satisfied=False, observed=True)
+        return {
+            "timeout": timed_out,
+            "waitedMs": int((time.time() - start_time) * 1000),
+            "newMessages": [
+                {
+                    "seq": m.get("seq"),
+                    "sender": m.get("sender"),
+                    "user_id": m.get("user_id"),
+                    "text": m.get("text"),
+                }
+                for m in waited_new
+            ],
+            "unreadCount": len(st.get("unread") or []),
+            **(
+                {
+                    "hint": (
+                        "对方可能还没说完，可以再等一轮或用催话短句"
+                        "（什么/啥/你说啊/然后呢/？）"
+                    )
+                }
+                if waited_new
+                and looks_like_unfinished(str(waited_new[-1].get("text") or ""))
+                else {}
+            ),
+        }
+
+    def _v2_after_send(
+        self, event: AstrMessageEvent, conv_id: str, segment: str
+    ) -> None:
+        """Post-send bookkeeping for the social v2 mode.
+
+        Records the sent segment into recent (as self message). The agent is
+        expected to call ``mark_read`` itself when it is done replying; we do
+        NOT auto-mark-read here so the model keeps control over the read
+        receipt. Also schedules the no-closing reminder check.
+
+        Args:
+            event: The message event driving this reply.
+            conv_id: Conversation identifier.
+            segment: The sent text segment.
+        """
+        if not self.social_v2:
+            return
+        try:
+            self.social_v2.record_sent(conv_id, [segment])
+        except Exception as e:
+            self.logger.debug(f"ChatCore v2 record_sent failed: {e}")
+        self._schedule_v2_closing_check(event, conv_id)
+
+    def _schedule_v2_closing_check(
+        self, event: AstrMessageEvent, conv_id: str
+    ) -> None:
+        """Schedule the closing reminder check after the agent's reply.
+
+        If the agent never calls ``mark_read`` (no closing), a reminder is
+        injected once after a quiet window so the conversation does not stay
+        dangling with unread messages.
+
+        Args:
+            event: The message event driving this reply.
+            conv_id: Conversation identifier.
+        """
+        if not self.social_v2:
+            return
+
+        async def _check() -> None:
+            try:
+                await asyncio.sleep(90)
+                if conv_id in self._v2_marked_read:
+                    return
+                st = self.social_v2.get_state(conv_id)
+                if st.get("unread"):
+                    count = self._v2_reminder_counts.get(conv_id, 0)
+                    if count < 1:
+                        self._v2_reminder_counts[conv_id] = count + 1
+                        self.logger.info(
+                            f"ChatCore v2 closing reminder | {conv_id}"
+                        )
+                        await self.context.send_message(
+                            conv_id,
+                            MessageChain().message(
+                                "【系统】你还有未处理完的对话（未读消息未标已读）。"
+                                "如果已经聊完，请调用 mark_read 收尾；"
+                                "如果还要继续，请回复对方。"
+                            ),
+                        )
+            except Exception as e:
+                self.logger.debug(f"ChatCore v2 closing check failed: {e}")
+            finally:
+                self._v2_reminder_counts.pop(conv_id, None)
+
+        asyncio.create_task(_check())
 
     async def _schedule_set_handler(
         self, event, state: str, level: int, minutes: float = 0, cron: str = "", priority: int = 0
@@ -3489,6 +4110,7 @@ class Main(Star):
             self.logger.info(
                 f"ChatCore send tracked | {conv_id} | id={sent_id or '(none)'}"
             )
+            self._v2_after_send(event, conv_id, segment)
             return
         # No bot, or the tracked send failed: use the standard send path.
         await self.context.send_message(
@@ -4515,6 +5137,68 @@ class Main(Star):
                 self._selfimprove_loop()
             )
 
+        if self.social_v2:
+            self._v2_bubble_task = asyncio.create_task(self._v2_bubble_loop())
+
+    async def _v2_bubble_loop(self) -> None:
+        """Periodically check sleeping conversations for proactive wake-ups.
+
+        Mirrors qq-bridge's bubble check: a conversation whose wake time has
+        arrived (finite sleep expired, or active mode with unread messages)
+        gets a soft-trigger conversation so the agent can decide to speak.
+        """
+        while True:
+            try:
+                await asyncio.sleep(30)
+                for conv_id, st in list(self.social_v2.snapshot().items()):
+                    if conv_id in self.active_tasks:
+                        continue
+                    if not self.social_v2.should_wake(conv_id):
+                        continue
+                    full = self.social_v2.get_state(conv_id)
+                    wc = full.get("wake_config") or {}
+                    unread = len(full.get("unread") or [])
+                    if wc.get("mode") != "active" and not unread:
+                        # 潜水中且没有新消息：不冒泡。
+                        continue
+                    if wc.get("mode") == "active" and not unread:
+                        # 活跃模式没有未读也不空转。
+                        continue
+                    self.logger.info(
+                        f"ChatCore v2 bubble | {conv_id} | unread={unread}"
+                    )
+                    note = (
+                        "【冒泡】到点了，看看有没有该回的消息。"
+                        "用 get_unread_messages 查看；没有要说的就"
+                        "继续潜水（set_wake_config）。"
+                    )
+                    from astrbot.core.cron.events import CronMessageEvent
+                    from astrbot.core.platform.message_session import (
+                        MessageSession,
+                    )
+
+                    session = MessageSession.from_str(conv_id)
+                    cron_event = CronMessageEvent(
+                        context=self.context,
+                        session=session,
+                        message=note,
+                        message_type=session.message_type,
+                    )
+                    self.context_mgr.record(conv_id, "user", "系统", note)
+                    task = GenerationTask(conv_id, "")
+                    task.soft_trigger = True
+                    self.active_tasks[conv_id] = task
+                    asyncio.create_task(
+                        self._run_conversation(
+                            task, cron_event, conv_id, note, []
+                        )
+                    )
+                    break
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger.warning(f"ChatCore v2 bubble loop failed: {e}")
+
     async def _expression_learn_loop(self) -> None:
         """Periodically sample active groups and learn their expression style.
 
@@ -5265,4 +5949,7 @@ class Main(Star):
         if self._scheduler_task:
             self._scheduler_task.cancel()
             self._scheduler_task = None
+        if self._v2_bubble_task:
+            self._v2_bubble_task.cancel()
+            self._v2_bubble_task = None
         self.active_tasks.clear()

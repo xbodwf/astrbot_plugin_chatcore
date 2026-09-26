@@ -790,5 +790,29 @@
         "hint": "收到好友申请/入群邀请时是否通知管理员"
       }
     }
+  },
+  "social_v2": {
+    "description": "二代仿真模式（已读/未读 + 自主唤醒）",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "二代仿真开关",
+        "type": "bool",
+        "default": true,
+        "hint": "启用后消息入库未读队列，AI 主动读消息（已读/未读标记替代历史上下文注入），唤醒/潜水由 AI 自主设置"
+      },
+      "recent_limit": {
+        "description": "最近消息上限",
+        "type": "int",
+        "default": 100,
+        "hint": "每会话保留的最近消息条数（含 AI 自己发的）"
+      },
+      "unread_limit": {
+        "description": "未读上限",
+        "type": "int",
+        "default": 30,
+        "hint": "每会话保留的未读消息条数，超出丢最旧"
+      }
+    }
   }
 }

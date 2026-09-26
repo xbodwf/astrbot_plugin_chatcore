@@ -669,6 +669,7 @@ class ContextManager:
         memory_texts: list[str] | None = None,
         history_texts: list[str] | None = None,
         profile_texts: list[str] | None = None,
+        fresh: bool = False,
     ) -> list[dict]:
         """Build the OpenAI-style message list from a conversation's history.
 
@@ -687,6 +688,10 @@ class ContextManager:
             memory_texts: Recalled global memories to inject.
             history_texts: Persisted chat-history blocks to inject.
             profile_texts: Structured person-profile blocks to inject.
+            fresh: When True (social v2 mode) build a brand-new conversation:
+                skip recent records, compressed summaries and history blocks.
+                The agent reads messages through the unread tool instead, so
+                each reply costs a fixed prompt + reply.
 
         Returns:
             OpenAI-style message dict list.
@@ -701,6 +706,10 @@ class ContextManager:
         ]
 
         all_records = self._history(conv_id)
+        if fresh:
+            # 社会二代模式：全新会话，不发送任何聊天记录上文。
+            # AI 通过未读/最近消息工具主动读取，成本固定。
+            all_records = []
         current = all_records[-1] if all_records else None
         records = all_records[:-1] if current else all_records
         recent = records[-self.recent_count :]
